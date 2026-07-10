@@ -12,6 +12,8 @@ pub const event = @import("event.zig");
 pub const keys = @import("keys.zig");
 pub const bip39 = @import("bip39.zig");
 pub const nip06 = @import("nip06.zig");
+pub const filter = @import("filter.zig");
+pub const message = @import("message.zig");
 
 test "module compiles and version is set" {
     try std.testing.expect(version.len > 0);

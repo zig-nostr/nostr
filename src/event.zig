@@ -217,21 +217,36 @@ pub fn fromJson(gpa: std.mem.Allocator, json_text: []const u8) !Parsed {
 
     const wire = try std.json.parseFromSliceLeaky(WireEvent, allocator, json_text, .{});
 
-    const id = try hex.decodeFixed(32, wire.id);
-    const pubkey = try hex.decodeFixed(32, wire.pubkey);
-    const sig = try hex.decodeFixed(64, wire.sig);
-
     return Parsed{
         .arena = arena,
-        .value = Event{
-            .id = id,
-            .pubkey = pubkey,
-            .created_at = wire.created_at,
-            .kind = wire.kind,
-            .tags = wire.tags,
-            .content = wire.content,
-            .sig = sig,
-        },
+        .value = try fromWire(wire),
+    };
+}
+
+/// Builds an `Event` from an already-parsed `std.json.Value` (which must be a
+/// JSON object) into `allocator`. The returned event borrows string/tag
+/// storage from `allocator`, so it must be arena-like and outlive the event.
+///
+/// This is the entry point the relay-message parser uses: a relay `EVENT`
+/// message is a JSON array whose third element is the event object, and the
+/// whole message shares one arena, so re-serializing just to call `fromJson`
+/// would be wasteful.
+pub fn fromValueLeaky(allocator: std.mem.Allocator, value: std.json.Value) !Event {
+    const wire = try std.json.parseFromValueLeaky(WireEvent, allocator, value, .{});
+    return fromWire(wire);
+}
+
+/// Converts the parsed wire representation into an `Event`, decoding the hex
+/// id/pubkey/sig fields. Shared by `fromJson` and `fromValueLeaky`.
+fn fromWire(wire: WireEvent) hex.Error!Event {
+    return Event{
+        .id = try hex.decodeFixed(32, wire.id),
+        .pubkey = try hex.decodeFixed(32, wire.pubkey),
+        .created_at = wire.created_at,
+        .kind = wire.kind,
+        .tags = wire.tags,
+        .content = wire.content,
+        .sig = try hex.decodeFixed(64, wire.sig),
     };
 }
 
