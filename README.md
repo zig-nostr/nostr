@@ -12,18 +12,28 @@ transport with the outbox model, NIP-44/NIP-17 encrypted messaging, and a
 zero-copy local event store modeled on
 [nostrdb](https://github.com/damus-io/nostrdb).
 
-**Status: pre-alpha.** The repository currently contains only workflow and
-build scaffolding (Milestone A1). No protocol functionality has shipped yet
-— see [`CURRENT_STATE.md`](CURRENT_STATE.md) for what's in progress and the
+**Status: pre-alpha, `v0.1.0`.** Milestone A2 (library core) has shipped:
+secp256k1 keys and BIP-340 Schnorr signatures (audited libsecp256k1
+binding, full official test-vector suite passing), the NIP-01 event model
+with canonical id hashing and signing, NIP-19 bech32 entity encoding,
+NIP-06 mnemonic-based key derivation, and NIP-49 encrypted key storage.
+Relay transport, the outbox model, and the local event store land in
+upcoming milestones — see [`CURRENT_STATE.md`](CURRENT_STATE.md) for what's
+in progress and the
 [project board](https://github.com/orgs/zig-nostr/projects) for the full
 milestone roadmap.
 
 ## Install
 
-Not yet published. Once Milestone A2 ships an installable module:
-
+```sh
+zig fetch --save https://github.com/zig-nostr/nostr/archive/refs/tags/v0.1.0.tar.gz
 ```
-zig fetch --save https://github.com/zig-nostr/nostr/archive/<ref>.tar.gz
+
+Then in `build.zig`:
+
+```zig
+const nostr = b.dependency("nostr", .{ .target = target, .optimize = optimize });
+your_module.addImport("nostr", nostr.module("nostr"));
 ```
 
 ## Development
