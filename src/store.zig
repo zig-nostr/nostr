@@ -368,6 +368,100 @@ pub const Store = struct {
         return QueryResult{ .arena = arena, .events = events };
     }
 
+    // -- Local-first reconciliation -----------------------------------------
+
+    /// The newest `created_at` among locally stored events matching `filter`,
+    /// or null if none match.
+    pub fn newestMatching(self: *Store, gpa: std.mem.Allocator, filter: Filter) Error!?i64 {
+        var f = filter;
+        f.limit = 1; // query returns newest-first, so we only need the first
+        var r = try self.query(gpa, f);
+        defer r.deinit();
+        if (r.events.len == 0) return null;
+        return r.events[0].created_at;
+    }
+
+    /// Builds the filter to send to relays when reconciling a local-first view:
+    /// a copy of `filter` whose `since` is advanced to the newest locally stored
+    /// matching event, so the subscription only streams what the cache is
+    /// missing. `since` stays inclusive (not `+1`) so events sharing the newest
+    /// timestamp are not skipped — `ingest` deduplicates the boundary re-fetch.
+    ///
+    /// Typical flow: render immediately from `query(filter)`, send
+    /// `message.encodeReq` of `reconcileFilter(filter)` to the relays, and feed
+    /// each incoming event back through `ingest`; a later `query` then reflects
+    /// the reconciled state.
+    pub fn reconcileFilter(self: *Store, gpa: std.mem.Allocator, filter: Filter) Error!Filter {
+        var f = filter;
+        if (try self.newestMatching(gpa, filter)) |newest| {
+            if (f.since == null or f.since.? < newest) f.since = newest;
+        }
+        return f;
+    }
+
+    // -- Cache policy -------------------------------------------------------
+
+    /// The number of events currently stored (O(1), from LMDB's statistics).
+    pub fn eventCount(self: *Store) Error!usize {
+        var txn: ?*c.MDB_txn = null;
+        try check(c.mdb_txn_begin(self.env, null, @intCast(c.MDB_RDONLY), &txn));
+        defer c.mdb_txn_abort(txn);
+        var stat: c.MDB_stat = undefined;
+        try check(c.mdb_stat(txn, self.events_dbi, &stat));
+        return stat.ms_entries;
+    }
+
+    /// Evicts the oldest events (by `created_at`) until at most `max_events`
+    /// remain, removing each event's record and all its index entries. Returns
+    /// how many were evicted. This is a size-cap cache policy; evicted events
+    /// are not tombstoned, so they can be re-fetched and re-ingested later.
+    pub fn evictToCap(self: *Store, gpa: std.mem.Allocator, max_events: usize) Error!usize {
+        var txn: ?*c.MDB_txn = null;
+        try check(c.mdb_txn_begin(self.env, null, 0, &txn));
+        errdefer c.mdb_txn_abort(txn);
+
+        var stat: c.MDB_stat = undefined;
+        try check(c.mdb_stat(txn, self.events_dbi, &stat));
+        var remaining = stat.ms_entries;
+
+        var scratch = std.heap.ArenaAllocator.init(gpa);
+        defer scratch.deinit();
+
+        var evicted: usize = 0;
+        while (remaining > max_events) {
+            // The first key in the created_at index is the oldest event.
+            var cursor: ?*c.MDB_cursor = null;
+            try check(c.mdb_cursor_open(txn, self.idx_created_dbi, &cursor));
+            var k: c.MDB_val = undefined;
+            var v: c.MDB_val = undefined;
+            const rc = c.mdb_cursor_get(cursor, &k, &v, c.MDB_FIRST);
+            const key = valBytes(k);
+            if (rc != c.MDB_SUCCESS or key.len < 32) {
+                c.mdb_cursor_close(cursor);
+                break;
+            }
+            const id: [32]u8 = key[key.len - 32 ..][0..32].*;
+            c.mdb_cursor_close(cursor);
+
+            var ek = val(&id);
+            var ev: c.MDB_val = undefined;
+            const erc = c.mdb_get(txn, self.events_dbi, &ek, &ev);
+            if (erc == c.MDB_NOTFOUND) break; // index/record inconsistency; stop
+            try check(erc);
+
+            _ = scratch.reset(.retain_capacity);
+            const decoded = try decodeEvent(scratch.allocator(), valBytes(ev));
+            try self.removeEvent(gpa, txn, decoded);
+            try self.clearReplCoordinate(gpa, txn, decoded);
+
+            remaining -= 1;
+            evicted += 1;
+        }
+
+        try check(c.mdb_txn_commit(txn));
+        return evicted;
+    }
+
     /// Populates `candidates` (deduplicated via `seen`) with event ids to
     /// evaluate, chosen from the most selective index the filter allows.
     fn collectCandidates(
@@ -1588,4 +1682,100 @@ test "store: conversation index returns both sides of a thread, newest-first" {
         defer r.deinit();
         try std.testing.expectEqual(@as(usize, 2), r.events.len);
     }
+}
+
+// -- local-first / cache tests ----------------------------------------------
+
+test "store: local-first snapshot, then reconcile with newer events" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var store = try openTempStore(&tmp, "reconcile.mdb", &buf);
+    defer store.deinit();
+
+    const a = [_]u8{0xA1} ** 32;
+    const by_a = Filter{ .authors = &[_][32]u8{a} };
+
+    // A prior sync populated the cache.
+    _ = try store.putEvent(gpa, qEvent(1, a, 1, 100, &[_]Tag{}));
+    _ = try store.putEvent(gpa, qEvent(2, a, 1, 200, &[_]Tag{}));
+
+    // The UI renders straight from the cache with no network involved.
+    {
+        var r = try store.query(gpa, by_a);
+        defer r.deinit();
+        try std.testing.expectEqual(@as(usize, 2), r.events.len);
+    }
+    try std.testing.expectEqual(@as(?i64, 200), try store.newestMatching(gpa, by_a));
+
+    // The reconcile filter only asks the relay for events at/after the newest
+    // cached one.
+    {
+        const rf = try store.reconcileFilter(gpa, by_a);
+        try std.testing.expectEqual(@as(?i64, 200), rf.since);
+    }
+
+    // A relay delivers a newer event, which we ingest; the next query reflects
+    // the reconciled state and the watermark advances.
+    _ = try store.putEvent(gpa, qEvent(3, a, 1, 300, &[_]Tag{}));
+    {
+        var r = try store.query(gpa, by_a);
+        defer r.deinit();
+        try std.testing.expectEqual(@as(usize, 3), r.events.len);
+        try std.testing.expectEqual(@as(u8, 3), r.events[0].id[0]); // newest first
+    }
+    {
+        const rf = try store.reconcileFilter(gpa, by_a);
+        try std.testing.expectEqual(@as(?i64, 300), rf.since);
+    }
+
+    // A caller's stricter `since` is preserved.
+    {
+        const rf = try store.reconcileFilter(gpa, .{ .authors = &[_][32]u8{a}, .since = 1000 });
+        try std.testing.expectEqual(@as(?i64, 1000), rf.since);
+    }
+
+    // No local matches -> no watermark.
+    try std.testing.expectEqual(
+        @as(?i64, null),
+        try store.newestMatching(gpa, .{ .authors = &[_][32]u8{[_]u8{0xFF} ** 32} }),
+    );
+}
+
+test "store: evictToCap removes the oldest events and their indexes" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var store = try openTempStore(&tmp, "evict.mdb", &buf);
+    defer store.deinit();
+
+    const a = [_]u8{0xA1} ** 32;
+    // Seeds 1..5 at times 100..500.
+    for (1..6) |i| {
+        const seed: u8 = @intCast(i);
+        _ = try store.putEvent(gpa, qEvent(seed, a, 1, @as(i64, @intCast(i)) * 100, &[_]Tag{}));
+    }
+    try std.testing.expectEqual(@as(usize, 5), try store.eventCount());
+
+    // Cap at 3: the two oldest (seeds 1, 2) are evicted.
+    try std.testing.expectEqual(@as(usize, 2), try store.evictToCap(gpa, 3));
+    try std.testing.expectEqual(@as(usize, 3), try store.eventCount());
+    try std.testing.expect(!(try store.hasEvent([_]u8{1} ** 32)));
+    try std.testing.expect(!(try store.hasEvent([_]u8{2} ** 32)));
+    try std.testing.expect(try store.hasEvent([_]u8{3} ** 32));
+    try std.testing.expect(try store.hasEvent([_]u8{5} ** 32));
+
+    // Indexes were cleaned too: the query sees only the survivors, newest-first.
+    {
+        var r = try store.query(gpa, .{ .authors = &[_][32]u8{a} });
+        defer r.deinit();
+        try std.testing.expectEqual(@as(usize, 3), r.events.len);
+        try std.testing.expectEqual(@as(u8, 5), r.events[0].id[0]);
+        try std.testing.expectEqual(@as(u8, 3), r.events[2].id[0]);
+    }
+
+    // Already under the cap: nothing to do.
+    try std.testing.expectEqual(@as(usize, 0), try store.evictToCap(gpa, 10));
 }
