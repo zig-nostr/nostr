@@ -4,11 +4,11 @@ Updated inside every PR that changes it. Never updated locally after merge.
 
 ## Version
 
-Unreleased (pre-`v0.1.0`).
+`v0.1.0` — Milestone A2 (library core: keys, encoding, events, signatures).
 
 ## Active milestone
 
-**A2 — Library core: keys, encoding, events, signatures** (targets `v0.1.0`).
+**A3 — Library transport: relays, subscriptions, outbox routing.**
 
 ## What's done
 
@@ -38,20 +38,20 @@ Unreleased (pre-`v0.1.0`).
 - NIP-06 key derivation (`src/bip39.zig`, `src/nip06.zig`): BIP-39 mnemonic
   generate/parse/checksum (embedded official English wordlist) and BIP-32
   HD derivation for `m/44'/1237'/<account>'/0/0`, verified against both
-  official NIP-06 test vectors byte-for-byte. This closes out A2's Tier-1
-  scope — all acceptance criteria in issue #2 are now met except the
-  version tag.
+  official NIP-06 test vectors byte-for-byte.
+- **Tagged `v0.1.0`** — Milestone A2 complete, issue #2 closed.
 
 ## What's in progress
 
-- A2: nothing left but tagging `v0.1.0` (issue #2's acceptance criteria are
-  all met: BIP-340 suite, NIP-19 round trips, NIP-06 + NIP-49 tests, NIP-01
-  id-hash tests).
+- A3: not yet started — see "What's next".
 
 ## What's next
 
-1. Tag `v0.1.0`, close issue #2, write release notes.
-2. Start A3 (transport: relays, subscriptions, outbox routing).
+1. A3: websocket relay client (TLS), reconnect/backoff.
+2. A3: NIP-01 message handling (`EVENT`/`REQ`/`CLOSE`/`EOSE`/`NOTICE`/`OK`/`CLOSED`),
+   filter model, subscription management, multi-relay pool with parallel fanout.
+3. A3: NIP-65 outbox routing (parse `kind:10002`, route reads/writes by
+   relay list, zero hardcoded relays).
 
 ## Known blockers / pending decisions
 
