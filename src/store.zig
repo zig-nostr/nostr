@@ -58,6 +58,10 @@ pub const Store = struct {
     /// Tombstones for NIP-09 deletions: deleted event id -> the pubkey that
     /// deleted it. Prevents a deleted event from being re-added by its author.
     deleted_dbi: c.MDB_dbi,
+    /// Conversation index for direct messages: canonical-pair ++ time-key ++ id
+    /// -> (empty). The canonical pair is the two participants' pubkeys sorted,
+    /// so both sides of a conversation resolve to the same prefix.
+    idx_convo_dbi: c.MDB_dbi,
 
     pub const OpenOptions = struct {
         /// Upper bound on the memory map (and thus the on-disk database) size.
@@ -95,6 +99,7 @@ pub const Store = struct {
             .idx_tag_dbi = try openDb(txn, "idx_tag"),
             .repl_dbi = try openDb(txn, "repl"),
             .deleted_dbi = try openDb(txn, "deleted"),
+            .idx_convo_dbi = try openDb(txn, "idx_convo"),
         };
         try check(c.mdb_txn_commit(txn));
         return store;
@@ -202,6 +207,23 @@ pub const Store = struct {
             try key.appendSlice(gpa, &ev.id);
             try indexOp(txn, self.idx_tag_dbi, key.items, op);
         }
+
+        // conversation index for direct messages: one entry per counterparty
+        // (each `p`-tagged pubkey), keyed by the canonical (sorted) pair so
+        // that both participants resolve to the same conversation prefix.
+        if (isDirectMessage(ev.kind)) {
+            for (ev.tags) |tag| {
+                if (tag.len < 2 or tag[0].len != 1 or tag[0][0] != 'p') continue;
+                const other = hex.decodeFixed(32, tag[1]) catch continue;
+                if (std.mem.eql(u8, &other, &ev.pubkey)) continue; // skip self
+                const pair = canonicalPair(ev.pubkey, other);
+                key.clearRetainingCapacity();
+                try key.appendSlice(gpa, &pair);
+                try key.appendSlice(gpa, &tk);
+                try key.appendSlice(gpa, &ev.id);
+                try indexOp(txn, self.idx_convo_dbi, key.items, op);
+            }
+        }
     }
 
     /// Encodes and stores `ev`'s record and index entries within `txn`,
@@ -283,6 +305,39 @@ pub const Store = struct {
         defer candidates.deinit(gpa);
         try self.collectCandidates(txn, gpa, filter, &candidates, &seen);
 
+        return self.collectResults(txn, gpa, candidates.items, filter, filter.limit);
+    }
+
+    /// Returns the direct-message conversation between pubkeys `a` and `b`
+    /// (both directions), newest-first, capped at `limit` when set. Served from
+    /// the conversation index, so it does not scan unrelated events.
+    pub fn queryConversation(self: *Store, gpa: std.mem.Allocator, a: [32]u8, b: [32]u8, limit: ?u32) Error!QueryResult {
+        var txn: ?*c.MDB_txn = null;
+        try check(c.mdb_txn_begin(self.env, null, @intCast(c.MDB_RDONLY), &txn));
+        defer c.mdb_txn_abort(txn);
+
+        var seen: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
+        defer seen.deinit(gpa);
+        var candidates: std.ArrayList([32]u8) = .empty;
+        defer candidates.deinit(gpa);
+        const prefix = canonicalPair(a, b);
+        try scanPrefix(txn, self.idx_convo_dbi, gpa, &prefix, &candidates, &seen);
+
+        return self.collectResults(txn, gpa, candidates.items, null, limit);
+    }
+
+    /// Fetches each candidate id, decodes it, keeps those matching `filter`
+    /// (when given), and returns them newest-first capped at `limit`. The
+    /// returned result owns an arena holding all event data; `txn` need only
+    /// stay open for the duration of this call.
+    fn collectResults(
+        self: *Store,
+        txn: ?*c.MDB_txn,
+        gpa: std.mem.Allocator,
+        candidate_ids: []const [32]u8,
+        filter: ?Filter,
+        limit: ?u32,
+    ) Error!QueryResult {
         const arena = try gpa.create(std.heap.ArenaAllocator);
         arena.* = std.heap.ArenaAllocator.init(gpa);
         errdefer {
@@ -293,19 +348,22 @@ pub const Store = struct {
 
         var matched: std.ArrayList(Event) = .empty;
         defer matched.deinit(gpa);
-        for (candidates.items) |id| {
+        for (candidate_ids) |id| {
             var k = val(&id);
             var v: c.MDB_val = undefined;
             const rc = c.mdb_get(txn, self.events_dbi, &k, &v);
             if (rc == c.MDB_NOTFOUND) continue;
             try check(rc);
             const ev = try decodeEvent(aa, valBytes(v));
-            if (filter.matches(ev)) try matched.append(gpa, ev);
+            if (filter) |f| {
+                if (!f.matches(ev)) continue;
+            }
+            try matched.append(gpa, ev);
         }
 
         std.mem.sort(Event, matched.items, {}, lessByTimeDesc);
 
-        const count = if (filter.limit) |l| @min(@as(usize, l), matched.items.len) else matched.items.len;
+        const count = if (limit) |l| @min(@as(usize, l), matched.items.len) else matched.items.len;
         const events = try aa.dupe(Event, matched.items[0..count]);
         return QueryResult{ .arena = arena, .events = events };
     }
@@ -653,6 +711,23 @@ fn appendCoord(gpa: std.mem.Allocator, out: *std.ArrayList(u8), pubkey: [32]u8, 
     std.mem.writeInt(u16, &kb, kind, .big);
     try out.appendSlice(gpa, &kb);
     if (dtag) |d| try out.appendSlice(gpa, d);
+}
+
+/// The direct-message kinds whose participants are conversation-indexed:
+/// NIP-04 legacy DMs (kind 4) and NIP-17 chat messages (kind 14, the
+/// decrypted rumor a messenger re-ingests after unwrapping a gift wrap).
+fn isDirectMessage(kind: u16) bool {
+    return kind == 4 or kind == 14;
+}
+
+/// The two pubkeys sorted ascending and concatenated, so a conversation has one
+/// canonical 64-byte key regardless of who authored a given message.
+fn canonicalPair(a: [32]u8, b: [32]u8) [64]u8 {
+    var out: [64]u8 = undefined;
+    const a_first = std.mem.order(u8, &a, &b) != .gt;
+    @memcpy(out[0..32], if (a_first) &a else &b);
+    @memcpy(out[32..64], if (a_first) &b else &a);
+    return out;
 }
 
 fn lessByTimeDesc(_: void, a: Event, b: Event) bool {
@@ -1408,4 +1483,109 @@ test "store: ingest a-tag deletion removes a parameterized-replaceable event" {
     const article2 = try event.create(gpa, signer, kp, 3000, 30000, &d_tag, "new article", null);
     try std.testing.expectEqual(IngestResult.added, try store.ingest(gpa, article2, .{}));
     try std.testing.expect(try store.hasEvent(article2.id));
+}
+
+// -- conversation-index tests -----------------------------------------------
+
+test "store: canonicalPair is order-independent" {
+    const x = [_]u8{0x01} ** 32;
+    const y = [_]u8{0x02} ** 32;
+    try std.testing.expectEqualSlices(u8, &canonicalPair(x, y), &canonicalPair(y, x));
+    // The lower pubkey comes first.
+    try std.testing.expectEqualSlices(u8, &x, canonicalPair(y, x)[0..32]);
+}
+
+/// Creates a direct message of `kind` from `author_kp` to `recipient_pk` and
+/// ingests it, returning the event id. All borrowed tag storage stays local.
+fn ingestDM(
+    store: *Store,
+    gpa: std.mem.Allocator,
+    signer: keys.Signer,
+    author_kp: keys.KeyPair,
+    recipient_pk: [32]u8,
+    kind: u16,
+    created_at: i64,
+    content: []const u8,
+) ![32]u8 {
+    const r_hex = std.fmt.bytesToHex(recipient_pk, .lower);
+    const p_tag = [_]Tag{&[_][]const u8{ "p", r_hex[0..] }};
+    const dm = try event.create(gpa, signer, author_kp, created_at, kind, &p_tag, content, null);
+    _ = try store.ingest(gpa, dm, .{});
+    return dm.id;
+}
+
+fn resultIds(r: QueryResult, out: [][32]u8) [][32]u8 {
+    for (r.events, 0..) |e, i| out[i] = e.id;
+    return out[0..r.events.len];
+}
+
+test "store: conversation index returns both sides of a thread, newest-first" {
+    const gpa = std.testing.allocator;
+    var signer = try keys.Signer.initRandomized(std.testing.io);
+    defer signer.deinit();
+    const kp_a = try signer.generateKeyPair(std.testing.io);
+    const kp_b = try signer.generateKeyPair(std.testing.io);
+    const kp_c = try signer.generateKeyPair(std.testing.io);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var store = try openTempStore(&tmp, "convo.mdb", &buf);
+    defer store.deinit();
+
+    // A<->B thread across both directions and both DM kinds, plus an A->C
+    // message that belongs to a different conversation.
+    const ab1 = try ingestDM(&store, gpa, signer, kp_a, kp_b.public_key, 4, 100, "hi B");
+    const ba = try ingestDM(&store, gpa, signer, kp_b, kp_a.public_key, 4, 200, "hi A");
+    const ab2 = try ingestDM(&store, gpa, signer, kp_a, kp_b.public_key, 14, 300, "later");
+    const ac = try ingestDM(&store, gpa, signer, kp_a, kp_c.public_key, 4, 150, "hi C");
+
+    var ids: [8][32]u8 = undefined;
+
+    // A<->B, newest-first, from either participant's perspective.
+    {
+        var r = try store.queryConversation(gpa, kp_a.public_key, kp_b.public_key, null);
+        defer r.deinit();
+        try std.testing.expectEqual(@as(usize, 3), r.events.len);
+        const got = resultIds(r, &ids);
+        try std.testing.expectEqualSlices(u8, &ab2, &got[0]);
+        try std.testing.expectEqualSlices(u8, &ba, &got[1]);
+        try std.testing.expectEqualSlices(u8, &ab1, &got[2]);
+    }
+    {
+        var r = try store.queryConversation(gpa, kp_b.public_key, kp_a.public_key, null);
+        defer r.deinit();
+        try std.testing.expectEqual(@as(usize, 3), r.events.len); // symmetric
+    }
+    // A<->C has just the one message.
+    {
+        var r = try store.queryConversation(gpa, kp_a.public_key, kp_c.public_key, null);
+        defer r.deinit();
+        try std.testing.expectEqual(@as(usize, 1), r.events.len);
+        try std.testing.expectEqualSlices(u8, &ac, &r.events[0].id);
+    }
+    // Limit caps the newest messages.
+    {
+        var r = try store.queryConversation(gpa, kp_a.public_key, kp_b.public_key, 2);
+        defer r.deinit();
+        try std.testing.expectEqual(@as(usize, 2), r.events.len);
+        try std.testing.expectEqualSlices(u8, &ab2, &r.events[0].id);
+        try std.testing.expectEqualSlices(u8, &ba, &r.events[1].id);
+    }
+    // An unrelated pair has no conversation.
+    {
+        var r = try store.queryConversation(gpa, kp_b.public_key, kp_c.public_key, null);
+        defer r.deinit();
+        try std.testing.expectEqual(@as(usize, 0), r.events.len);
+    }
+
+    // Deleting a message drops it from the conversation index too.
+    {
+        const id_hex = std.fmt.bytesToHex(ab1, .lower);
+        const del = try event.create(gpa, signer, kp_a, 400, 5, &[_]Tag{&[_][]const u8{ "e", id_hex[0..] }}, "", null);
+        _ = try store.ingest(gpa, del, .{});
+        var r = try store.queryConversation(gpa, kp_a.public_key, kp_b.public_key, null);
+        defer r.deinit();
+        try std.testing.expectEqual(@as(usize, 2), r.events.len);
+    }
 }
