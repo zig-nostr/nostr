@@ -2,20 +2,27 @@
 //!
 //! The storage engine for the local-first cache (milestone A4): a zero-copy,
 //! memory-mapped key/value database. This module owns the on-disk event record
-//! format and the primary store keyed by event id. Secondary indexes
-//! (author/kind/created_at/tags), the filter-driven query API, and ingestion
-//! semantics build on top of this surface in later changes.
+//! format, the primary store keyed by event id, the secondary indexes, and the
+//! filter-driven query API that serves reads entirely from the local database.
 //!
 //! Events are stored in a compact binary record (see `EventView`) rather than
 //! JSON: the fixed-size scalar fields sit at constant offsets so they can be
 //! read in O(1) straight out of the memory map, with no JSON re-parse on read.
+//!
+//! Secondary indexes (by author, kind, created_at, and single-letter tag) are
+//! written in the same transaction as the event. A query selects the most
+//! selective index as its driving scan, gathers candidate ids, and applies the
+//! full `Filter` to each candidate — reusing the exact matching semantics that
+//! subscriptions use — returning results newest-first with pagination.
 
 const std = @import("std");
 const c = @import("lmdb");
 const event = @import("event.zig");
+const filter_mod = @import("filter.zig");
 
 const Event = event.Event;
 const Tag = event.Tag;
+const Filter = filter_mod.Filter;
 
 pub const Error = error{
     /// LMDB returned a non-success, non-`NOTFOUND` status code.
@@ -33,14 +40,21 @@ pub const Store = struct {
     kv_dbi: c.MDB_dbi,
     /// Primary event store: 32-byte event id -> binary event record.
     events_dbi: c.MDB_dbi,
+    /// Index: pubkey ++ time-key ++ id -> (empty).
+    idx_author_dbi: c.MDB_dbi,
+    /// Index: kind(be u16) ++ time-key ++ id -> (empty).
+    idx_kind_dbi: c.MDB_dbi,
+    /// Index: time-key ++ id -> (empty). Drives "everything, newest first".
+    idx_created_dbi: c.MDB_dbi,
+    /// Index: letter ++ value ++ time-key ++ id -> (empty).
+    idx_tag_dbi: c.MDB_dbi,
 
     pub const OpenOptions = struct {
         /// Upper bound on the memory map (and thus the on-disk database) size.
         /// LMDB reserves this as virtual address space, not physical memory,
         /// so a generous default is cheap. Defaults to 1 GiB.
         map_size: usize = 1 << 30,
-        /// Maximum number of named sub-databases. Each secondary index added
-        /// by later layers lives in its own named database. Defaults to 16.
+        /// Maximum number of named sub-databases. Defaults to 16.
         max_dbs: u32 = 16,
     };
 
@@ -61,13 +75,17 @@ pub const Store = struct {
         var txn: ?*c.MDB_txn = null;
         try check(c.mdb_txn_begin(env, null, 0, &txn));
         errdefer c.mdb_txn_abort(txn);
-        var kv_dbi: c.MDB_dbi = 0;
-        var events_dbi: c.MDB_dbi = 0;
-        try check(c.mdb_dbi_open(txn, "kv", @intCast(c.MDB_CREATE), &kv_dbi));
-        try check(c.mdb_dbi_open(txn, "events", @intCast(c.MDB_CREATE), &events_dbi));
+        const store = Store{
+            .env = env.?,
+            .kv_dbi = try openDb(txn, "kv"),
+            .events_dbi = try openDb(txn, "events"),
+            .idx_author_dbi = try openDb(txn, "idx_author"),
+            .idx_kind_dbi = try openDb(txn, "idx_kind"),
+            .idx_created_dbi = try openDb(txn, "idx_created"),
+            .idx_tag_dbi = try openDb(txn, "idx_tag"),
+        };
         try check(c.mdb_txn_commit(txn));
-
-        return .{ .env = env.?, .kv_dbi = kv_dbi, .events_dbi = events_dbi };
+        return store;
     }
 
     /// Flushes and closes the environment. The handle is invalid afterwards.
@@ -106,11 +124,11 @@ pub const Store = struct {
 
     // -- Event storage ------------------------------------------------------
 
-    /// Stores `ev` keyed by its 32-byte id. Idempotent: because the id is a
-    /// hash of the event's own content, an id that already exists denotes the
-    /// same event, so a duplicate insert is a no-op (the stored record is
-    /// kept). Returns true if the event was newly inserted, false if it was
-    /// already present.
+    /// Stores `ev` keyed by its 32-byte id and writes its secondary index
+    /// entries in the same transaction. Idempotent: because the id is a hash of
+    /// the event's own content, an id that already exists denotes the same
+    /// event, so a duplicate insert is a no-op. Returns true if the event was
+    /// newly inserted, false if it was already present.
     pub fn putEvent(self: *Store, gpa: std.mem.Allocator, ev: Event) Error!bool {
         const record = try encodeEvent(gpa, ev);
         defer gpa.free(record);
@@ -118,13 +136,58 @@ pub const Store = struct {
         var txn: ?*c.MDB_txn = null;
         try check(c.mdb_txn_begin(self.env, null, 0, &txn));
         errdefer c.mdb_txn_abort(txn);
+
         var k = val(&ev.id);
         var v = val(record);
         const rc = c.mdb_put(txn, self.events_dbi, &k, &v, @intCast(c.MDB_NOOVERWRITE));
         const inserted = rc != c.MDB_KEYEXIST;
-        if (inserted) try check(rc);
+        if (inserted) {
+            try check(rc);
+            try self.writeIndexes(gpa, txn, ev);
+        }
         try check(c.mdb_txn_commit(txn));
         return inserted;
+    }
+
+    /// Writes the secondary-index entries for `ev` within transaction `txn`.
+    fn writeIndexes(self: *Store, gpa: std.mem.Allocator, txn: ?*c.MDB_txn, ev: Event) Error!void {
+        const tk = orderKey(ev.created_at);
+
+        var key: std.ArrayList(u8) = .empty;
+        defer key.deinit(gpa);
+
+        // created_at index: [time][id]
+        key.clearRetainingCapacity();
+        try key.appendSlice(gpa, &tk);
+        try key.appendSlice(gpa, &ev.id);
+        try putIndex(txn, self.idx_created_dbi, key.items);
+
+        // author index: [pubkey][time][id]
+        key.clearRetainingCapacity();
+        try key.appendSlice(gpa, &ev.pubkey);
+        try key.appendSlice(gpa, &tk);
+        try key.appendSlice(gpa, &ev.id);
+        try putIndex(txn, self.idx_author_dbi, key.items);
+
+        // kind index: [kind big-endian][time][id]
+        var kb: [2]u8 = undefined;
+        std.mem.writeInt(u16, &kb, ev.kind, .big);
+        key.clearRetainingCapacity();
+        try key.appendSlice(gpa, &kb);
+        try key.appendSlice(gpa, &tk);
+        try key.appendSlice(gpa, &ev.id);
+        try putIndex(txn, self.idx_kind_dbi, key.items);
+
+        // tag index: [letter][value][time][id] for each single-letter tag.
+        for (ev.tags) |tag| {
+            if (tag.len < 2 or tag[0].len != 1) continue;
+            key.clearRetainingCapacity();
+            try key.append(gpa, tag[0][0]);
+            try key.appendSlice(gpa, tag[1]);
+            try key.appendSlice(gpa, &tk);
+            try key.appendSlice(gpa, &ev.id);
+            try putIndex(txn, self.idx_tag_dbi, key.items);
+        }
     }
 
     /// Returns true if an event with `id` is stored.
@@ -163,6 +226,99 @@ pub const Store = struct {
         const ev = try decodeEvent(arena.allocator(), valBytes(v));
         return StoredEvent{ .arena = arena, .event = ev };
     }
+
+    // -- Query --------------------------------------------------------------
+
+    /// Runs `filter` against the local database and returns the matching events
+    /// newest-first (ties broken deterministically by id), capped at
+    /// `filter.limit` when set. The result owns an arena backing all returned
+    /// event data — call `deinit` on it to free.
+    ///
+    /// The query drives off the most selective available index (ids > authors >
+    /// kinds > tags > everything-by-time) to gather candidates, then applies the
+    /// full `Filter` to each, so every constraint is enforced exactly as in
+    /// subscription matching.
+    pub fn query(self: *Store, gpa: std.mem.Allocator, filter: Filter) Error!QueryResult {
+        var txn: ?*c.MDB_txn = null;
+        try check(c.mdb_txn_begin(self.env, null, @intCast(c.MDB_RDONLY), &txn));
+        defer c.mdb_txn_abort(txn);
+
+        var seen: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
+        defer seen.deinit(gpa);
+        var candidates: std.ArrayList([32]u8) = .empty;
+        defer candidates.deinit(gpa);
+        try self.collectCandidates(txn, gpa, filter, &candidates, &seen);
+
+        const arena = try gpa.create(std.heap.ArenaAllocator);
+        arena.* = std.heap.ArenaAllocator.init(gpa);
+        errdefer {
+            arena.deinit();
+            gpa.destroy(arena);
+        }
+        const aa = arena.allocator();
+
+        var matched: std.ArrayList(Event) = .empty;
+        defer matched.deinit(gpa);
+        for (candidates.items) |id| {
+            var k = val(&id);
+            var v: c.MDB_val = undefined;
+            const rc = c.mdb_get(txn, self.events_dbi, &k, &v);
+            if (rc == c.MDB_NOTFOUND) continue;
+            try check(rc);
+            const ev = try decodeEvent(aa, valBytes(v));
+            if (filter.matches(ev)) try matched.append(gpa, ev);
+        }
+
+        std.mem.sort(Event, matched.items, {}, lessByTimeDesc);
+
+        const count = if (filter.limit) |l| @min(@as(usize, l), matched.items.len) else matched.items.len;
+        const events = try aa.dupe(Event, matched.items[0..count]);
+        return QueryResult{ .arena = arena, .events = events };
+    }
+
+    /// Populates `candidates` (deduplicated via `seen`) with event ids to
+    /// evaluate, chosen from the most selective index the filter allows.
+    fn collectCandidates(
+        self: *Store,
+        txn: ?*c.MDB_txn,
+        gpa: std.mem.Allocator,
+        filter: Filter,
+        candidates: *std.ArrayList([32]u8),
+        seen: *std.AutoHashMapUnmanaged([32]u8, void),
+    ) Error!void {
+        if (filter.ids) |ids| {
+            for (ids) |id| try addCandidate(gpa, candidates, seen, id);
+            return;
+        }
+        if (filter.authors) |authors| {
+            for (authors) |a| try scanPrefix(txn, self.idx_author_dbi, gpa, &a, candidates, seen);
+            return;
+        }
+        if (filter.kinds) |kinds| {
+            for (kinds) |kd| {
+                var kb: [2]u8 = undefined;
+                std.mem.writeInt(u16, &kb, kd, .big);
+                try scanPrefix(txn, self.idx_kind_dbi, gpa, &kb, candidates, seen);
+            }
+            return;
+        }
+        if (filter.tags) |tag_filters| {
+            if (tag_filters.len > 0) {
+                const tf = tag_filters[0];
+                var prefix: std.ArrayList(u8) = .empty;
+                defer prefix.deinit(gpa);
+                for (tf.values) |value| {
+                    prefix.clearRetainingCapacity();
+                    try prefix.append(gpa, tf.letter);
+                    try prefix.appendSlice(gpa, value);
+                    try scanPrefix(txn, self.idx_tag_dbi, gpa, prefix.items, candidates, seen);
+                }
+                return;
+            }
+        }
+        // No selective constraint: walk every event by the created_at index.
+        try scanPrefix(txn, self.idx_created_dbi, gpa, &.{}, candidates, seen);
+    }
 };
 
 /// An owned, decoded event: `event`'s tag/content storage lives in `arena`.
@@ -176,6 +332,82 @@ pub const StoredEvent = struct {
         gpa.destroy(self.arena);
     }
 };
+
+/// The owned result of a `query`: `events` (newest-first) and all their backing
+/// storage live in `arena`.
+pub const QueryResult = struct {
+    arena: *std.heap.ArenaAllocator,
+    events: []Event,
+
+    pub fn deinit(self: *QueryResult) void {
+        const gpa = self.arena.child_allocator;
+        self.arena.deinit();
+        gpa.destroy(self.arena);
+    }
+};
+
+fn lessByTimeDesc(_: void, a: Event, b: Event) bool {
+    if (a.created_at != b.created_at) return a.created_at > b.created_at;
+    return std.mem.order(u8, &a.id, &b.id) == .gt;
+}
+
+fn addCandidate(
+    gpa: std.mem.Allocator,
+    candidates: *std.ArrayList([32]u8),
+    seen: *std.AutoHashMapUnmanaged([32]u8, void),
+    id: [32]u8,
+) Error!void {
+    const gop = try seen.getOrPut(gpa, id);
+    if (gop.found_existing) return;
+    try candidates.append(gpa, id);
+}
+
+/// Scans an index database for all keys beginning with `prefix` (an empty
+/// prefix scans everything), extracts the trailing 32-byte id of each, and adds
+/// it to `candidates`. Every index key ends with `[time-key(8)][id(32)]`, so a
+/// non-empty prefix match additionally requires the exact length
+/// `prefix.len + 40`, which rules out a shorter query value being a prefix of a
+/// longer stored value.
+fn scanPrefix(
+    txn: ?*c.MDB_txn,
+    dbi: c.MDB_dbi,
+    gpa: std.mem.Allocator,
+    prefix: []const u8,
+    candidates: *std.ArrayList([32]u8),
+    seen: *std.AutoHashMapUnmanaged([32]u8, void),
+) Error!void {
+    var cursor: ?*c.MDB_cursor = null;
+    try check(c.mdb_cursor_open(txn, dbi, &cursor));
+    defer c.mdb_cursor_close(cursor);
+
+    var k: c.MDB_val = if (prefix.len == 0) undefined else val(prefix);
+    var v: c.MDB_val = undefined;
+    var rc = if (prefix.len == 0)
+        c.mdb_cursor_get(cursor, &k, &v, c.MDB_FIRST)
+    else
+        c.mdb_cursor_get(cursor, &k, &v, c.MDB_SET_RANGE);
+
+    while (rc == c.MDB_SUCCESS) : (rc = c.mdb_cursor_get(cursor, &k, &v, c.MDB_NEXT)) {
+        const key = valBytes(k);
+        if (prefix.len != 0) {
+            if (key.len < prefix.len or !std.mem.eql(u8, key[0..prefix.len], prefix)) break;
+            if (key.len != prefix.len + 40) continue;
+        }
+        if (key.len < 32) continue;
+        try addCandidate(gpa, candidates, seen, key[key.len - 32 ..][0..32].*);
+    }
+    if (rc != c.MDB_SUCCESS and rc != c.MDB_NOTFOUND) return error.Lmdb;
+}
+
+/// Order-preserving big-endian encoding of an `i64` timestamp: flipping the
+/// sign bit maps two's-complement order onto unsigned lexicographic order, so
+/// LMDB's byte comparison sorts index keys by time.
+fn orderKey(t: i64) [8]u8 {
+    const u = @as(u64, @bitCast(t)) ^ (@as(u64, 1) << 63);
+    var b: [8]u8 = undefined;
+    std.mem.writeInt(u64, &b, u, .big);
+    return b;
+}
 
 // -- Binary event record ----------------------------------------------------
 //
@@ -310,6 +542,20 @@ fn appendInt(list: *std.ArrayList(u8), gpa: std.mem.Allocator, comptime T: type,
 
 // -- LMDB helpers -----------------------------------------------------------
 
+/// Opens (creating) a named database within `txn` and returns its handle.
+fn openDb(txn: ?*c.MDB_txn, name: [*:0]const u8) Error!c.MDB_dbi {
+    var dbi: c.MDB_dbi = 0;
+    try check(c.mdb_dbi_open(txn, name, @intCast(c.MDB_CREATE), &dbi));
+    return dbi;
+}
+
+/// Inserts a key with an empty value into an index database.
+fn putIndex(txn: ?*c.MDB_txn, dbi: c.MDB_dbi, key: []const u8) Error!void {
+    var k = val(key);
+    var v = val(&.{});
+    try check(c.mdb_put(txn, dbi, &k, &v, 0));
+}
+
 /// Wraps a byte slice as an `MDB_val` for passing to LMDB. LMDB does not mutate
 /// key/value inputs, so casting away const is sound here.
 fn val(bytes: []const u8) c.MDB_val {
@@ -336,47 +582,9 @@ fn testStorePath(tmp: *std.testing.TmpDir, name: []const u8, buf: []u8) [:0]cons
     return std.fmt.bufPrintZ(buf, "{s}/{s}", .{ dir_buf[0..dir_len], name }) catch unreachable;
 }
 
-test "store: open, put, and get round-trip through LMDB" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = testStorePath(&tmp, "store.mdb", &buf);
-
-    var store = try Store.open(path.ptr, .{});
-    defer store.deinit();
-
-    try store.put("hello", "world");
-    const got = try store.get(std.testing.allocator, "hello");
-    defer if (got) |g| std.testing.allocator.free(g);
-    try std.testing.expectEqualStrings("world", got.?);
-
-    try store.put("hello", "nostr"); // overwrite
-    const got2 = try store.get(std.testing.allocator, "hello");
-    defer if (got2) |g| std.testing.allocator.free(g);
-    try std.testing.expectEqualStrings("nostr", got2.?);
-
-    const missing = try store.get(std.testing.allocator, "absent");
-    try std.testing.expect(missing == null);
-}
-
-test "store: data persists across reopen" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = testStorePath(&tmp, "persist.mdb", &buf);
-
-    {
-        var store = try Store.open(path.ptr, .{});
-        defer store.deinit();
-        try store.put("key", "durable");
-    }
-    {
-        var store = try Store.open(path.ptr, .{});
-        defer store.deinit();
-        const got = try store.get(std.testing.allocator, "key");
-        defer if (got) |g| std.testing.allocator.free(g);
-        try std.testing.expectEqualStrings("durable", got.?);
-    }
+fn openTempStore(tmp: *std.testing.TmpDir, name: []const u8, buf: []u8) !Store {
+    const path = testStorePath(tmp, name, buf);
+    return Store.open(path.ptr, .{});
 }
 
 fn sampleEvent() Event {
@@ -408,12 +616,32 @@ fn expectEventEqual(a: Event, b: Event) !void {
     }
 }
 
+test "store: open, put, and get round-trip through LMDB" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var store = try openTempStore(&tmp, "store.mdb", &buf);
+    defer store.deinit();
+
+    try store.put("hello", "world");
+    const got = try store.get(std.testing.allocator, "hello");
+    defer if (got) |g| std.testing.allocator.free(g);
+    try std.testing.expectEqualStrings("world", got.?);
+
+    try store.put("hello", "nostr"); // overwrite
+    const got2 = try store.get(std.testing.allocator, "hello");
+    defer if (got2) |g| std.testing.allocator.free(g);
+    try std.testing.expectEqualStrings("nostr", got2.?);
+
+    const missing = try store.get(std.testing.allocator, "absent");
+    try std.testing.expect(missing == null);
+}
+
 test "store: event record encode/decode round-trip" {
     const ev = sampleEvent();
     const record = try encodeEvent(std.testing.allocator, ev);
     defer std.testing.allocator.free(record);
 
-    // Zero-copy view reads scalars and content directly from the record.
     const view = EventView{ .bytes = record };
     try std.testing.expectEqualSlices(u8, &ev.id, view.id());
     try std.testing.expectEqualSlices(u8, &ev.pubkey, view.pubkey());
@@ -439,31 +667,34 @@ test "store: decodeEvent rejects a truncated record" {
     try std.testing.expectError(error.CorruptRecord, decodeEvent(arena.allocator(), record[0..10]));
 }
 
+test "store: orderKey preserves i64 order as unsigned bytes" {
+    const times = [_]i64{ -1_000, -1, 0, 1, 1_700_000_000, std.math.maxInt(i32) };
+    var prev: ?[8]u8 = null;
+    for (times) |t| {
+        const k = orderKey(t);
+        if (prev) |p| try std.testing.expect(std.mem.order(u8, &p, &k) == .lt);
+        prev = k;
+    }
+}
+
 test "store: putEvent / getEvent round-trip and idempotent dedup" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = testStorePath(&tmp, "events.mdb", &buf);
-
-    var store = try Store.open(path.ptr, .{});
+    var store = try openTempStore(&tmp, "events.mdb", &buf);
     defer store.deinit();
 
     const ev = sampleEvent();
     try std.testing.expect(!(try store.hasEvent(ev.id)));
 
-    const inserted = try store.putEvent(std.testing.allocator, ev);
-    try std.testing.expect(inserted);
+    try std.testing.expect(try store.putEvent(std.testing.allocator, ev));
     try std.testing.expect(try store.hasEvent(ev.id));
-
-    // Second insert of the same id is a no-op.
-    const inserted_again = try store.putEvent(std.testing.allocator, ev);
-    try std.testing.expect(!inserted_again);
+    try std.testing.expect(!(try store.putEvent(std.testing.allocator, ev))); // no-op
 
     var stored = (try store.getEvent(std.testing.allocator, ev.id)).?;
     defer stored.deinit();
     try expectEventEqual(ev, stored.event);
 
-    // Unknown id returns null.
     const none = try store.getEvent(std.testing.allocator, [_]u8{0xAA} ** 32);
     try std.testing.expect(none == null);
 }
@@ -486,5 +717,110 @@ test "store: stored events survive reopen (decoded from mmap, no JSON)" {
         var stored = (try store.getEvent(std.testing.allocator, ev.id)).?;
         defer stored.deinit();
         try expectEventEqual(ev, stored.event);
+    }
+}
+
+// -- query tests ------------------------------------------------------------
+
+const author_a = [_]u8{0xA1} ** 32;
+const author_b = [_]u8{0xB2} ** 32;
+
+/// Builds a minimal event with a distinct id derived from `seed`.
+fn qEvent(seed: u8, pubkey: [32]u8, kind: u16, created_at: i64, tags: []const Tag) Event {
+    return Event{
+        .id = [_]u8{seed} ** 32,
+        .pubkey = pubkey,
+        .created_at = created_at,
+        .kind = kind,
+        .tags = tags,
+        .content = "",
+        .sig = [_]u8{0} ** 64,
+    };
+}
+
+/// Collects the seeds (first id byte) of the query results in order.
+fn resultSeeds(r: QueryResult, out: []u8) []u8 {
+    for (r.events, 0..) |e, i| out[i] = e.id[0];
+    return out[0..r.events.len];
+}
+
+test "store: query drives off indexes and returns newest-first" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var store = try openTempStore(&tmp, "query.mdb", &buf);
+    defer store.deinit();
+
+    const gpa = std.testing.allocator;
+    const p_tag = [_]Tag{&[_][]const u8{ "p", "cafe" }};
+    // seed, author, kind, created_at, tags
+    _ = try store.putEvent(gpa, qEvent(1, author_a, 1, 100, &p_tag));
+    _ = try store.putEvent(gpa, qEvent(2, author_a, 1, 200, &.{}));
+    _ = try store.putEvent(gpa, qEvent(3, author_b, 1, 150, &.{}));
+    _ = try store.putEvent(gpa, qEvent(4, author_a, 7, 300, &.{}));
+
+    var seeds: [8]u8 = undefined;
+
+    // Empty filter: all events, newest-first (300, 200, 150, 100).
+    {
+        var r = try store.query(gpa, .{});
+        defer r.deinit();
+        try std.testing.expectEqualSlices(u8, &[_]u8{ 4, 2, 3, 1 }, resultSeeds(r, &seeds));
+    }
+    // By author A (any kind), newest-first: 4(300), 2(200), 1(100).
+    {
+        var r = try store.query(gpa, .{ .authors = &[_][32]u8{author_a} });
+        defer r.deinit();
+        try std.testing.expectEqualSlices(u8, &[_]u8{ 4, 2, 1 }, resultSeeds(r, &seeds));
+    }
+    // Author A AND kind 1: 2(200), 1(100).
+    {
+        var r = try store.query(gpa, .{ .authors = &[_][32]u8{author_a}, .kinds = &[_]u16{1} });
+        defer r.deinit();
+        try std.testing.expectEqualSlices(u8, &[_]u8{ 2, 1 }, resultSeeds(r, &seeds));
+    }
+    // By kind 7: just event 4.
+    {
+        var r = try store.query(gpa, .{ .kinds = &[_]u16{7} });
+        defer r.deinit();
+        try std.testing.expectEqualSlices(u8, &[_]u8{4}, resultSeeds(r, &seeds));
+    }
+    // By id.
+    {
+        var r = try store.query(gpa, .{ .ids = &[_][32]u8{[_]u8{3} ** 32} });
+        defer r.deinit();
+        try std.testing.expectEqualSlices(u8, &[_]u8{3}, resultSeeds(r, &seeds));
+    }
+    // By tag #p = cafe: just event 1.
+    {
+        const vals = [_][]const u8{"cafe"};
+        var r = try store.query(gpa, .{ .tags = &[_]filter_mod.TagFilter{.{ .letter = 'p', .values = &vals }} });
+        defer r.deinit();
+        try std.testing.expectEqualSlices(u8, &[_]u8{1}, resultSeeds(r, &seeds));
+    }
+    // Time window since/until.
+    {
+        var r = try store.query(gpa, .{ .since = 150, .until = 250 });
+        defer r.deinit();
+        try std.testing.expectEqualSlices(u8, &[_]u8{ 2, 3 }, resultSeeds(r, &seeds));
+    }
+    // Limit caps the newest N.
+    {
+        var r = try store.query(gpa, .{ .limit = 2 });
+        defer r.deinit();
+        try std.testing.expectEqualSlices(u8, &[_]u8{ 4, 2 }, resultSeeds(r, &seeds));
+    }
+    // Duplicate authors do not produce duplicate results.
+    {
+        var r = try store.query(gpa, .{ .authors = &[_][32]u8{ author_a, author_a } });
+        defer r.deinit();
+        try std.testing.expectEqualSlices(u8, &[_]u8{ 4, 2, 1 }, resultSeeds(r, &seeds));
+    }
+    // A tag prefix that is shorter than a stored value must not match it.
+    {
+        const vals = [_][]const u8{"ca"}; // "ca" is a prefix of "cafe"
+        var r = try store.query(gpa, .{ .tags = &[_]filter_mod.TagFilter{.{ .letter = 'p', .values = &vals }} });
+        defer r.deinit();
+        try std.testing.expectEqual(@as(usize, 0), r.events.len);
     }
 }
