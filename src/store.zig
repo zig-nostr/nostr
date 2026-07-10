@@ -20,6 +20,7 @@ const c = @import("lmdb");
 const event = @import("event.zig");
 const filter_mod = @import("filter.zig");
 const keys = @import("keys.zig");
+const hex = @import("hex.zig");
 
 const Event = event.Event;
 const Tag = event.Tag;
@@ -54,6 +55,9 @@ pub const Store = struct {
     /// `d`-tag value appended for parameterized ones. Lets ingestion find the
     /// event a new replaceable event supersedes.
     repl_dbi: c.MDB_dbi,
+    /// Tombstones for NIP-09 deletions: deleted event id -> the pubkey that
+    /// deleted it. Prevents a deleted event from being re-added by its author.
+    deleted_dbi: c.MDB_dbi,
 
     pub const OpenOptions = struct {
         /// Upper bound on the memory map (and thus the on-disk database) size.
@@ -90,6 +94,7 @@ pub const Store = struct {
             .idx_created_dbi = try openDb(txn, "idx_created"),
             .idx_tag_dbi = try openDb(txn, "idx_tag"),
             .repl_dbi = try openDb(txn, "repl"),
+            .deleted_dbi = try openDb(txn, "deleted"),
         };
         try check(c.mdb_txn_commit(txn));
         return store;
@@ -362,6 +367,10 @@ pub const Store = struct {
         if (options.verify_with) |signer| {
             if (!(try event.verify(gpa, signer, ev))) return .invalid;
         }
+        // A NIP-09 deletion tombstones an id against its author, so a later
+        // re-arrival of that event from the same author is rejected.
+        if (try self.isTombstoned(ev.id, ev.pubkey)) return .deleted;
+        if (ev.kind == 5) return self.ingestDeletion(gpa, ev);
         switch (classify(ev.kind)) {
             .ephemeral => return .ephemeral,
             .regular => {
@@ -372,16 +381,145 @@ pub const Store = struct {
         }
     }
 
+    /// True if `id` has been tombstoned by `pubkey` (i.e. that pubkey deleted an
+    /// event with this id). A tombstone recorded by a *different* pubkey does
+    /// not block `pubkey`'s event, since one can only delete one's own events.
+    fn isTombstoned(self: *Store, id: [32]u8, pubkey: [32]u8) Error!bool {
+        var txn: ?*c.MDB_txn = null;
+        try check(c.mdb_txn_begin(self.env, null, @intCast(c.MDB_RDONLY), &txn));
+        defer c.mdb_txn_abort(txn);
+        var k = val(&id);
+        var v: c.MDB_val = undefined;
+        const rc = c.mdb_get(txn, self.deleted_dbi, &k, &v);
+        if (rc == c.MDB_NOTFOUND) return false;
+        try check(rc);
+        return valBytes(v).len == 32 and std.mem.eql(u8, valBytes(v), &pubkey);
+    }
+
+    /// Ingests a kind-5 deletion event: stores the request itself, then applies
+    /// its `e` (by id) and `a` (by addressable coordinate) deletions. A target
+    /// is only removed when it was authored by the same pubkey as the deletion;
+    /// `a` deletions additionally only affect events at or older than the
+    /// deletion. Every `e` target id is tombstoned so it cannot be re-added by
+    /// its author, even if the target has not been seen yet.
+    fn ingestDeletion(self: *Store, gpa: std.mem.Allocator, ev: Event) Error!IngestResult {
+        var txn: ?*c.MDB_txn = null;
+        try check(c.mdb_txn_begin(self.env, null, 0, &txn));
+        errdefer c.mdb_txn_abort(txn);
+
+        var k = val(&ev.id);
+        var probe: c.MDB_val = undefined;
+        const existed = c.mdb_get(txn, self.events_dbi, &k, &probe) == c.MDB_SUCCESS;
+        if (!existed) try self.storeEvent(gpa, txn, ev);
+
+        for (ev.tags) |tag| {
+            if (tag.len < 2 or tag[0].len != 1) continue;
+            switch (tag[0][0]) {
+                'e' => {
+                    const target = hex.decodeFixed(32, tag[1]) catch continue;
+                    try self.deleteById(gpa, txn, ev.pubkey, target);
+                },
+                'a' => try self.deleteByCoord(gpa, txn, ev.pubkey, ev.created_at, tag[1]),
+                else => {},
+            }
+        }
+
+        try check(c.mdb_txn_commit(txn));
+        return if (existed) .duplicate else .added;
+    }
+
+    /// Deletes the event `id` if it is stored and authored by `deleter`, and
+    /// tombstones the id against `deleter` regardless (so a not-yet-seen target
+    /// is blocked on arrival).
+    fn deleteById(self: *Store, gpa: std.mem.Allocator, txn: ?*c.MDB_txn, deleter: [32]u8, id: [32]u8) Error!void {
+        var k = val(&id);
+        var v: c.MDB_val = undefined;
+        const rc = c.mdb_get(txn, self.events_dbi, &k, &v);
+        if (rc != c.MDB_NOTFOUND) {
+            try check(rc);
+            var scratch = std.heap.ArenaAllocator.init(gpa);
+            defer scratch.deinit();
+            const target = try decodeEvent(scratch.allocator(), valBytes(v));
+            if (!std.mem.eql(u8, &target.pubkey, &deleter)) return; // not the author
+            try self.removeEvent(gpa, txn, target);
+            try self.clearReplCoordinate(gpa, txn, target);
+        }
+        try self.tombstone(txn, id, deleter);
+    }
+
+    /// Applies an `a`-tag deletion `kind:pubkey:dtag`: if the coordinate is
+    /// owned by `deleter` and its current event is at or older than `del_time`,
+    /// that event is removed. No tombstone is recorded — a strictly newer
+    /// replaceable event may legitimately arrive later.
+    fn deleteByCoord(self: *Store, gpa: std.mem.Allocator, txn: ?*c.MDB_txn, deleter: [32]u8, del_time: i64, a_value: []const u8) Error!void {
+        var it = std.mem.splitScalar(u8, a_value, ':');
+        const kind_str = it.next() orelse return;
+        const pk_str = it.next() orelse return;
+        const dtag = it.rest();
+        const kind = std.fmt.parseInt(u16, kind_str, 10) catch return;
+        const pk = hex.decodeFixed(32, pk_str) catch return;
+        if (!std.mem.eql(u8, &pk, &deleter)) return;
+
+        const class = classify(kind);
+        if (class != .replaceable and class != .parameterized) return;
+
+        var coord: std.ArrayList(u8) = .empty;
+        defer coord.deinit(gpa);
+        try appendCoord(gpa, &coord, pk, kind, if (class == .parameterized) dtag else null);
+
+        var ck = val(coord.items);
+        var cv: c.MDB_val = undefined;
+        const crc = c.mdb_get(txn, self.repl_dbi, &ck, &cv);
+        if (crc == c.MDB_NOTFOUND) return;
+        try check(crc);
+        const target_id: [32]u8 = valBytes(cv)[0..32].*;
+
+        var ek = val(&target_id);
+        var ev: c.MDB_val = undefined;
+        const erc = c.mdb_get(txn, self.events_dbi, &ek, &ev);
+        if (erc == c.MDB_NOTFOUND) return;
+        try check(erc);
+        var scratch = std.heap.ArenaAllocator.init(gpa);
+        defer scratch.deinit();
+        const target = try decodeEvent(scratch.allocator(), valBytes(ev));
+        if (target.created_at > del_time) return; // newer than the deletion; keep
+
+        try self.removeEvent(gpa, txn, target);
+        _ = c.mdb_del(txn, self.repl_dbi, &ck, null);
+    }
+
+    /// If `ev` is (parameterized-)replaceable and its coordinate currently
+    /// points at `ev`, clears that coordinate mapping.
+    fn clearReplCoordinate(self: *Store, gpa: std.mem.Allocator, txn: ?*c.MDB_txn, ev: Event) Error!void {
+        const class = classify(ev.kind);
+        if (class != .replaceable and class != .parameterized) return;
+
+        var coord: std.ArrayList(u8) = .empty;
+        defer coord.deinit(gpa);
+        try appendCoord(gpa, &coord, ev.pubkey, ev.kind, if (class == .parameterized) dTagValue(ev) else null);
+
+        var ck = val(coord.items);
+        var cv: c.MDB_val = undefined;
+        const crc = c.mdb_get(txn, self.repl_dbi, &ck, &cv);
+        if (crc == c.MDB_NOTFOUND) return;
+        try check(crc);
+        if (std.mem.eql(u8, valBytes(cv), &ev.id)) {
+            _ = c.mdb_del(txn, self.repl_dbi, &ck, null);
+        }
+    }
+
+    fn tombstone(self: *Store, txn: ?*c.MDB_txn, id: [32]u8, deleter: [32]u8) Error!void {
+        var k = val(&id);
+        var v = val(&deleter);
+        try check(c.mdb_put(txn, self.deleted_dbi, &k, &v, 0));
+    }
+
     fn ingestReplaceable(self: *Store, gpa: std.mem.Allocator, ev: Event, class: Class) Error!IngestResult {
         // Build the replaceable coordinate: pubkey ++ kind, plus the d-tag
         // value for parameterized-replaceable events.
         var coord: std.ArrayList(u8) = .empty;
         defer coord.deinit(gpa);
-        try coord.appendSlice(gpa, &ev.pubkey);
-        var kb: [2]u8 = undefined;
-        std.mem.writeInt(u16, &kb, ev.kind, .big);
-        try coord.appendSlice(gpa, &kb);
-        if (class == .parameterized) try coord.appendSlice(gpa, dTagValue(ev));
+        try appendCoord(gpa, &coord, ev.pubkey, ev.kind, if (class == .parameterized) dTagValue(ev) else null);
 
         var txn: ?*c.MDB_txn = null;
         try check(c.mdb_txn_begin(self.env, null, 0, &txn));
@@ -473,6 +611,8 @@ pub const IngestResult = enum {
     invalid,
     /// An ephemeral-kind event, which is not persisted.
     ephemeral,
+    /// Rejected: the event was previously deleted (NIP-09) by its author.
+    deleted,
 };
 
 /// NIP-01 event-kind classes that determine storage semantics.
@@ -503,6 +643,16 @@ fn dTagValue(ev: Event) []const u8 {
         }
     }
     return "";
+}
+
+/// Appends a replaceable coordinate to `out`: `pubkey ++ kind(be u16)`, plus
+/// the `d`-tag value when `dtag` is non-null (parameterized-replaceable).
+fn appendCoord(gpa: std.mem.Allocator, out: *std.ArrayList(u8), pubkey: [32]u8, kind: u16, dtag: ?[]const u8) Error!void {
+    try out.appendSlice(gpa, &pubkey);
+    var kb: [2]u8 = undefined;
+    std.mem.writeInt(u16, &kb, kind, .big);
+    try out.appendSlice(gpa, &kb);
+    if (dtag) |d| try out.appendSlice(gpa, d);
 }
 
 fn lessByTimeDesc(_: void, a: Event, b: Event) bool {
@@ -1143,4 +1293,119 @@ test "store: ingest does not persist ephemeral events" {
     const eph = try event.create(gpa, signer, kp, 1000, 20000, &[_]Tag{}, "ephemeral", null);
     try std.testing.expectEqual(IngestResult.ephemeral, try store.ingest(gpa, eph, .{}));
     try std.testing.expect(!(try store.hasEvent(eph.id)));
+}
+
+// -- NIP-09 deletion tests --------------------------------------------------
+
+test "store: ingest deletion removes the author's event and tombstones it" {
+    const gpa = std.testing.allocator;
+    var signer = try keys.Signer.initRandomized(std.testing.io);
+    defer signer.deinit();
+    const kp = try signer.generateKeyPair(std.testing.io);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var store = try openTempStore(&tmp, "del-e.mdb", &buf);
+    defer store.deinit();
+
+    const note = try event.create(gpa, signer, kp, 1000, 1, &[_]Tag{}, "to be deleted", null);
+    try std.testing.expectEqual(IngestResult.added, try store.ingest(gpa, note, .{}));
+
+    const id_hex = std.fmt.bytesToHex(note.id, .lower);
+    const e_tag = [_]Tag{&[_][]const u8{ "e", id_hex[0..] }};
+    const del = try event.create(gpa, signer, kp, 2000, 5, &e_tag, "", null);
+
+    try std.testing.expectEqual(IngestResult.added, try store.ingest(gpa, del, .{}));
+    try std.testing.expect(!(try store.hasEvent(note.id))); // target removed
+    try std.testing.expect(try store.hasEvent(del.id)); // deletion request kept
+
+    // The tombstone blocks re-adding the same event by its author.
+    try std.testing.expectEqual(IngestResult.deleted, try store.ingest(gpa, note, .{}));
+    try std.testing.expect(!(try store.hasEvent(note.id)));
+}
+
+test "store: ingest deletion cannot remove another author's event" {
+    const gpa = std.testing.allocator;
+    var signer = try keys.Signer.initRandomized(std.testing.io);
+    defer signer.deinit();
+    const kp_a = try signer.generateKeyPair(std.testing.io);
+    const kp_b = try signer.generateKeyPair(std.testing.io);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var store = try openTempStore(&tmp, "del-foreign.mdb", &buf);
+    defer store.deinit();
+
+    const note_b = try event.create(gpa, signer, kp_b, 1000, 1, &[_]Tag{}, "b's note", null);
+    try std.testing.expectEqual(IngestResult.added, try store.ingest(gpa, note_b, .{}));
+
+    // A attempts to delete B's stored event by id: rejected, B's note survives.
+    const id_hex = std.fmt.bytesToHex(note_b.id, .lower);
+    const e_tag = [_]Tag{&[_][]const u8{ "e", id_hex[0..] }};
+    const del_a = try event.create(gpa, signer, kp_a, 2000, 5, &e_tag, "", null);
+    try std.testing.expectEqual(IngestResult.added, try store.ingest(gpa, del_a, .{}));
+    try std.testing.expect(try store.hasEvent(note_b.id));
+}
+
+test "store: ingest deletion tombstones a not-yet-seen event, scoped to the deleter" {
+    const gpa = std.testing.allocator;
+    var signer = try keys.Signer.initRandomized(std.testing.io);
+    defer signer.deinit();
+    const kp_a = try signer.generateKeyPair(std.testing.io);
+    const kp_b = try signer.generateKeyPair(std.testing.io);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var store = try openTempStore(&tmp, "del-ooo.mdb", &buf);
+    defer store.deinit();
+
+    // A's own note, deleted before it is ever stored (out-of-order arrival).
+    const note_a = try event.create(gpa, signer, kp_a, 1000, 1, &[_]Tag{}, "a's future note", null);
+    const a_hex = std.fmt.bytesToHex(note_a.id, .lower);
+    const del_a = try event.create(gpa, signer, kp_a, 2000, 5, &[_]Tag{&[_][]const u8{ "e", a_hex[0..] }}, "", null);
+    try std.testing.expectEqual(IngestResult.added, try store.ingest(gpa, del_a, .{}));
+    // When A's note finally arrives it is rejected as deleted.
+    try std.testing.expectEqual(IngestResult.deleted, try store.ingest(gpa, note_a, .{}));
+    try std.testing.expect(!(try store.hasEvent(note_a.id)));
+
+    // But a tombstone A placed on B's (unseen) id does not block B's event.
+    const note_b = try event.create(gpa, signer, kp_b, 1000, 1, &[_]Tag{}, "b's note", null);
+    const b_hex = std.fmt.bytesToHex(note_b.id, .lower);
+    const del_a_on_b = try event.create(gpa, signer, kp_a, 2000, 5, &[_]Tag{&[_][]const u8{ "e", b_hex[0..] }}, "", null);
+    try std.testing.expectEqual(IngestResult.added, try store.ingest(gpa, del_a_on_b, .{}));
+    try std.testing.expectEqual(IngestResult.added, try store.ingest(gpa, note_b, .{}));
+    try std.testing.expect(try store.hasEvent(note_b.id));
+}
+
+test "store: ingest a-tag deletion removes a parameterized-replaceable event" {
+    const gpa = std.testing.allocator;
+    var signer = try keys.Signer.initRandomized(std.testing.io);
+    defer signer.deinit();
+    const kp = try signer.generateKeyPair(std.testing.io);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var store = try openTempStore(&tmp, "del-a.mdb", &buf);
+    defer store.deinit();
+
+    const d_tag = [_]Tag{&[_][]const u8{ "d", "profile" }};
+    const article = try event.create(gpa, signer, kp, 1000, 30000, &d_tag, "article", null);
+    try std.testing.expectEqual(IngestResult.added, try store.ingest(gpa, article, .{}));
+
+    // "a" coordinate = kind:pubkey:dtag. Deletion at t=2000 covers the t=1000 event.
+    const pk_hex = std.fmt.bytesToHex(kp.public_key, .lower);
+    var abuf: [128]u8 = undefined;
+    const a_val = try std.fmt.bufPrint(&abuf, "30000:{s}:profile", .{pk_hex[0..]});
+    const del = try event.create(gpa, signer, kp, 2000, 5, &[_]Tag{&[_][]const u8{ "a", a_val }}, "", null);
+    try std.testing.expectEqual(IngestResult.added, try store.ingest(gpa, del, .{}));
+    try std.testing.expect(!(try store.hasEvent(article.id)));
+
+    // A strictly newer article at the same coordinate is not blocked.
+    const article2 = try event.create(gpa, signer, kp, 3000, 30000, &d_tag, "new article", null);
+    try std.testing.expectEqual(IngestResult.added, try store.ingest(gpa, article2, .{}));
+    try std.testing.expect(try store.hasEvent(article2.id));
 }
