@@ -35,16 +35,23 @@ Unreleased (pre-`v0.1.0`).
   event from a keypair, and verifies an event by recomputing its canonical
   id from its own fields (rejecting id/content mismatches) before checking
   the signature.
+- NIP-06 key derivation (`src/bip39.zig`, `src/nip06.zig`): BIP-39 mnemonic
+  generate/parse/checksum (embedded official English wordlist) and BIP-32
+  HD derivation for `m/44'/1237'/<account>'/0/0`, verified against both
+  official NIP-06 test vectors byte-for-byte. This closes out A2's Tier-1
+  scope — all acceptance criteria in issue #2 are now met except the
+  version tag.
 
 ## What's in progress
 
-- A2: NIP-06 derivation — next up.
+- A2: nothing left but tagging `v0.1.0` (issue #2's acceptance criteria are
+  all met: BIP-340 suite, NIP-19 round trips, NIP-06 + NIP-49 tests, NIP-01
+  id-hash tests).
 
 ## What's next
 
-1. A2: NIP-06 derivation (BIP-39 mnemonic → BIP-32 HD derivation; uses
-   secp256k1 for the EC point multiplication in non-hardened steps).
-2. Tag `v0.1.0` once all A2 acceptance criteria are met.
+1. Tag `v0.1.0`, close issue #2, write release notes.
+2. Start A3 (transport: relays, subscriptions, outbox routing).
 
 ## Known blockers / pending decisions
 
@@ -65,7 +72,7 @@ Unreleased (pre-`v0.1.0`).
 | NIP-01 event model | done |
 | secp256k1 keys + BIP-340 sign/verify | done |
 | Event-level sign/verify glue | done |
-| NIP-06 derivation | not started |
+| NIP-06 derivation | done |
 | Transport & outbox (NIP-65) | not started |
 | Local event store | not started |
 | Encryption (NIP-44/17/59) + signer interface | not started |

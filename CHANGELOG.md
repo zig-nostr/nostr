@@ -29,3 +29,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Event-level signing: `event.create` builds and signs an event from a
   keypair; `event.verify` recomputes the canonical id from the event's own
   fields (rejecting any mismatch) and checks the signature against it.
+- NIP-06 key derivation: BIP-39 mnemonic generation/parsing/checksum
+  (embedded official English wordlist) and BIP-32 HD derivation for path
+  `m/44'/1237'/<account>'/0/0`, verified against both official NIP-06 test
+  vectors (secret key and public key, byte-for-byte). Password/mnemonic
+  Unicode NFKD normalization is not implemented (same documented limitation
+  as NIP-49's NFKC gap).
