@@ -12,21 +12,32 @@ transport with the outbox model, NIP-44/NIP-17 encrypted messaging, and a
 zero-copy local event store modeled on
 [nostrdb](https://github.com/damus-io/nostrdb).
 
-**Status: pre-alpha, `v0.1.0`.** Milestone A2 (library core) has shipped:
-secp256k1 keys and BIP-340 Schnorr signatures (audited libsecp256k1
-binding, full official test-vector suite passing), the NIP-01 event model
-with canonical id hashing and signing, NIP-19 bech32 entity encoding,
-NIP-06 mnemonic-based key derivation, and NIP-49 encrypted key storage.
-Relay transport, the outbox model, and the local event store land in
-upcoming milestones — see [`CURRENT_STATE.md`](CURRENT_STATE.md) for what's
-in progress and the
+**Status: pre-alpha, `v0.2.0`.** The library core, relay transport, and the
+local-first event store have shipped:
+
+- **Milestone A2 — library core:** secp256k1 keys and BIP-340 Schnorr
+  signatures (audited libsecp256k1 binding, full official test-vector suite
+  passing), the NIP-01 event model with canonical id hashing and signing,
+  NIP-19 bech32 entity encoding, NIP-06 mnemonic-based key derivation, and
+  NIP-49 encrypted key storage.
+- **Milestone A3 — transport:** RFC 6455 WebSocket framing and handshake, a
+  relay connection state machine with NIP-01 subscriptions, a live TCP/TLS
+  dialer, and NIP-65 relay lists with outbox routing.
+- **Milestone A4 — local-first store:** a zero-copy, memory-mapped LMDB event
+  store with secondary indexes and a filter-driven query API, validate-on-
+  insert ingestion (dedup, replaceable/parameterized, NIP-09 deletion), a
+  direct-message conversation index, local-first reconciliation, and a
+  size-cap cache.
+
+Native signer, messenger, and reader showcases land in upcoming milestones —
+see [`CURRENT_STATE.md`](CURRENT_STATE.md) for what's in progress and the
 [project board](https://github.com/orgs/zig-nostr/projects) for the full
 milestone roadmap.
 
 ## Install
 
 ```sh
-zig fetch --save https://github.com/zig-nostr/nostr/archive/refs/tags/v0.1.0.tar.gz
+zig fetch --save https://github.com/zig-nostr/nostr/archive/refs/tags/v0.2.0.tar.gz
 ```
 
 Then in `build.zig`:
