@@ -26,3 +26,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   libsecp256k1 (compiled from source, pinned in `build.zig.zon`). Passes the
   full official BIP-340 test-vector suite (all 19 vectors, signing and
   verification).
+- Event-level signing: `event.create` builds and signs an event from a
+  keypair; `event.verify` recomputes the canonical id from the event's own
+  fields (rejecting any mismatch) and checks the signature against it.

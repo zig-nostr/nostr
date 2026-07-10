@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const hex = @import("hex.zig");
+const keys = @import("keys.zig");
 
 pub const Error = error{
     InvalidJson,
@@ -120,6 +121,42 @@ pub fn computeId(
     var id: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(list.items, &id, .{});
     return id;
+}
+
+/// Builds and signs an event: computes the canonical id from `keypair`'s
+/// public key and the given fields, then signs that id with `keypair`'s
+/// secret key. `aux_rand`, when provided, is 32 bytes of fresh randomness
+/// (recommended — see `keys.Signer.sign`).
+pub fn create(
+    allocator: std.mem.Allocator,
+    signer: keys.Signer,
+    keypair: keys.KeyPair,
+    created_at: i64,
+    kind: u16,
+    tags: []const Tag,
+    content: []const u8,
+    aux_rand: ?[32]u8,
+) (std.mem.Allocator.Error || keys.Error)!Event {
+    const id = try computeId(allocator, keypair.public_key, created_at, kind, tags, content);
+    const sig = try signer.signId(id, keypair, aux_rand);
+    return Event{
+        .id = id,
+        .pubkey = keypair.public_key,
+        .created_at = created_at,
+        .kind = kind,
+        .tags = tags,
+        .content = content,
+        .sig = sig,
+    };
+}
+
+/// Verifies an event: recomputes the canonical id from its fields (rejecting
+/// any event whose `id` doesn't match its own content — a forged or
+/// corrupted id), then verifies `sig` against that id and `pubkey`.
+pub fn verify(allocator: std.mem.Allocator, signer: keys.Signer, ev: Event) std.mem.Allocator.Error!bool {
+    const computed_id = try computeId(allocator, ev.pubkey, ev.created_at, ev.kind, ev.tags, ev.content);
+    if (!std.mem.eql(u8, &computed_id, &ev.id)) return false;
+    return signer.verifyId(ev.sig, ev.id, ev.pubkey);
 }
 
 /// Serializes a full `Event` to wire-format JSON (`{"id":...,...}`).
@@ -267,4 +304,44 @@ test "fromJson rejects malformed hex id" {
     const allocator = std.testing.allocator;
     const bad = "{\"id\":\"zz\",\"pubkey\":\"" ++ "00" ** 32 ++ "\",\"created_at\":0,\"kind\":0,\"tags\":[],\"content\":\"\",\"sig\":\"" ++ "00" ** 64 ++ "\"}";
     try std.testing.expectError(hex.Error.InvalidHex, fromJson(allocator, bad));
+}
+
+test "create produces a valid, self-consistent, verifiable event" {
+    const allocator = std.testing.allocator;
+    var signer = try keys.Signer.initRandomized(std.testing.io);
+    defer signer.deinit();
+    const kp = try signer.generateKeyPair(std.testing.io);
+
+    const tags = [_]Tag{&[_][]const u8{ "p", "f7234bd4c1394dda46d09f35bd384dd30cc552ad5541990f98844fb06676e9ca" }};
+    const ev = try create(allocator, signer, kp, 1700000000, 1, &tags, "hello nostr", null);
+
+    // The id really is the canonical hash of the event's own fields.
+    const expected_id = try computeId(allocator, kp.public_key, 1700000000, 1, &tags, "hello nostr");
+    try std.testing.expectEqualSlices(u8, &expected_id, &ev.id);
+    try std.testing.expectEqualSlices(u8, &kp.public_key, &ev.pubkey);
+
+    try std.testing.expect(try verify(allocator, signer, ev));
+}
+
+test "verify rejects a tampered content field" {
+    const allocator = std.testing.allocator;
+    var signer = try keys.Signer.initRandomized(std.testing.io);
+    defer signer.deinit();
+    const kp = try signer.generateKeyPair(std.testing.io);
+
+    var ev = try create(allocator, signer, kp, 1700000000, 1, &[_]Tag{}, "original", null);
+    ev.content = "tampered"; // id no longer matches its own content
+    try std.testing.expect(!(try verify(allocator, signer, ev)));
+}
+
+test "verify rejects a signature from the wrong key" {
+    const allocator = std.testing.allocator;
+    var signer = try keys.Signer.initRandomized(std.testing.io);
+    defer signer.deinit();
+    const kp_a = try signer.generateKeyPair(std.testing.io);
+    const kp_b = try signer.generateKeyPair(std.testing.io);
+
+    var ev = try create(allocator, signer, kp_a, 1700000000, 1, &[_]Tag{}, "hello", null);
+    ev.sig = try signer.signId(ev.id, kp_b, null); // sign the same id, wrong key
+    try std.testing.expect(!(try verify(allocator, signer, ev)));
 }

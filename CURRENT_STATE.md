@@ -31,18 +31,20 @@ Unreleased (pre-`v0.1.0`).
   bitcoin-core/libsecp256k1 (compiled from source, pinned in
   `build.zig.zon`). Passes the full official BIP-340 test-vector suite
   (all 19 vectors). This is the credibility-anchor deliverable.
+- Event-level signing (`event.create`/`event.verify`): builds and signs an
+  event from a keypair, and verifies an event by recomputing its canonical
+  id from its own fields (rejecting id/content mismatches) before checking
+  the signature.
 
 ## What's in progress
 
-- A2: event-level signing — wiring `keys.Signer` into `event` (compute id →
-  sign → populate `sig`; verify an event's signature). Next up.
+- A2: NIP-06 derivation — next up.
 
 ## What's next
 
-1. A2: event-level sign/verify glue over `event.Event` + `keys.Signer`.
-2. A2: NIP-06 derivation (BIP-39 mnemonic → BIP-32 HD derivation; uses
+1. A2: NIP-06 derivation (BIP-39 mnemonic → BIP-32 HD derivation; uses
    secp256k1 for the EC point multiplication in non-hardened steps).
-3. Tag `v0.1.0` once all A2 acceptance criteria are met.
+2. Tag `v0.1.0` once all A2 acceptance criteria are met.
 
 ## Known blockers / pending decisions
 
@@ -62,6 +64,7 @@ Unreleased (pre-`v0.1.0`).
 | NIP-49 encrypted key storage | done |
 | NIP-01 event model | done |
 | secp256k1 keys + BIP-340 sign/verify | done |
+| Event-level sign/verify glue | done |
 | NIP-06 derivation | not started |
 | Transport & outbox (NIP-65) | not started |
 | Local event store | not started |
