@@ -256,6 +256,182 @@ pub fn Connection(comptime Stream: type) type {
 }
 
 // ---------------------------------------------------------------------------
+// Live transport: dialing a real relay over TCP (ws://) or TLS (wss://).
+// ---------------------------------------------------------------------------
+
+const net = std.Io.net;
+const tls = std.crypto.tls;
+
+/// Adapts a pair of std `Io.Reader`/`Io.Writer` to the two-method stream
+/// interface `Connection` expects. This is the exact bridge the live dialer
+/// wires a socket (or a TLS session) into, and it is exercised hermetically in
+/// tests by pointing it at in-memory `Io.Reader.fixed` / `Io.Writer.Allocating`.
+pub const IoStream = struct {
+    reader: *std.Io.Reader,
+    writer: *std.Io.Writer,
+    /// For TLS, `writer` is the TLS session writer, whose flush only drains
+    /// ciphertext into the *underlying* transport writer's buffer — that
+    /// transport writer must then be flushed too for the bytes to reach the
+    /// socket. Null for plain `ws://`, where `writer` already is the transport.
+    transport_writer: ?*std.Io.Writer = null,
+
+    pub fn read(self: IoStream, buffer: []u8) std.Io.Reader.ShortError!usize {
+        return self.reader.readSliceShort(buffer);
+    }
+
+    pub fn writeAll(self: IoStream, bytes: []const u8) std.Io.Writer.Error!void {
+        try self.writer.writeAll(bytes);
+        try self.writer.flush();
+        if (self.transport_writer) |tw| try tw.flush();
+    }
+};
+
+/// A `Connection` over a live socket/TLS stream.
+pub const LiveConnection = Connection(IoStream);
+
+const TlsState = struct {
+    client: tls.Client,
+    read_buffer: []u8,
+    write_buffer: []u8,
+};
+
+/// Owns the byte-stream plumbing behind a live relay connection. The std
+/// `Io.Reader`/`Io.Writer` chain is pointer-linked (its vtables recover their
+/// parent with `@fieldParentPtr`), so this is heap-allocated by `dial` and
+/// never moved: `Connection`'s `IoStream` holds pointers into these fields.
+const Transport = struct {
+    tcp: net.Stream,
+    tcp_reader: net.Stream.Reader,
+    tcp_writer: net.Stream.Writer,
+    tcp_read_buffer: []u8,
+    tcp_write_buffer: []u8,
+    tls_state: ?*TlsState,
+
+    fn deinit(self: *Transport, gpa: std.mem.Allocator, io: std.Io) void {
+        if (self.tls_state) |ts| {
+            gpa.free(ts.read_buffer);
+            gpa.free(ts.write_buffer);
+            gpa.destroy(ts);
+        }
+        self.tcp.close(io);
+        gpa.free(self.tcp_read_buffer);
+        gpa.free(self.tcp_write_buffer);
+    }
+};
+
+/// A live connection to a Nostr relay. Create with `dial`; free with `deinit`.
+/// The publish/subscribe/receive methods forward to the underlying
+/// `Connection` (see its docs for semantics).
+pub const Relay = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    transport: *Transport,
+    conn: LiveConnection,
+
+    pub fn publish(self: *Relay, ev: Event) !void {
+        return self.conn.publish(ev);
+    }
+    pub fn subscribe(self: *Relay, subscription_id: []const u8, filters: []const Filter) !void {
+        return self.conn.subscribe(subscription_id, filters);
+    }
+    pub fn unsubscribe(self: *Relay, subscription_id: []const u8) !void {
+        return self.conn.unsubscribe(subscription_id);
+    }
+    pub fn receive(self: *Relay) !?message.ParsedRelayMessage {
+        return self.conn.receive();
+    }
+
+    pub fn deinit(self: *Relay) void {
+        self.conn.close() catch {};
+        self.conn.deinit();
+        self.transport.deinit(self.gpa, self.io);
+        const gpa = self.gpa;
+        const transport = self.transport;
+        self.* = undefined;
+        gpa.destroy(transport);
+    }
+};
+
+/// Connects to the relay at `url` (`ws://` or `wss://`), performing the TCP
+/// connect, the TLS handshake for `wss://` (verifying the server certificate
+/// against the system CA bundle), and the websocket opening handshake. Returns
+/// a ready `Relay`. The caller owns it and must `deinit`.
+///
+/// Not covered by CI (no relay is reachable there); the transport-agnostic
+/// `Connection` and the `IoStream` adapter it uses are what the tests exercise.
+pub fn dial(gpa: std.mem.Allocator, io: std.Io, url: []const u8) !*Relay {
+    const parsed = try parseUrl(url);
+
+    const transport = try gpa.create(Transport);
+    errdefer gpa.destroy(transport);
+    transport.tls_state = null;
+
+    const host = try net.HostName.init(parsed.host);
+    transport.tcp = try host.connect(io, parsed.port, .{ .mode = .stream });
+    errdefer transport.tcp.close(io);
+
+    transport.tcp_read_buffer = try gpa.alloc(u8, 64 * 1024);
+    errdefer gpa.free(transport.tcp_read_buffer);
+    transport.tcp_write_buffer = try gpa.alloc(u8, 64 * 1024);
+    errdefer gpa.free(transport.tcp_write_buffer);
+
+    transport.tcp_reader = transport.tcp.reader(io, transport.tcp_read_buffer);
+    transport.tcp_writer = transport.tcp.writer(io, transport.tcp_write_buffer);
+
+    const stream: IoStream = if (parsed.secure) blk: {
+        const ts = try gpa.create(TlsState);
+        errdefer gpa.destroy(ts);
+        ts.read_buffer = try gpa.alloc(u8, 64 * 1024);
+        errdefer gpa.free(ts.read_buffer);
+        ts.write_buffer = try gpa.alloc(u8, 64 * 1024);
+        errdefer gpa.free(ts.write_buffer);
+
+        var ca_bundle: std.crypto.Certificate.Bundle = .empty;
+        defer ca_bundle.deinit(gpa);
+        var ca_lock: std.Io.RwLock = .init;
+        try ca_bundle.rescan(gpa, io, std.Io.Timestamp.now(io, .real));
+
+        var entropy: [tls.Client.Options.entropy_len]u8 = undefined;
+        io.randomSecure(&entropy) catch return error.RandomFailed;
+
+        ts.client = try tls.Client.init(
+            &transport.tcp_reader.interface,
+            &transport.tcp_writer.interface,
+            .{
+                .host = .{ .explicit = parsed.host },
+                .ca = .{ .bundle = .{ .gpa = gpa, .io = io, .lock = &ca_lock, .bundle = &ca_bundle } },
+                .read_buffer = ts.read_buffer,
+                .write_buffer = ts.write_buffer,
+                .entropy = &entropy,
+                .realtime_now = std.Io.Timestamp.now(io, .real),
+            },
+        );
+        transport.tls_state = ts;
+        break :blk .{
+            .reader = &ts.client.reader,
+            .writer = &ts.client.writer,
+            .transport_writer = &transport.tcp_writer.interface,
+        };
+    } else .{
+        .reader = &transport.tcp_reader.interface,
+        .writer = &transport.tcp_writer.interface,
+    };
+
+    const relay = try gpa.create(Relay);
+    errdefer gpa.destroy(relay);
+    relay.* = .{
+        .gpa = gpa,
+        .io = io,
+        .transport = transport,
+        .conn = LiveConnection.init(gpa, io, stream),
+    };
+    errdefer relay.conn.deinit();
+
+    try relay.conn.handshake(parsed.host, parsed.path);
+    return relay;
+}
+
+// ---------------------------------------------------------------------------
 // Tests — an in-memory fake stream drives the connection end to end.
 // ---------------------------------------------------------------------------
 
@@ -555,4 +731,47 @@ test "parseUrl handles schemes, ports, paths, and IPv6" {
     try std.testing.expectError(UrlError.UnsupportedScheme, parseUrl("http://x"));
     try std.testing.expectError(UrlError.InvalidUrl, parseUrl("wss://"));
     try std.testing.expectError(UrlError.InvalidUrl, parseUrl("ws://host:notaport"));
+}
+
+test "IoStream drives a Connection over real std Io.Reader/Writer" {
+    // The live dialer feeds sockets through IoStream; here we point IoStream at
+    // in-memory std readers/writers so the exact adapter code path runs in CI.
+    const allocator = std.testing.allocator;
+
+    var server: std.ArrayList(u8) = .empty;
+    defer server.deinit(allocator);
+    try appendServerText(&server, allocator, "[\"NOTICE\",\"live\"]");
+
+    var reader = std.Io.Reader.fixed(server.items);
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+
+    var conn = LiveConnection.init(allocator, std.testing.io, .{ .reader = &reader, .writer = &out.writer });
+    defer conn.deinit();
+
+    // Reading a relay message flows through IoStream.read -> readSliceShort.
+    var m = (try conn.receive()).?;
+    defer m.deinit();
+    try std.testing.expectEqualStrings("live", m.value.notice.message);
+
+    // Writing flows through IoStream.writeAll -> writeAll + flush; the captured
+    // bytes must decode back to the CLOSE frame we sent.
+    try conn.unsubscribe("s1");
+    var written = out.toArrayList();
+    defer written.deinit(allocator);
+    const frame = (try websocket.decodeFrame(written.items)).?;
+    try std.testing.expectEqualStrings("[\"CLOSE\",\"s1\"]", frame.payload);
+}
+
+test "live dialer is semantically analyzed" {
+    // `dial` opens a real socket, so it can't run in CI, and Zig would
+    // otherwise skip analyzing an uncalled function's body. Referencing it (and
+    // the `Relay` methods) forces full type-checking so the live TCP/TLS path
+    // is kept compiling by CI even though it is exercised only by hand.
+    _ = &dial;
+    _ = &Relay.publish;
+    _ = &Relay.subscribe;
+    _ = &Relay.unsubscribe;
+    _ = &Relay.receive;
+    _ = &Relay.deinit;
 }
