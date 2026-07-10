@@ -19,6 +19,7 @@ const std = @import("std");
 const c = @import("lmdb");
 const event = @import("event.zig");
 const filter_mod = @import("filter.zig");
+const keys = @import("keys.zig");
 
 const Event = event.Event;
 const Tag = event.Tag;
@@ -48,6 +49,11 @@ pub const Store = struct {
     idx_created_dbi: c.MDB_dbi,
     /// Index: letter ++ value ++ time-key ++ id -> (empty).
     idx_tag_dbi: c.MDB_dbi,
+    /// Replaceable coordinate -> current event id. The coordinate is
+    /// pubkey ++ kind(be u16) for (parameterized-)replaceable events, with the
+    /// `d`-tag value appended for parameterized ones. Lets ingestion find the
+    /// event a new replaceable event supersedes.
+    repl_dbi: c.MDB_dbi,
 
     pub const OpenOptions = struct {
         /// Upper bound on the memory map (and thus the on-disk database) size.
@@ -83,6 +89,7 @@ pub const Store = struct {
             .idx_kind_dbi = try openDb(txn, "idx_kind"),
             .idx_created_dbi = try openDb(txn, "idx_created"),
             .idx_tag_dbi = try openDb(txn, "idx_tag"),
+            .repl_dbi = try openDb(txn, "repl"),
         };
         try check(c.mdb_txn_commit(txn));
         return store;
@@ -143,14 +150,16 @@ pub const Store = struct {
         const inserted = rc != c.MDB_KEYEXIST;
         if (inserted) {
             try check(rc);
-            try self.writeIndexes(gpa, txn, ev);
+            try self.applyIndexes(gpa, txn, ev, .put);
         }
         try check(c.mdb_txn_commit(txn));
         return inserted;
     }
 
-    /// Writes the secondary-index entries for `ev` within transaction `txn`.
-    fn writeIndexes(self: *Store, gpa: std.mem.Allocator, txn: ?*c.MDB_txn, ev: Event) Error!void {
+    /// Writes or deletes every secondary-index entry for `ev` within `txn`.
+    /// Building both directions from one place guarantees an index delete uses
+    /// the exact keys its insert did.
+    fn applyIndexes(self: *Store, gpa: std.mem.Allocator, txn: ?*c.MDB_txn, ev: Event, op: IndexOp) Error!void {
         const tk = orderKey(ev.created_at);
 
         var key: std.ArrayList(u8) = .empty;
@@ -160,14 +169,14 @@ pub const Store = struct {
         key.clearRetainingCapacity();
         try key.appendSlice(gpa, &tk);
         try key.appendSlice(gpa, &ev.id);
-        try putIndex(txn, self.idx_created_dbi, key.items);
+        try indexOp(txn, self.idx_created_dbi, key.items, op);
 
         // author index: [pubkey][time][id]
         key.clearRetainingCapacity();
         try key.appendSlice(gpa, &ev.pubkey);
         try key.appendSlice(gpa, &tk);
         try key.appendSlice(gpa, &ev.id);
-        try putIndex(txn, self.idx_author_dbi, key.items);
+        try indexOp(txn, self.idx_author_dbi, key.items, op);
 
         // kind index: [kind big-endian][time][id]
         var kb: [2]u8 = undefined;
@@ -176,7 +185,7 @@ pub const Store = struct {
         try key.appendSlice(gpa, &kb);
         try key.appendSlice(gpa, &tk);
         try key.appendSlice(gpa, &ev.id);
-        try putIndex(txn, self.idx_kind_dbi, key.items);
+        try indexOp(txn, self.idx_kind_dbi, key.items, op);
 
         // tag index: [letter][value][time][id] for each single-letter tag.
         for (ev.tags) |tag| {
@@ -186,8 +195,28 @@ pub const Store = struct {
             try key.appendSlice(gpa, tag[1]);
             try key.appendSlice(gpa, &tk);
             try key.appendSlice(gpa, &ev.id);
-            try putIndex(txn, self.idx_tag_dbi, key.items);
+            try indexOp(txn, self.idx_tag_dbi, key.items, op);
         }
+    }
+
+    /// Encodes and stores `ev`'s record and index entries within `txn`,
+    /// overwriting any record already at its id. Used by the ingestion paths,
+    /// which have already decided the write should happen.
+    fn storeEvent(self: *Store, gpa: std.mem.Allocator, txn: ?*c.MDB_txn, ev: Event) Error!void {
+        const record = try encodeEvent(gpa, ev);
+        defer gpa.free(record);
+        var k = val(&ev.id);
+        var v = val(record);
+        try check(c.mdb_put(txn, self.events_dbi, &k, &v, 0));
+        try self.applyIndexes(gpa, txn, ev, .put);
+    }
+
+    /// Removes `ev`'s record and all its index entries within `txn`.
+    fn removeEvent(self: *Store, gpa: std.mem.Allocator, txn: ?*c.MDB_txn, ev: Event) Error!void {
+        try self.applyIndexes(gpa, txn, ev, .del);
+        var k = val(&ev.id);
+        const rc = c.mdb_del(txn, self.events_dbi, &k, null);
+        if (rc != c.MDB_NOTFOUND) try check(rc);
     }
 
     /// Returns true if an event with `id` is stored.
@@ -319,6 +348,82 @@ pub const Store = struct {
         // No selective constraint: walk every event by the created_at index.
         try scanPrefix(txn, self.idx_created_dbi, gpa, &.{}, candidates, seen);
     }
+
+    // -- Ingestion ----------------------------------------------------------
+
+    /// Ingests `ev`, applying NIP-01 protocol semantics on top of raw storage:
+    /// optional signature validation, and replaceable / parameterized-
+    /// replaceable "latest wins" upserts. Ephemeral events are not persisted.
+    /// See `IngestResult` for the possible outcomes.
+    ///
+    /// This is the protocol-aware entry point; `putEvent` is the low-level
+    /// insert. Callers feeding events from relays should use `ingest`.
+    pub fn ingest(self: *Store, gpa: std.mem.Allocator, ev: Event, options: IngestOptions) Error!IngestResult {
+        if (options.verify_with) |signer| {
+            if (!(try event.verify(gpa, signer, ev))) return .invalid;
+        }
+        switch (classify(ev.kind)) {
+            .ephemeral => return .ephemeral,
+            .regular => {
+                const inserted = try self.putEvent(gpa, ev);
+                return if (inserted) .added else .duplicate;
+            },
+            .replaceable, .parameterized => |class| return self.ingestReplaceable(gpa, ev, class),
+        }
+    }
+
+    fn ingestReplaceable(self: *Store, gpa: std.mem.Allocator, ev: Event, class: Class) Error!IngestResult {
+        // Build the replaceable coordinate: pubkey ++ kind, plus the d-tag
+        // value for parameterized-replaceable events.
+        var coord: std.ArrayList(u8) = .empty;
+        defer coord.deinit(gpa);
+        try coord.appendSlice(gpa, &ev.pubkey);
+        var kb: [2]u8 = undefined;
+        std.mem.writeInt(u16, &kb, ev.kind, .big);
+        try coord.appendSlice(gpa, &kb);
+        if (class == .parameterized) try coord.appendSlice(gpa, dTagValue(ev));
+
+        var txn: ?*c.MDB_txn = null;
+        try check(c.mdb_txn_begin(self.env, null, 0, &txn));
+        errdefer c.mdb_txn_abort(txn);
+
+        var ck = val(coord.items);
+        var cv: c.MDB_val = undefined;
+        const crc = c.mdb_get(txn, self.repl_dbi, &ck, &cv);
+
+        var result: IngestResult = .added;
+        if (crc != c.MDB_NOTFOUND) {
+            try check(crc);
+            const existing_id: [32]u8 = valBytes(cv)[0..32].*;
+            if (std.mem.eql(u8, &existing_id, &ev.id)) {
+                try check(c.mdb_txn_commit(txn));
+                return .duplicate;
+            }
+            // Compare against the currently stored event for this coordinate.
+            var ek = val(&existing_id);
+            var evv: c.MDB_val = undefined;
+            const erc = c.mdb_get(txn, self.events_dbi, &ek, &evv);
+            if (erc != c.MDB_NOTFOUND) {
+                try check(erc);
+                var scratch = std.heap.ArenaAllocator.init(gpa);
+                defer scratch.deinit();
+                const existing = try decodeEvent(scratch.allocator(), valBytes(evv));
+                if (!replaces(ev, existing)) {
+                    try check(c.mdb_txn_commit(txn));
+                    return .stale;
+                }
+                try self.removeEvent(gpa, txn, existing);
+                result = .replaced;
+            }
+        }
+
+        try self.storeEvent(gpa, txn, ev);
+        // Point the coordinate at the new event.
+        var v = val(&ev.id);
+        try check(c.mdb_put(txn, self.repl_dbi, &ck, &v, 0));
+        try check(c.mdb_txn_commit(txn));
+        return result;
+    }
 };
 
 /// An owned, decoded event: `event`'s tag/content storage lives in `arena`.
@@ -345,6 +450,60 @@ pub const QueryResult = struct {
         gpa.destroy(self.arena);
     }
 };
+
+/// Options controlling `Store.ingest`.
+pub const IngestOptions = struct {
+    /// When set, the event's signature and id are verified before storing; a
+    /// failing event is rejected with `IngestResult.invalid`. When null the
+    /// event is trusted (e.g. already verified upstream).
+    verify_with: ?keys.Signer = null,
+};
+
+/// The outcome of `Store.ingest`.
+pub const IngestResult = enum {
+    /// Stored as a new event (or the first for its replaceable coordinate).
+    added,
+    /// A (parameterized-)replaceable event superseded an older stored one.
+    replaced,
+    /// The same event id was already stored; nothing changed.
+    duplicate,
+    /// A replaceable event at least as new is already stored; not stored.
+    stale,
+    /// Rejected: signature/id validation failed.
+    invalid,
+    /// An ephemeral-kind event, which is not persisted.
+    ephemeral,
+};
+
+/// NIP-01 event-kind classes that determine storage semantics.
+const Class = enum { regular, replaceable, parameterized, ephemeral };
+
+fn classify(kind: u16) Class {
+    if (kind == 0 or kind == 3) return .replaceable;
+    if (kind >= 10_000 and kind < 20_000) return .replaceable;
+    if (kind >= 20_000 and kind < 30_000) return .ephemeral;
+    if (kind >= 30_000 and kind < 40_000) return .parameterized;
+    return .regular;
+}
+
+/// Whether `new` supersedes `old` for the same replaceable coordinate: the
+/// higher `created_at` wins, ties broken by the lexicographically lower id
+/// (per NIP-01).
+fn replaces(new: Event, old: Event) bool {
+    if (new.created_at != old.created_at) return new.created_at > old.created_at;
+    return std.mem.order(u8, &new.id, &old.id) == .lt;
+}
+
+/// The value of the first `d` tag, or "" if absent (an addressable event with
+/// no `d` tag is treated as having an empty identifier).
+fn dTagValue(ev: Event) []const u8 {
+    for (ev.tags) |tag| {
+        if (tag.len >= 1 and tag[0].len == 1 and tag[0][0] == 'd') {
+            return if (tag.len >= 2) tag[1] else "";
+        }
+    }
+    return "";
+}
 
 fn lessByTimeDesc(_: void, a: Event, b: Event) bool {
     if (a.created_at != b.created_at) return a.created_at > b.created_at;
@@ -549,11 +708,22 @@ fn openDb(txn: ?*c.MDB_txn, name: [*:0]const u8) Error!c.MDB_dbi {
     return dbi;
 }
 
-/// Inserts a key with an empty value into an index database.
-fn putIndex(txn: ?*c.MDB_txn, dbi: c.MDB_dbi, key: []const u8) Error!void {
+const IndexOp = enum { put, del };
+
+/// Inserts (with an empty value) or deletes an index key, per `op`. A delete of
+/// an already-absent key is not an error.
+fn indexOp(txn: ?*c.MDB_txn, dbi: c.MDB_dbi, key: []const u8, op: IndexOp) Error!void {
     var k = val(key);
-    var v = val(&.{});
-    try check(c.mdb_put(txn, dbi, &k, &v, 0));
+    switch (op) {
+        .put => {
+            var v = val(&.{});
+            try check(c.mdb_put(txn, dbi, &k, &v, 0));
+        },
+        .del => {
+            const rc = c.mdb_del(txn, dbi, &k, null);
+            if (rc != c.MDB_NOTFOUND) try check(rc);
+        },
+    }
 }
 
 /// Wraps a byte slice as an `MDB_val` for passing to LMDB. LMDB does not mutate
@@ -823,4 +993,154 @@ test "store: query drives off indexes and returns newest-first" {
         defer r.deinit();
         try std.testing.expectEqual(@as(usize, 0), r.events.len);
     }
+}
+
+// -- ingestion tests --------------------------------------------------------
+
+test "store: classify maps kinds to storage semantics" {
+    try std.testing.expectEqual(Class.replaceable, classify(0));
+    try std.testing.expectEqual(Class.replaceable, classify(3));
+    try std.testing.expectEqual(Class.replaceable, classify(10002));
+    try std.testing.expectEqual(Class.ephemeral, classify(20001));
+    try std.testing.expectEqual(Class.parameterized, classify(30023));
+    try std.testing.expectEqual(Class.regular, classify(1));
+    try std.testing.expectEqual(Class.regular, classify(5));
+    try std.testing.expectEqual(Class.regular, classify(40000));
+}
+
+test "store: ingest verifies signatures when a signer is given" {
+    const gpa = std.testing.allocator;
+    var signer = try keys.Signer.initRandomized(std.testing.io);
+    defer signer.deinit();
+    const kp = try signer.generateKeyPair(std.testing.io);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var store = try openTempStore(&tmp, "ingest-verify.mdb", &buf);
+    defer store.deinit();
+
+    const good = try event.create(gpa, signer, kp, 1000, 1, &[_]Tag{}, "hi", null);
+    try std.testing.expectEqual(IngestResult.added, try store.ingest(gpa, good, .{ .verify_with = signer }));
+    try std.testing.expect(try store.hasEvent(good.id));
+
+    // A valid id but a zeroed signature must be rejected when verifying.
+    var bad = try event.create(gpa, signer, kp, 2000, 1, &[_]Tag{}, "nope", null);
+    bad.sig = [_]u8{0} ** 64;
+    try std.testing.expectEqual(IngestResult.invalid, try store.ingest(gpa, bad, .{ .verify_with = signer }));
+    try std.testing.expect(!(try store.hasEvent(bad.id)));
+
+    // Without a signer the same event is trusted and stored.
+    try std.testing.expectEqual(IngestResult.added, try store.ingest(gpa, bad, .{}));
+    try std.testing.expect(try store.hasEvent(bad.id));
+}
+
+test "store: ingest replaceable keeps the newest" {
+    const gpa = std.testing.allocator;
+    var signer = try keys.Signer.initRandomized(std.testing.io);
+    defer signer.deinit();
+    const kp = try signer.generateKeyPair(std.testing.io);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var store = try openTempStore(&tmp, "ingest-repl.mdb", &buf);
+    defer store.deinit();
+
+    const older = try event.create(gpa, signer, kp, 1000, 0, &[_]Tag{}, "old profile", null);
+    const newer = try event.create(gpa, signer, kp, 2000, 0, &[_]Tag{}, "new profile", null);
+
+    try std.testing.expectEqual(IngestResult.added, try store.ingest(gpa, older, .{}));
+    try std.testing.expectEqual(IngestResult.replaced, try store.ingest(gpa, newer, .{}));
+    try std.testing.expect(!(try store.hasEvent(older.id)));
+    try std.testing.expect(try store.hasEvent(newer.id));
+
+    // Only the newest survives, and its indexes point at it.
+    {
+        var r = try store.query(gpa, .{ .authors = &[_][32]u8{kp.public_key}, .kinds = &[_]u16{0} });
+        defer r.deinit();
+        try std.testing.expectEqual(@as(usize, 1), r.events.len);
+        try std.testing.expectEqualSlices(u8, &newer.id, &r.events[0].id);
+    }
+
+    // An older event for the same coordinate is stale; the same one is a dup.
+    try std.testing.expectEqual(IngestResult.stale, try store.ingest(gpa, older, .{}));
+    try std.testing.expect(try store.hasEvent(newer.id));
+    try std.testing.expectEqual(IngestResult.duplicate, try store.ingest(gpa, newer, .{}));
+}
+
+test "store: ingest replaceable tie-break prefers the lower id" {
+    const gpa = std.testing.allocator;
+    var signer = try keys.Signer.initRandomized(std.testing.io);
+    defer signer.deinit();
+    const kp = try signer.generateKeyPair(std.testing.io);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var store = try openTempStore(&tmp, "ingest-tiebreak.mdb", &buf);
+    defer store.deinit();
+
+    // Same author, kind and created_at, different content -> different ids.
+    const e1 = try event.create(gpa, signer, kp, 1000, 0, &[_]Tag{}, "aaa", null);
+    const e2 = try event.create(gpa, signer, kp, 1000, 0, &[_]Tag{}, "bbb", null);
+    const e1_lower = std.mem.order(u8, &e1.id, &e2.id) == .lt;
+    const lower = if (e1_lower) e1 else e2;
+    const higher = if (e1_lower) e2 else e1;
+
+    try std.testing.expectEqual(IngestResult.added, try store.ingest(gpa, higher, .{}));
+    // The lexicographically lower id wins the tie and replaces the stored one.
+    try std.testing.expectEqual(IngestResult.replaced, try store.ingest(gpa, lower, .{}));
+    try std.testing.expect(try store.hasEvent(lower.id));
+    try std.testing.expect(!(try store.hasEvent(higher.id)));
+    // Re-ingesting the higher id now loses the tie.
+    try std.testing.expectEqual(IngestResult.stale, try store.ingest(gpa, higher, .{}));
+}
+
+test "store: ingest parameterized-replaceable is keyed by the d tag" {
+    const gpa = std.testing.allocator;
+    var signer = try keys.Signer.initRandomized(std.testing.io);
+    defer signer.deinit();
+    const kp = try signer.generateKeyPair(std.testing.io);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var store = try openTempStore(&tmp, "ingest-param.mdb", &buf);
+    defer store.deinit();
+
+    const d_profile = [_]Tag{&[_][]const u8{ "d", "profile" }};
+    const d_other = [_]Tag{&[_][]const u8{ "d", "other" }};
+    const a1 = try event.create(gpa, signer, kp, 1000, 30000, &d_profile, "a1", null);
+    const a2 = try event.create(gpa, signer, kp, 2000, 30000, &d_profile, "a2", null);
+    const b1 = try event.create(gpa, signer, kp, 1500, 30000, &d_other, "b1", null);
+
+    try std.testing.expectEqual(IngestResult.added, try store.ingest(gpa, a1, .{}));
+    try std.testing.expectEqual(IngestResult.added, try store.ingest(gpa, b1, .{}));
+    // a2 replaces a1 (same d), b1 is a different coordinate and untouched.
+    try std.testing.expectEqual(IngestResult.replaced, try store.ingest(gpa, a2, .{}));
+    try std.testing.expect(!(try store.hasEvent(a1.id)));
+    try std.testing.expect(try store.hasEvent(a2.id));
+    try std.testing.expect(try store.hasEvent(b1.id));
+
+    var r = try store.query(gpa, .{ .authors = &[_][32]u8{kp.public_key}, .kinds = &[_]u16{30000} });
+    defer r.deinit();
+    try std.testing.expectEqual(@as(usize, 2), r.events.len);
+}
+
+test "store: ingest does not persist ephemeral events" {
+    const gpa = std.testing.allocator;
+    var signer = try keys.Signer.initRandomized(std.testing.io);
+    defer signer.deinit();
+    const kp = try signer.generateKeyPair(std.testing.io);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var store = try openTempStore(&tmp, "ingest-ephemeral.mdb", &buf);
+    defer store.deinit();
+
+    const eph = try event.create(gpa, signer, kp, 1000, 20000, &[_]Tag{}, "ephemeral", null);
+    try std.testing.expectEqual(IngestResult.ephemeral, try store.ingest(gpa, eph, .{}));
+    try std.testing.expect(!(try store.hasEvent(eph.id)));
 }
