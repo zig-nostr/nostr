@@ -16,6 +16,7 @@ pub const filter = @import("filter.zig");
 pub const message = @import("message.zig");
 pub const websocket = @import("websocket.zig");
 pub const relay = @import("relay.zig");
+pub const nip65 = @import("nip65.zig");
 
 test "module compiles and version is set" {
     try std.testing.expect(version.len > 0);
