@@ -166,6 +166,32 @@ pub const Store = struct {
         return inserted;
     }
 
+    /// Inserts many events in a single transaction — the bulk-load path (e.g.
+    /// hydrating the cache from a relay's backlog). One commit (one fsync)
+    /// covers the whole batch, so throughput is far higher than calling
+    /// `putEvent` per event, at the cost of per-event durability. Events whose
+    /// id is already stored are skipped. Returns the number newly inserted.
+    ///
+    /// Like `putEvent`, this is the low-level insert: it does not apply
+    /// replaceable/deletion semantics (use `ingest` for those).
+    pub fn putEventBatch(self: *Store, gpa: std.mem.Allocator, events: []const Event) Error!usize {
+        var txn: ?*c.MDB_txn = null;
+        try check(c.mdb_txn_begin(self.env, null, 0, &txn));
+        errdefer c.mdb_txn_abort(txn);
+
+        var inserted: usize = 0;
+        for (events) |ev| {
+            var k = val(&ev.id);
+            var probe: c.MDB_val = undefined;
+            if (c.mdb_get(txn, self.events_dbi, &k, &probe) == c.MDB_SUCCESS) continue;
+            try self.storeEvent(gpa, txn, ev);
+            inserted += 1;
+        }
+
+        try check(c.mdb_txn_commit(txn));
+        return inserted;
+    }
+
     /// Writes or deletes every secondary-index entry for `ev` within `txn`.
     /// Building both directions from one place guarantees an index delete uses
     /// the exact keys its insert did.
@@ -1186,6 +1212,32 @@ test "store: putEvent / getEvent round-trip and idempotent dedup" {
 
     const none = try store.getEvent(std.testing.allocator, [_]u8{0xAA} ** 32);
     try std.testing.expect(none == null);
+}
+
+test "store: putEventBatch inserts many in one transaction, skipping duplicates" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var store = try openTempStore(&tmp, "batch.mdb", &buf);
+    defer store.deinit();
+
+    const a = [_]u8{0xA1} ** 32;
+    const evs = [_]Event{
+        qEvent(1, a, 1, 100, &[_]Tag{}),
+        qEvent(2, a, 1, 200, &[_]Tag{}),
+        qEvent(3, a, 1, 300, &[_]Tag{}),
+    };
+    try std.testing.expectEqual(@as(usize, 3), try store.putEventBatch(gpa, &evs));
+    try std.testing.expectEqual(@as(usize, 3), try store.eventCount());
+    // Re-inserting the same batch inserts nothing (all duplicates).
+    try std.testing.expectEqual(@as(usize, 0), try store.putEventBatch(gpa, &evs));
+
+    // Indexes were written in the batch: the query returns them newest-first.
+    var r = try store.query(gpa, .{ .authors = &[_][32]u8{a} });
+    defer r.deinit();
+    try std.testing.expectEqual(@as(usize, 3), r.events.len);
+    try std.testing.expectEqual(@as(u8, 3), r.events[0].id[0]);
 }
 
 test "store: stored events survive reopen (decoded from mmap, no JSON)" {
