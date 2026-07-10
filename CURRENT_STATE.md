@@ -27,31 +27,31 @@ Unreleased (pre-`v0.1.0`).
 - NIP-01 event model: `Event` struct, canonical serialization, sha256 id
   computation, wire JSON encode/decode (`src/hex.zig`, `src/event.zig`),
   verified against hand-computed sha256 oracle vectors.
+- secp256k1 keys + BIP-340 Schnorr sign/verify (`src/keys.zig`), bound to
+  bitcoin-core/libsecp256k1 (compiled from source, pinned in
+  `build.zig.zon`). Passes the full official BIP-340 test-vector suite
+  (all 19 vectors). This is the credibility-anchor deliverable.
 
 ## What's in progress
 
-- A2: secp256k1 binding + BIP-340 Schnorr sign/verify — next up. This is
-  the credibility-anchor deliverable (full official test-vector suite).
-  Pending explicit user approval on the dependency pin (see below).
+- A2: event-level signing — wiring `keys.Signer` into `event` (compute id →
+  sign → populate `sig`; verify an event's signature). Next up.
 
 ## What's next
 
-1. A2: secp256k1 keypair generation + BIP-340 Schnorr sign/verify via a
-   `bitcoin-core/secp256k1` binding, full official test-vector suite passing.
-2. A2: NIP-06 derivation (also depends on secp256k1 for non-hardened HD
-   derivation steps, which require EC point multiplication).
+1. A2: event-level sign/verify glue over `event.Event` + `keys.Signer`.
+2. A2: NIP-06 derivation (BIP-39 mnemonic → BIP-32 HD derivation; uses
+   secp256k1 for the EC point multiplication in non-hardened steps).
 3. Tag `v0.1.0` once all A2 acceptance criteria are met.
 
 ## Known blockers / pending decisions
 
-- Adding `bitcoin-core/secp256k1` as a compiled `build.zig.zon` dependency
-  needs explicit user sign-off before it's pinned (proposed: tag `v0.7.1`,
-  commit `1a53f496`). Blocks BIP-340 signing and NIP-06 derivation.
-- Zig 0.16 removed the `std.crypto.random` global; secure randomness now
-  requires threading an `std.Io` instance through any function that needs
-  fresh entropy (`io.randomSecure(buffer)`), e.g. `nip49.encrypt`. Future
-  randomness-needing APIs (keygen, gift-wrap disposable keys, signing
-  aux_rand) should follow the same pattern.
+- None. (The `bitcoin-core/secp256k1` dependency — tag `v0.7.1`, commit
+  `1a53f496` — was approved and is now pinned in `build.zig.zon`.)
+- Note for future randomness-needing APIs: Zig 0.16 removed the
+  `std.crypto.random` global; secure randomness threads an `std.Io` instance
+  through the call (`io.randomSecure(buffer)`), as in `nip49.encrypt` and
+  `keys.Signer.generateKeyPair`/`initRandomized`.
 
 ## Package status
 
@@ -61,7 +61,8 @@ Unreleased (pre-`v0.1.0`).
 | NIP-19/21 encoding | done |
 | NIP-49 encrypted key storage | done |
 | NIP-01 event model | done |
-| Keys, signatures (BIP-340), NIP-06 | not started (blocked on secp256k1 dependency approval) |
+| secp256k1 keys + BIP-340 sign/verify | done |
+| NIP-06 derivation | not started |
 | Transport & outbox (NIP-65) | not started |
 | Local event store | not started |
 | Encryption (NIP-44/17/59) + signer interface | not started |

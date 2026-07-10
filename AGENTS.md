@@ -37,9 +37,14 @@ Use the Zig version pinned in `.zigversion`. CI runs on Linux and macOS.
 
 ## Dependency graph
 
-No external dependencies yet. Planned, added as each milestone needs them:
+Current:
 
-- `bitcoin-core/secp256k1` (binding) — BIP-340 Schnorr signing/verification.
+- `bitcoin-core/secp256k1` — BIP-340 Schnorr signing/verification. Compiled
+  from source and exposed to Zig via translate-c in `build.zig`; wrapped by
+  `src/keys.zig`. Pinned by exact commit in `build.zig.zon`.
+
+Planned, added as each milestone needs them:
+
 - `karlseguin/websocket.zig` — relay transport.
 - `allyourcodebase/lmdb` — local event store backing.
 

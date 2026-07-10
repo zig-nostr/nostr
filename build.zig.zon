@@ -4,7 +4,12 @@
     // Generated at project creation; never regenerate for this repo.
     .fingerprint = 0x208aa38fcd8fcc08,
     .minimum_zig_version = "0.16.0",
-    .dependencies = .{},
+    .dependencies = .{
+        .secp256k1 = .{
+            .url = "git+https://github.com/bitcoin-core/secp256k1#1a53f4961f337b4d166c25fce72ef0dc88806618",
+            .hash = "N-V-__8AAO1SWwCbwhTAU7t6L3XQtTy6TzE8CiOGHjENn_rl",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",

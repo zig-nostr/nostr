@@ -21,3 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - NIP-01 event model: `Event` struct, canonical serialization for id
   hashing (strict escaping per spec), sha256 id computation, and
   wire-format JSON encode/decode.
+- secp256k1 keys and BIP-340 Schnorr signatures: keypair generation,
+  x-only public keys, and sign/verify, bound to bitcoin-core's audited
+  libsecp256k1 (compiled from source, pinned in `build.zig.zon`). Passes the
+  full official BIP-340 test-vector suite (all 19 vectors, signing and
+  verification).
