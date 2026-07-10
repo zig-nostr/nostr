@@ -133,6 +133,33 @@ pub const Signer = struct {
     pub fn verifyId(self: Signer, sig: Signature, id: [32]u8, public_key: PublicKey) bool {
         return self.verify(sig, &id, public_key);
     }
+
+    /// Adds `tweak` to `secret_key` modulo the curve order (BIP-32
+    /// `CKDpriv`'s `parse256(IL) + kpar mod n`). Returns `InvalidSecretKey`
+    /// in the negligibly-rare case the result would be invalid.
+    pub fn tweakAdd(self: Signer, secret_key: SecretKey, tweak: [32]u8) Error!SecretKey {
+        var sk = secret_key;
+        if (c.secp256k1_ec_seckey_tweak_add(self.ctx, &sk, &tweak) != 1) {
+            return Error.InvalidSecretKey;
+        }
+        return sk;
+    }
+
+    /// Serializes the compressed SEC1 public key (33 bytes: a 0x02/0x03
+    /// parity prefix plus the x-coordinate) for a secret key. BIP-32 (used
+    /// by NIP-06) needs this full compressed point for non-hardened child
+    /// derivation — distinct from Nostr's 32-byte x-only public key.
+    pub fn compressedPublicKey(self: Signer, secret_key: SecretKey) Error![33]u8 {
+        var pk: c.secp256k1_pubkey = undefined;
+        if (c.secp256k1_ec_pubkey_create(self.ctx, &pk, &secret_key) != 1) {
+            return Error.InvalidSecretKey;
+        }
+        var out: [33]u8 = undefined;
+        var out_len: usize = out.len;
+        _ = c.secp256k1_ec_pubkey_serialize(self.ctx, &out, &out_len, &pk, c.SECP256K1_EC_COMPRESSED);
+        std.debug.assert(out_len == out.len);
+        return out;
+    }
 };
 
 // ---------------------------------------------------------------------------
