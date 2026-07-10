@@ -1,0 +1,15 @@
+.{
+    .name = .nostr,
+    .version = "0.0.0",
+    // Generated at project creation; never regenerate for this repo.
+    .fingerprint = 0x208aa38fcd8fcc08,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "LICENSE",
+        "README.md",
+    },
+}
