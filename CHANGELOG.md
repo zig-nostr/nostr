@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-07-10
+
+Milestone A2: the cryptographic and data foundation of the library —
+keys, encoding, events, and signatures, all verified against official
+spec test vectors.
+
 ### Added
 
 - Repository and workflow scaffolding (Milestone A1): build system, CI,
