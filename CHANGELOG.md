@@ -15,3 +15,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - NIP-19 bech32-encoded entities: `npub`/`nsec`/`note` bare encoding,
   `nprofile`/`nevent`/`naddr`/`nrelay` TLV encoding, and NIP-21 `nostr:`
   URIs, verified against the official NIP-19 spec vectors.
+- NIP-49 encrypted private key storage (`ncryptsec`): scrypt + XChaCha20-
+  Poly1305, verified against the official NIP-49 decryption vector. Password
+  Unicode NFKC normalization is not implemented (documented limitation).
