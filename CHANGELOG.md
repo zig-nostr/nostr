@@ -18,3 +18,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - NIP-49 encrypted private key storage (`ncryptsec`): scrypt + XChaCha20-
   Poly1305, verified against the official NIP-49 decryption vector. Password
   Unicode NFKC normalization is not implemented (documented limitation).
+- NIP-01 event model: `Event` struct, canonical serialization for id
+  hashing (strict escaping per spec), sha256 id computation, and
+  wire-format JSON encode/decode.

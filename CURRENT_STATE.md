@@ -24,20 +24,23 @@ Unreleased (pre-`v0.1.0`).
   XChaCha20-Poly1305, verified against the official decryption vector
   (`src/nip49.zig`). Password NFKC normalization not implemented (documented
   limitation — Zig std has no Unicode normalization).
+- NIP-01 event model: `Event` struct, canonical serialization, sha256 id
+  computation, wire JSON encode/decode (`src/hex.zig`, `src/event.zig`),
+  verified against hand-computed sha256 oracle vectors.
 
 ## What's in progress
 
-- A2: NIP-01 event struct, canonical serialization, id hashing, and the
-  secp256k1/BIP-340 binding — both next up (secp256k1 dependency pin is
-  pending explicit user approval, see below).
+- A2: secp256k1 binding + BIP-340 Schnorr sign/verify — next up. This is
+  the credibility-anchor deliverable (full official test-vector suite).
+  Pending explicit user approval on the dependency pin (see below).
 
 ## What's next
 
-1. A2: NIP-01 event struct, canonical serialization, id hashing.
-2. A2: secp256k1 keypair generation + BIP-340 Schnorr sign/verify via a
+1. A2: secp256k1 keypair generation + BIP-340 Schnorr sign/verify via a
    `bitcoin-core/secp256k1` binding, full official test-vector suite passing.
-3. A2: NIP-06 derivation (also depends on secp256k1 for non-hardened HD
+2. A2: NIP-06 derivation (also depends on secp256k1 for non-hardened HD
    derivation steps, which require EC point multiplication).
+3. Tag `v0.1.0` once all A2 acceptance criteria are met.
 
 ## Known blockers / pending decisions
 
@@ -57,8 +60,8 @@ Unreleased (pre-`v0.1.0`).
 | Repo/CI scaffolding | done |
 | NIP-19/21 encoding | done |
 | NIP-49 encrypted key storage | done |
+| NIP-01 event model | done |
 | Keys, signatures (BIP-340), NIP-06 | not started (blocked on secp256k1 dependency approval) |
-| Events & signatures (NIP-01) | not started |
 | Transport & outbox (NIP-65) | not started |
 | Local event store | not started |
 | Encryption (NIP-44/17/59) + signer interface | not started |
