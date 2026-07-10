@@ -4,11 +4,12 @@ Updated inside every PR that changes it. Never updated locally after merge.
 
 ## Version
 
-`v0.1.0` — Milestone A2 (library core: keys, encoding, events, signatures).
+`v0.2.0` — Milestones A2 (library core), A3 (transport), and A4 (local-first
+event store) complete.
 
 ## Active milestone
 
-**A3 — Library transport: relays, subscriptions, outbox routing.**
+**A5 — Showcase 1: native Signer + NIP-46 bunker.** (Not yet started.)
 
 ## What's done
 
@@ -40,18 +41,32 @@ Updated inside every PR that changes it. Never updated locally after merge.
   HD derivation for `m/44'/1237'/<account>'/0/0`, verified against both
   official NIP-06 test vectors byte-for-byte.
 - **Tagged `v0.1.0`** — Milestone A2 complete, issue #2 closed.
+- Relay transport (A3): RFC 6455 WebSocket framing + handshake
+  (`src/websocket.zig`), a stream-generic relay connection state machine with
+  NIP-01 subscriptions (`src/relay.zig`), a live TCP/TLS dialer, and the
+  NIP-01 filter/message wire types (`src/filter.zig`, `src/message.zig`).
+- Outbox model (A3): NIP-65 relay lists (`kind:10002`) with read/write
+  routing and zero hardcoded relays (`src/nip65.zig`).
+- Local-first event store (A4): a zero-copy, memory-mapped LMDB store
+  (`src/store.zig`) with a compact binary event record, secondary indexes
+  (author/kind/created_at/tag) and a filter-driven query API, validate-on-
+  insert ingestion with replaceable/parameterized-replaceable upserts and
+  NIP-09 deletion, a direct-message conversation index, local-first
+  reconciliation, a size-cap cache, and a benchmark (`src/bench.zig`).
+- **Tagged `v0.2.0`** — Milestones A3 and A4 complete, issues #3 and #4 closed.
 
 ## What's in progress
 
-- A3: not yet started — see "What's next".
+- A5: not yet started — see "What's next".
 
 ## What's next
 
-1. A3: websocket relay client (TLS), reconnect/backoff.
-2. A3: NIP-01 message handling (`EVENT`/`REQ`/`CLOSE`/`EOSE`/`NOTICE`/`OK`/`CLOSED`),
-   filter model, subscription management, multi-relay pool with parallel fanout.
-3. A3: NIP-65 outbox routing (parse `kind:10002`, route reads/writes by
-   relay list, zero hardcoded relays).
+1. A5: native key manager — create/import key, NIP-49 at-rest encryption, a
+   local signing API.
+2. A5: NIP-46 bunker (`sign_event`/`get_public_key`/`nip44_encrypt`/
+   `nip44_decrypt`/`ping`) with per-request approval.
+3. A6+: NIP-44 v2 encryption and NIP-17 private messaging, then the read-only
+   outbox client — see the project board for the full roadmap.
 
 ## Known blockers / pending decisions
 
@@ -73,6 +88,6 @@ Updated inside every PR that changes it. Never updated locally after merge.
 | secp256k1 keys + BIP-340 sign/verify | done |
 | Event-level sign/verify glue | done |
 | NIP-06 derivation | done |
-| Transport & outbox (NIP-65) | not started |
-| Local event store | not started |
+| Transport & outbox (NIP-65) | done |
+| Local event store | done |
 | Encryption (NIP-44/17/59) + signer interface | not started |
