@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `nostr.version` now reports `0.1.0` to match the package version and the
+  `v0.1.0` release tag (it was left at the placeholder `0.0.0`).
+
 ## [0.1.0] - 2026-07-10
 
 Milestone A2: the cryptographic and data foundation of the library —
