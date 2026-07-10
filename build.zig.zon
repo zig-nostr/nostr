@@ -9,6 +9,10 @@
             .url = "git+https://github.com/bitcoin-core/secp256k1#1a53f4961f337b4d166c25fce72ef0dc88806618",
             .hash = "N-V-__8AAO1SWwCbwhTAU7t6L3XQtTy6TzE8CiOGHjENn_rl",
         },
+        .lmdb = .{
+            .url = "git+https://github.com/LMDB/lmdb#ce201088de95d26fc0da36ba805bf2ddc2ba74ff",
+            .hash = "N-V-__8AAHEsCACb_b9D1HnCysDKIhKFOrITbxYh9JRh9ix5",
+        },
     },
     .paths = .{
         "build.zig",

@@ -9,6 +9,12 @@ pub fn build(b: *std.Build) void {
     // hand-rolling signing, and expose its C API to Zig via translate-c.
     const secp = buildSecp256k1(b, target, optimize);
 
+    // LMDB backs the local-first event store (src/store.zig): a zero-copy,
+    // memory-mapped key/value engine. We compile the canonical liblmdb C
+    // sources (pinned in build.zig.zon) directly and expose them via
+    // translate-c, mirroring how we vendor libsecp256k1.
+    const lmdb = buildLmdb(b, target, optimize);
+
     // The "nostr" module is the library's public API surface (src/root.zig).
     // This is what consumers import via `@import("nostr")`.
     const mod = b.addModule("nostr", .{
@@ -18,6 +24,8 @@ pub fn build(b: *std.Build) void {
     });
     mod.addImport("secp256k1", secp.c_module);
     mod.linkLibrary(secp.library);
+    mod.addImport("lmdb", lmdb.c_module);
+    mod.linkLibrary(lmdb.library);
 
     const mod_tests = b.addTest(.{
         .root_module = mod,
@@ -82,3 +90,52 @@ const secp_flags = &.{
     "-DENABLE_MODULE_SCHNORRSIG=1",
     "-DENABLE_MODULE_EXTRAKEYS=1",
 };
+
+const Lmdb = struct {
+    library: *std.Build.Step.Compile,
+    c_module: *std.Build.Module,
+};
+
+/// Compiles the canonical liblmdb (two C files: mdb.c + midl.c) as a static
+/// library and produces a translate-c module exposing its C API to Zig.
+///
+/// We disable Zig's C UBSan for these sources: liblmdb intentionally performs
+/// unaligned reads and pointer arithmetic over its memory-mapped pages that
+/// are well-defined for the engine but trip -fsanitize=undefined.
+fn buildLmdb(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) Lmdb {
+    const upstream = b.dependency("lmdb", .{});
+    const src = upstream.path("libraries/liblmdb");
+
+    const lib = b.addLibrary(.{
+        .name = "lmdb",
+        .linkage = .static,
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .sanitize_c = .off,
+        }),
+    });
+    lib.root_module.addIncludePath(src);
+    lib.root_module.addCSourceFiles(.{
+        .root = src,
+        .files = &.{ "mdb.c", "midl.c" },
+    });
+    lib.installHeadersDirectory(src, "", .{ .include_extensions = &.{"lmdb.h"} });
+
+    const translate_c = b.addTranslateC(.{
+        .root_source_file = src.path(b, "lmdb.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    translate_c.addIncludePath(src);
+
+    const c_module = translate_c.createModule();
+    c_module.linkLibrary(lib);
+
+    return .{ .library = lib, .c_module = c_module };
+}
