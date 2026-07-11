@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-07-11
+
+### Fixed
+
+- `relay.dial` now resolves relay hostnames with the system resolver (libc
+  `getaddrinfo`) instead of std's built-in resolver. std reads nameservers from
+  `/etc/resolv.conf`, which is empty on macOS, so it fell back to a dead
+  `127.0.0.1:53` and a hostname lookup hung indefinitely. The live dialer now
+  connects by hostname on both macOS and Linux. (#41)
+
 ## [0.3.0] - 2026-07-11
 
 Milestone A5 groundwork: NIP-44 v2 encryption and the NIP-46 remote-signing
