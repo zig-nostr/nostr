@@ -277,26 +277,39 @@ pub const IoStream = struct {
     transport_writer: ?*std.Io.Writer = null,
 
     pub fn read(self: IoStream, buffer: []u8) std.Io.Reader.ShortError!usize {
-        // Return whatever a single read makes available, like a POSIX `read` —
-        // NOT `readSliceShort`, which loops until the *whole* buffer is full (or
-        // EOF). Filling deadlocks against a relay that sends a short message and
-        // then waits for us: the 101 handshake response is ~129 bytes, so
-        // `readSliceShort` on a 4096-byte buffer blocks forever waiting for the
-        // rest, and the subscription is never sent.
+        // Return whatever is already buffered, else exactly ONE underlying
+        // read's worth — like a POSIX `read`, never blocking for more once some
+        // bytes are available.
         //
-        // `readVec` reads once, but a short read of *zero* is "no bytes yet, not
-        // end of stream" (e.g. a TLS record that carried no application data) —
-        // reporting that as EOF fails the handshake read. So loop past a bare
-        // zero (the underlying read blocks between records) and return on the
-        // first real bytes or a genuine end of stream.
-        var data: [1][]u8 = .{buffer};
-        while (true) {
-            const n = self.reader.readVec(&data) catch |err| switch (err) {
+        // This is subtle over TLS and is what stalled `wss://` delivery. The std
+        // reader decrypts one record at a time into its *own* buffer; the greedy
+        // primitives (`readSliceShort`, and `readVec` into a large destination)
+        // keep pulling until that destination is full. So after a full relay
+        // message was received and buffered, `readVec` would drain it into our
+        // buffer and then block on `fillMore` for the *next* record to fill the
+        // rest — withholding the message we already had until unrelated later
+        // traffic (a retry, a ping) happened to arrive. Every NIP-46 request to
+        // a signer stalled behind the following record. (`readSliceShort`, the
+        // original primitive here, was even worse: it blocked the opening
+        // handshake outright.)
+        //
+        // `fillMore` does exactly one underlying read and may add zero bytes
+        // without being end of stream (a partial record, or a TLS record with no
+        // application data), so loop only while nothing is buffered; then hand
+        // back what one read produced. Each message surfaces the moment its
+        // record lands, on both `ws://` and `wss://`.
+        const r = self.reader;
+        while (r.bufferedLen() == 0) {
+            r.fillMore() catch |err| switch (err) {
                 error.EndOfStream => return 0,
                 error.ReadFailed => return error.ReadFailed,
             };
-            if (n != 0) return n;
         }
+        const available = r.buffered();
+        const n = @min(available.len, buffer.len);
+        @memcpy(buffer[0..n], available[0..n]);
+        r.toss(n);
+        return n;
     }
 
     pub fn writeAll(self: IoStream, bytes: []const u8) std.Io.Writer.Error!void {
@@ -826,86 +839,91 @@ test "IoStream drives a Connection over real std Io.Reader/Writer" {
     try std.testing.expectEqualStrings("[\"CLOSE\",\"s1\"]", frame.payload);
 }
 
-test "IoStream.read returns a single short read and never blocks to fill the buffer" {
-    // Regression (relay handshake deadlock): IoStream.read must return whatever
-    // ONE read yields, POSIX-style. It once used `readSliceShort`, which loops
-    // until the *whole* buffer is full — so the WS handshake, reading a short
-    // 101 response into a 4 KiB buffer, blocked forever waiting for bytes the
-    // relay never sends until we reply, and the subscription REQ was never sent.
+test "IoStream.read returns one buffered record without pulling the next" {
+    // Regression (wss:// delivery stall): the std TLS reader decrypts one record
+    // at a time into its *own* buffer, and the generic `readVec` keeps pulling
+    // until the caller's buffer is full — so a relay message that had fully
+    // arrived was withheld until the *next* record showed up, stalling every
+    // NIP-46 request behind later traffic. `read` must hand back the first
+    // record's bytes after exactly ONE underlying read.
     //
-    // A reader that hands out 5 bytes per `readVec` must therefore yield exactly
-    // 5 from a 4 KiB read; the buggy fill-the-buffer version would loop and
-    // return the whole input. (A live end-to-end check lives outside CI, since
-    // it needs a real relay — this pins the read primitive that broke.)
-    const Chunked = struct {
-        data: []const u8,
-        pos: usize = 0,
+    // This models that reader faithfully: each read fills the reader's own
+    // buffer with one "record" and returns 0 (as a TLS application_data record
+    // does), never touching the destination vector.
+    const Recorder = struct {
+        records: []const []const u8,
+        idx: usize = 0,
+        reads: usize = 0,
         reader: std.Io.Reader,
 
         fn readVec(r: *std.Io.Reader, dest: [][]u8) std.Io.Reader.Error!usize {
             const self: *@This() = @fieldParentPtr("reader", r);
-            if (self.pos >= self.data.len) return error.EndOfStream;
-            const dst = dest[0];
-            const n = @min(@min(@as(usize, 5), dst.len), self.data.len - self.pos);
-            @memcpy(dst[0..n], self.data[self.pos..][0..n]);
-            self.pos += n;
-            return n;
-        }
-        fn noStream(_: *std.Io.Reader, _: *std.Io.Writer, _: std.Io.Limit) std.Io.Reader.StreamError!usize {
-            return error.ReadFailed; // unused: IoStream.read only calls readVec
-        }
-    };
-
-    const vtable: std.Io.Reader.VTable = .{ .stream = Chunked.noStream, .readVec = Chunked.readVec };
-    var empty: [0]u8 = .{};
-    var cr = Chunked{ .data = "hello world, well over one five-byte chunk", .reader = .{ .vtable = &vtable, .buffer = &empty, .seek = 0, .end = 0 } };
-
-    var write_scratch: [1]u8 = undefined;
-    var writer = std.Io.Writer.fixed(&write_scratch);
-    const stream: IoStream = .{ .reader = &cr.reader, .writer = &writer };
-
-    var buffer: [4096]u8 = undefined;
-    const n = try stream.read(&buffer);
-    try std.testing.expectEqual(@as(usize, 5), n);
-    try std.testing.expectEqualStrings("hello", buffer[0..n]);
-}
-
-test "IoStream.read retries past a zero-length read instead of reporting EOF" {
-    // A `readVec` of zero without EndOfStream means "no bytes yet" — e.g. a TLS
-    // record carrying no application data. `read` must retry, not report EOF,
-    // or the WS handshake read fails against a real (TLS) relay. This is the
-    // case a naive single-`readVec` got wrong.
-    const ZeroThenData = struct {
-        calls: usize = 0,
-        reader: std.Io.Reader,
-
-        fn readVec(r: *std.Io.Reader, dest: [][]u8) std.Io.Reader.Error!usize {
-            const self: *@This() = @fieldParentPtr("reader", r);
-            self.calls += 1;
-            if (self.calls == 1) return 0; // a zero-length read that is NOT EOF
-            const msg = "data";
-            const n = @min(msg.len, dest[0].len);
-            @memcpy(dest[0][0..n], msg[0..n]);
-            return n;
+            _ = dest; // TLS-style: fill our own buffer, ignore the destination
+            self.reads += 1;
+            if (self.idx >= self.records.len) return error.EndOfStream;
+            const rec = self.records[self.idx];
+            self.idx += 1;
+            @memcpy(r.buffer[r.end..][0..rec.len], rec);
+            r.end += rec.len;
+            return 0; // buffered, nothing "returned" — like a TLS record
         }
         fn noStream(_: *std.Io.Reader, _: *std.Io.Writer, _: std.Io.Limit) std.Io.Reader.StreamError!usize {
             return error.ReadFailed;
         }
     };
 
-    const vtable: std.Io.Reader.VTable = .{ .stream = ZeroThenData.noStream, .readVec = ZeroThenData.readVec };
-    var empty: [0]u8 = .{};
-    var zd = ZeroThenData{ .reader = .{ .vtable = &vtable, .buffer = &empty, .seek = 0, .end = 0 } };
+    const vtable: std.Io.Reader.VTable = .{ .stream = Recorder.noStream, .readVec = Recorder.readVec };
+    const records = [_][]const u8{ "first", "second" };
+    var buf: [64]u8 = undefined;
+    var rec = Recorder{ .records = &records, .reader = .{ .vtable = &vtable, .buffer = &buf, .seek = 0, .end = 0 } };
 
     var write_scratch: [1]u8 = undefined;
     var writer = std.Io.Writer.fixed(&write_scratch);
-    const stream: IoStream = .{ .reader = &zd.reader, .writer = &writer };
+    const stream: IoStream = .{ .reader = &rec.reader, .writer = &writer };
 
-    var buffer: [4096]u8 = undefined;
-    const n = try stream.read(&buffer);
-    try std.testing.expectEqual(@as(usize, 4), n);
-    try std.testing.expectEqualStrings("data", buffer[0..n]);
-    try std.testing.expectEqual(@as(usize, 2), zd.calls); // retried past the zero
+    var out: [4096]u8 = undefined;
+    const n = try stream.read(&out);
+    try std.testing.expectEqualStrings("first", out[0..n]);
+    // Crucially, it did NOT go on to pull "second" to fill the 4 KiB buffer.
+    try std.testing.expectEqual(@as(usize, 1), rec.reads);
+}
+
+test "IoStream.read loops past a read that buffers no bytes instead of reporting EOF" {
+    // One underlying read can legitimately add zero bytes without end of stream
+    // — a partial record, or a TLS record with no application data. `read` must
+    // retry rather than mistake that for EOF (which would fail the handshake and
+    // drop live connections).
+    const StallThenData = struct {
+        calls: usize = 0,
+        reader: std.Io.Reader,
+
+        fn readVec(r: *std.Io.Reader, dest: [][]u8) std.Io.Reader.Error!usize {
+            const self: *@This() = @fieldParentPtr("reader", r);
+            _ = dest;
+            self.calls += 1;
+            if (self.calls == 1) return 0; // buffered nothing, but NOT end of stream
+            const msg = "data";
+            @memcpy(r.buffer[r.end..][0..msg.len], msg);
+            r.end += msg.len;
+            return 0;
+        }
+        fn noStream(_: *std.Io.Reader, _: *std.Io.Writer, _: std.Io.Limit) std.Io.Reader.StreamError!usize {
+            return error.ReadFailed;
+        }
+    };
+
+    const vtable: std.Io.Reader.VTable = .{ .stream = StallThenData.noStream, .readVec = StallThenData.readVec };
+    var buf: [64]u8 = undefined;
+    var sd = StallThenData{ .reader = .{ .vtable = &vtable, .buffer = &buf, .seek = 0, .end = 0 } };
+
+    var write_scratch: [1]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&write_scratch);
+    const stream: IoStream = .{ .reader = &sd.reader, .writer = &writer };
+
+    var out: [4096]u8 = undefined;
+    const n = try stream.read(&out);
+    try std.testing.expectEqualStrings("data", out[0..n]);
+    try std.testing.expectEqual(@as(usize, 2), sd.calls); // looped past the empty read
 }
 
 test "live dialer is semantically analyzed" {
