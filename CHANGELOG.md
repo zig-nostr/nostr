@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The live relay connection no longer deadlocks the websocket opening
+  handshake. `IoStream.read` used `readSliceShort`, which blocks until it has
+  filled the *whole* read buffer — so reading a short `101 Switching Protocols`
+  response (~129 bytes) into a 4 KiB buffer waited forever for bytes the relay
+  only sends after we subscribe, and `dial` never returned. It now reads once
+  and returns whatever is available (`readVec`), like a POSIX `read`. This was
+  why a running signer connected to relays but never received any requests.
+  Adds a regression test pinning the read primitive. (#44)
+
 ## [0.3.1] - 2026-07-11
 
 ### Fixed
