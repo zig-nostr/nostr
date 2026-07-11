@@ -4,8 +4,9 @@ Updated inside every PR that changes it. Never updated locally after merge.
 
 ## Version
 
-`v0.2.1` — Milestones A2 (library core), A3 (transport), and A4 (local-first
-event store) complete, plus the bounded-query performance patch (#33).
+`v0.3.0` — Milestones A2 (library core), A3 (transport), and A4 (local-first
+event store) complete; A5's NIP-44 v2 encryption and NIP-46 remote-signing
+protocol layer have landed (the native signer app is in progress).
 
 ## Active milestone
 
@@ -70,6 +71,8 @@ library-side cryptographic groundwork is landing first.)
   nip44_decrypt) behind an injectable approval `Policy`, and the `bunker://` /
   `nostrconnect://` connection URIs (parse + build, percent-decoding, verified
   against the spec's example token). Relay I/O is left to the app.
+- **Tagged `v0.3.0`** — NIP-44 v2 encryption and the NIP-46 remote-signing
+  protocol layer; the native signer app continues in `zig-nostr/signer`.
 
 ## What's in progress
 

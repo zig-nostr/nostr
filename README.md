@@ -12,8 +12,8 @@ transport with the outbox model, NIP-44/NIP-17 encrypted messaging, and a
 zero-copy local event store modeled on
 [nostrdb](https://github.com/damus-io/nostrdb).
 
-**Status: pre-alpha, `v0.2.1`.** The library core, relay transport, and the
-local-first event store have shipped:
+**Status: pre-alpha, `v0.3.0`.** The library core, relay transport, the
+local-first event store, and the NIP-46 signer protocol layer have shipped:
 
 - **Milestone A2 — library core:** secp256k1 keys and BIP-340 Schnorr
   signatures (audited libsecp256k1 binding, full official test-vector suite
@@ -28,6 +28,12 @@ local-first event store have shipped:
   insert ingestion (dedup, replaceable/parameterized, NIP-09 deletion), a
   direct-message conversation index, local-first reconciliation, and a
   size-cap cache.
+- **Milestone A5 (in progress) — signer protocol layer:** NIP-44 v2 payload
+  encryption and the NIP-46 remote-signing ("bunker") protocol — the
+  request/response messages, the `kind:24133` envelope, a transport-agnostic
+  dispatcher behind an approval policy, and the `bunker://` / `nostrconnect://`
+  connection URIs. The native signer app is being built in
+  [`zig-nostr/signer`](https://github.com/zig-nostr/signer).
 
 Native signer, messenger, and reader showcases land in upcoming milestones —
 see [`CURRENT_STATE.md`](CURRENT_STATE.md) for what's in progress and the
@@ -37,7 +43,7 @@ milestone roadmap.
 ## Install
 
 ```sh
-zig fetch --save https://github.com/zig-nostr/nostr/archive/refs/tags/v0.2.1.tar.gz
+zig fetch --save https://github.com/zig-nostr/nostr/archive/refs/tags/v0.3.0.tar.gz
 ```
 
 Then in `build.zig`:
