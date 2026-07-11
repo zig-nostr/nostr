@@ -2,7 +2,7 @@
 
 const std = @import("std");
 
-pub const version = "0.3.3";
+pub const version = "0.3.4";
 
 pub const bech32 = @import("bech32.zig");
 pub const nip19 = @import("nip19.zig");

@@ -4,12 +4,15 @@ Updated inside every PR that changes it. Never updated locally after merge.
 
 ## Version
 
-`v0.3.3` — Milestones A2 (library core), A3 (transport), and A4 (local-first
+`v0.3.4` — Milestones A2 (library core), A3 (transport), and A4 (local-first
 event store) complete; A5's NIP-44 v2 encryption and NIP-46 remote-signing
 protocol layer have landed (the native signer app is in progress), plus a run
 of fixes to the live relay dialer: macOS hostname resolution (#41), a websocket
-handshake deadlock that stopped a signer from receiving requests (#44), and a
-follow-up so the same read fix doesn't fail the TLS (`wss://`) handshake (#46).
+handshake deadlock that stopped a signer from receiving requests (#44), a
+follow-up so the same read fix doesn't fail the TLS (`wss://`) handshake (#46),
+and a receive-path stall that withheld each `wss://` request until the next
+record arrived — the real cause of non-delivery over public relays like damus,
+so a signer now works end-to-end over `relay.damus.io` (#48, #49).
 
 ## Active milestone
 
@@ -84,6 +87,11 @@ library-side cryptographic groundwork is landing first.)
 - **Tagged `v0.3.3`** — follow-up: `IoStream.read` retries past a zero-length
   read (a TLS record with no application data) instead of reporting EOF, so the
   read fix no longer fails the `wss://` handshake (#46).
+- **Tagged `v0.3.4`** — `IoStream.read` serves already-buffered bytes and does a
+  single underlying read (`fillMore`) instead of greedily filling via `readVec`,
+  which blocked on the *next* TLS record and stalled `wss://` request delivery.
+  A full NIP-46 round-trip now completes over `relay.damus.io` at sub-second
+  latency; this — not NIP-42 AUTH — was the public-relay delivery gap (#48, #49).
 
 ## What's in progress
 

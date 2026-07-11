@@ -1,6 +1,6 @@
 .{
     .name = .nostr,
-    .version = "0.3.3",
+    .version = "0.3.4",
     // Generated at project creation; never regenerate for this repo.
     .fingerprint = 0x208aa38fcd8fcc08,
     .minimum_zig_version = "0.16.0",

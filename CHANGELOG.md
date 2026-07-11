@@ -8,6 +8,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-07-12
+
+### Fixed
+
+- The live relay connection no longer stalls request delivery over `wss://`.
+  `IoStream.read` returned bytes via the generic `readVec` into the full 4 KiB
+  receive buffer, which greedily keeps reading until that buffer fills — so a
+  relay message that had already arrived was drained into the buffer and then
+  the read *blocked on the next TLS record* to fill the remaining space,
+  withholding the message until unrelated later traffic (a client retry, a
+  relay ping) happened to arrive. Every NIP-46 request to a running signer
+  stalled behind the following record — tens of seconds, or indefinitely. It
+  now serves already-buffered bytes and otherwise does exactly one underlying
+  read (`fillMore`), so each message surfaces the moment its record lands, on
+  both `ws://` and `wss://`. This was the real cause of non-delivery over public
+  relays like `relay.damus.io` (not NIP-42 AUTH); verified live with a full
+  NIP-46 round-trip completing in ~3 s at sub-second per-request latency.
+  Supersedes the #44 / #46 read iterations, which fixed the handshake but left
+  this receive-path stall. (#49)
+
 ## [0.3.3] - 2026-07-12
 
 ### Fixed
