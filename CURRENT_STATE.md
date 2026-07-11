@@ -64,18 +64,20 @@ library-side cryptographic groundwork is landing first.)
   HKDF-derived keys over a libsecp256k1 ECDH shared secret, verified against
   the official NIP-44 test vectors (conversation keys, message keys, padding,
   and encrypt/decrypt round-trips). Groundwork for the A5 NIP-46 bunker.
-- NIP-46 remote-signing core (`src/nip46.zig`): the request/response messages
-  and JSON, the kind:24133 NIP-44 envelope (`seal`/`open`), and a transport-
-  agnostic `Bunker` dispatcher (connect/sign_event/ping/get_public_key/
-  nip44_encrypt/nip44_decrypt) behind an injectable approval `Policy`. Relay
-  I/O is left to the app; connection URIs are the next slice.
+- NIP-46 remote signing (`src/nip46.zig`): the request/response messages and
+  JSON, the kind:24133 NIP-44 envelope (`seal`/`open`), a transport-agnostic
+  `Bunker` dispatcher (connect/sign_event/ping/get_public_key/nip44_encrypt/
+  nip44_decrypt) behind an injectable approval `Policy`, and the `bunker://` /
+  `nostrconnect://` connection URIs (parse + build, percent-decoding, verified
+  against the spec's example token). Relay I/O is left to the app.
 
 ## What's in progress
 
-- A5 (Showcase 1): NIP-44 v2 encryption and the NIP-46 protocol core
-  (messages, kind:24133 envelope, bunker dispatch) have landed in the library.
-  Next: the `bunker://` / `nostrconnect://` connection URIs, then the native
-  signer app in its own repo.
+- A5 (Showcase 1): the NIP-46 library layer is complete — NIP-44 v2 encryption,
+  the messages, the kind:24133 envelope, the bunker dispatch, and the
+  connection URIs. Next: the native signer app in its own repo
+  (`zig-nostr/signer`), which needs two decisions — creating that public repo
+  and the macOS GUI approach.
 
 ## What's next
 
@@ -109,5 +111,5 @@ library-side cryptographic groundwork is landing first.)
 | Transport & outbox (NIP-65) | done |
 | Local event store | done |
 | NIP-44 v2 encryption | done |
-| NIP-46 remote signing (protocol core) | done |
+| NIP-46 remote signing (protocol + URIs) | done |
 | NIP-17/59 + signer interface | not started |

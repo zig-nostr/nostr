@@ -1,8 +1,9 @@
 //! NIP-46 remote signing (Nostr Connect / "bunker").
 //!
 //! Transport-agnostic protocol layer: the request/response messages, the
-//! kind:24133 NIP-44 envelope, and a `Bunker` that answers requests using a
-//! local key behind an approval policy. Relay I/O is intentionally out of
+//! kind:24133 NIP-44 envelope, the `bunker://` / `nostrconnect://` connection
+//! URIs, and a `Bunker` that answers requests using a local key behind an
+//! approval policy. Relay I/O is intentionally out of
 //! scope — callers move the `event.Event`s produced and consumed here over
 //! whatever transport they use (see `src/relay.zig`); the native signer app
 //! wires those together.
@@ -29,6 +30,8 @@ pub const Error = error{
     WrongEventKind,
     /// The decrypted content was not a well-formed request/response object.
     MalformedContent,
+    /// A connection URI had a bad scheme, pubkey, or missing required field.
+    InvalidUri,
 } || nip44.Error || keys.Error || hex.Error;
 
 // ---------------------------------------------------------------------------
@@ -406,6 +409,243 @@ fn errorResponse(arena: *std.heap.ArenaAllocator, id: []const u8, message: []con
 }
 
 // ---------------------------------------------------------------------------
+// Connection URIs (bunker:// and nostrconnect://)
+// ---------------------------------------------------------------------------
+
+/// A parsed `bunker://` token — a remote-signer-initiated connection.
+pub const BunkerUri = struct {
+    remote_signer_pubkey: [32]u8,
+    relays: []const []const u8,
+    secret: ?[]const u8,
+};
+
+/// A parsed `nostrconnect://` token — a client-initiated connection. `secret`
+/// is required; the client MUST validate it against the connect response.
+pub const NostrConnectUri = struct {
+    client_pubkey: [32]u8,
+    relays: []const []const u8,
+    secret: []const u8,
+    perms: ?[]const u8 = null,
+    name: ?[]const u8 = null,
+    url: ?[]const u8 = null,
+    image: ?[]const u8 = null,
+};
+
+/// Options for `buildNostrConnectUri`.
+pub const NostrConnectOptions = struct {
+    relays: []const []const u8,
+    secret: []const u8,
+    perms: ?[]const u8 = null,
+    name: ?[]const u8 = null,
+    url: ?[]const u8 = null,
+    image: ?[]const u8 = null,
+};
+
+/// A `BunkerUri` backed by an owned arena. Call `deinit`.
+pub const ParsedBunkerUri = struct {
+    arena: *std.heap.ArenaAllocator,
+    value: BunkerUri,
+
+    pub fn deinit(self: *ParsedBunkerUri) void {
+        const gpa = self.arena.child_allocator;
+        self.arena.deinit();
+        gpa.destroy(self.arena);
+    }
+};
+
+/// A `NostrConnectUri` backed by an owned arena. Call `deinit`.
+pub const ParsedNostrConnectUri = struct {
+    arena: *std.heap.ArenaAllocator,
+    value: NostrConnectUri,
+
+    pub fn deinit(self: *ParsedNostrConnectUri) void {
+        const gpa = self.arena.child_allocator;
+        self.arena.deinit();
+        gpa.destroy(self.arena);
+    }
+};
+
+const UriParts = struct {
+    pubkey: [32]u8,
+    relays: std.ArrayList([]const u8),
+    secret: ?[]const u8,
+    perms: ?[]const u8,
+    name: ?[]const u8,
+    url: ?[]const u8,
+    image: ?[]const u8,
+};
+
+/// Splits `<scheme>://<pubkey-hex>?<query>` and percent-decodes the recognized
+/// query parameters into `a`. Repeated `relay` keys accumulate; unknown keys
+/// are ignored.
+fn parseUriParts(a: std.mem.Allocator, s: []const u8, scheme: []const u8) Error!UriParts {
+    if (!std.mem.startsWith(u8, s, scheme)) return Error.InvalidUri;
+    const rest = s[scheme.len..];
+    const q = std.mem.indexOfScalar(u8, rest, '?');
+    const pubkey_hex = if (q) |i| rest[0..i] else rest;
+    const query = if (q) |i| rest[i + 1 ..] else "";
+
+    var parts: UriParts = .{
+        .pubkey = hex.decodeFixed(32, pubkey_hex) catch return Error.InvalidUri,
+        .relays = .empty,
+        .secret = null,
+        .perms = null,
+        .name = null,
+        .url = null,
+        .image = null,
+    };
+
+    var it = std.mem.splitScalar(u8, query, '&');
+    while (it.next()) |pair| {
+        if (pair.len == 0) continue;
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        const key = pair[0..eq];
+        const raw = pair[eq + 1 ..];
+        if (std.mem.eql(u8, key, "relay")) {
+            try parts.relays.append(a, try percentDecode(a, raw));
+        } else if (std.mem.eql(u8, key, "secret")) {
+            parts.secret = try percentDecode(a, raw);
+        } else if (std.mem.eql(u8, key, "perms")) {
+            parts.perms = try percentDecode(a, raw);
+        } else if (std.mem.eql(u8, key, "name")) {
+            parts.name = try percentDecode(a, raw);
+        } else if (std.mem.eql(u8, key, "url")) {
+            parts.url = try percentDecode(a, raw);
+        } else if (std.mem.eql(u8, key, "image")) {
+            parts.image = try percentDecode(a, raw);
+        }
+    }
+    return parts;
+}
+
+/// Parses a `bunker://<remote-signer-pubkey>?relay=...&secret=...` token.
+pub fn parseBunkerUri(gpa: std.mem.Allocator, s: []const u8) Error!ParsedBunkerUri {
+    const arena = try gpa.create(std.heap.ArenaAllocator);
+    arena.* = std.heap.ArenaAllocator.init(gpa);
+    errdefer {
+        arena.deinit();
+        gpa.destroy(arena);
+    }
+    const a = arena.allocator();
+    var parts = try parseUriParts(a, s, "bunker://");
+    return .{ .arena = arena, .value = .{
+        .remote_signer_pubkey = parts.pubkey,
+        .relays = try parts.relays.toOwnedSlice(a),
+        .secret = parts.secret,
+    } };
+}
+
+/// Parses a `nostrconnect://<client-pubkey>?relay=...&secret=...&...` token.
+/// The `secret` query parameter is required.
+pub fn parseNostrConnectUri(gpa: std.mem.Allocator, s: []const u8) Error!ParsedNostrConnectUri {
+    const arena = try gpa.create(std.heap.ArenaAllocator);
+    arena.* = std.heap.ArenaAllocator.init(gpa);
+    errdefer {
+        arena.deinit();
+        gpa.destroy(arena);
+    }
+    const a = arena.allocator();
+    var parts = try parseUriParts(a, s, "nostrconnect://");
+    const secret = parts.secret orelse return Error.InvalidUri;
+    return .{ .arena = arena, .value = .{
+        .client_pubkey = parts.pubkey,
+        .relays = try parts.relays.toOwnedSlice(a),
+        .secret = secret,
+        .perms = parts.perms,
+        .name = parts.name,
+        .url = parts.url,
+        .image = parts.image,
+    } };
+}
+
+/// Builds a `bunker://` token (owned by the caller).
+pub fn buildBunkerUri(
+    gpa: std.mem.Allocator,
+    remote_signer_pubkey: [32]u8,
+    relays: []const []const u8,
+    secret: ?[]const u8,
+) std.mem.Allocator.Error![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    try out.appendSlice(gpa, "bunker://");
+    try hex.appendHex(&out, gpa, &remote_signer_pubkey);
+    var sep: u8 = '?';
+    for (relays) |r| try appendUriParam(&out, gpa, &sep, "relay", r);
+    if (secret) |sec| try appendUriParam(&out, gpa, &sep, "secret", sec);
+    return out.toOwnedSlice(gpa);
+}
+
+/// Builds a `nostrconnect://` token (owned by the caller).
+pub fn buildNostrConnectUri(
+    gpa: std.mem.Allocator,
+    client_pubkey: [32]u8,
+    opts: NostrConnectOptions,
+) std.mem.Allocator.Error![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    try out.appendSlice(gpa, "nostrconnect://");
+    try hex.appendHex(&out, gpa, &client_pubkey);
+    var sep: u8 = '?';
+    for (opts.relays) |r| try appendUriParam(&out, gpa, &sep, "relay", r);
+    try appendUriParam(&out, gpa, &sep, "secret", opts.secret);
+    if (opts.perms) |v| try appendUriParam(&out, gpa, &sep, "perms", v);
+    if (opts.name) |v| try appendUriParam(&out, gpa, &sep, "name", v);
+    if (opts.url) |v| try appendUriParam(&out, gpa, &sep, "url", v);
+    if (opts.image) |v| try appendUriParam(&out, gpa, &sep, "image", v);
+    return out.toOwnedSlice(gpa);
+}
+
+fn appendUriParam(
+    out: *std.ArrayList(u8),
+    gpa: std.mem.Allocator,
+    sep: *u8,
+    key: []const u8,
+    value: []const u8,
+) std.mem.Allocator.Error!void {
+    try out.append(gpa, sep.*);
+    sep.* = '&';
+    try out.appendSlice(gpa, key);
+    try out.append(gpa, '=');
+    try appendPercentEncoded(out, gpa, value);
+}
+
+/// Percent-decodes a query value into `a` (`%XX` -> byte, `+` -> space).
+fn percentDecode(a: std.mem.Allocator, s: []const u8) Error![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) {
+        switch (s[i]) {
+            '%' => {
+                if (i + 2 >= s.len) return Error.InvalidUri;
+                const hi = std.fmt.charToDigit(s[i + 1], 16) catch return Error.InvalidUri;
+                const lo = std.fmt.charToDigit(s[i + 2], 16) catch return Error.InvalidUri;
+                try out.append(a, (@as(u8, hi) << 4) | lo);
+                i += 2;
+            },
+            '+' => try out.append(a, ' '),
+            else => try out.append(a, s[i]),
+        }
+    }
+    return out.toOwnedSlice(a);
+}
+
+/// Percent-encodes `s` into `out` (RFC 3986 unreserved bytes pass through).
+fn appendPercentEncoded(out: *std.ArrayList(u8), gpa: std.mem.Allocator, s: []const u8) std.mem.Allocator.Error!void {
+    const upper = "0123456789ABCDEF";
+    for (s) |c| {
+        switch (c) {
+            'A'...'Z', 'a'...'z', '0'...'9', '-', '.', '_', '~' => try out.append(gpa, c),
+            else => {
+                try out.append(gpa, '%');
+                try out.append(gpa, upper[c >> 4]);
+                try out.append(gpa, upper[c & 0x0f]);
+            },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -658,4 +898,90 @@ test "NIP-46 connect validates an optional secret" {
         defer resp.deinit();
         try testing.expectEqualStrings("invalid secret", resp.value.err);
     }
+}
+
+test "NIP-46 parses the spec nostrconnect example" {
+    const gpa = testing.allocator;
+    const uri = "nostrconnect://83f3b2ae6aa368e8275397b9c26cf550101d63ebaab900d19dd4a4429f5ad8f5" ++
+        "?relay=wss%3A%2F%2Frelay1.example.com" ++
+        "&perms=nip44_encrypt%2Cnip44_decrypt%2Csign_event%3A13%2Csign_event%3A14%2Csign_event%3A1059" ++
+        "&name=My+Client&secret=0s8j2djs&relay=wss%3A%2F%2Frelay2.example2.com";
+    var parsed = try parseNostrConnectUri(gpa, uri);
+    defer parsed.deinit();
+
+    const want_pk = try hex.decodeFixed(32, "83f3b2ae6aa368e8275397b9c26cf550101d63ebaab900d19dd4a4429f5ad8f5");
+    try testing.expectEqualSlices(u8, &want_pk, &parsed.value.client_pubkey);
+    try testing.expectEqual(@as(usize, 2), parsed.value.relays.len);
+    try testing.expectEqualStrings("wss://relay1.example.com", parsed.value.relays[0]);
+    try testing.expectEqualStrings("wss://relay2.example2.com", parsed.value.relays[1]);
+    try testing.expectEqualStrings("0s8j2djs", parsed.value.secret);
+    try testing.expectEqualStrings("My Client", parsed.value.name.?);
+    try testing.expectEqualStrings(
+        "nip44_encrypt,nip44_decrypt,sign_event:13,sign_event:14,sign_event:1059",
+        parsed.value.perms.?,
+    );
+}
+
+test "NIP-46 parses a bunker uri with an unencoded relay" {
+    const gpa = testing.allocator;
+    const uri = "bunker://" ++ ("ab" ** 32) ++ "?relay=wss://relay.example.com&secret=xyz789";
+    var parsed = try parseBunkerUri(gpa, uri);
+    defer parsed.deinit();
+    try testing.expectEqualSlices(u8, &([_]u8{0xab} ** 32), &parsed.value.remote_signer_pubkey);
+    try testing.expectEqual(@as(usize, 1), parsed.value.relays.len);
+    try testing.expectEqualStrings("wss://relay.example.com", parsed.value.relays[0]);
+    try testing.expectEqualStrings("xyz789", parsed.value.secret.?);
+}
+
+test "NIP-46 bunker uri build/parse round trip" {
+    const gpa = testing.allocator;
+    const remote = [_]u8{0x2c} ** 32;
+    const relays = [_][]const u8{ "wss://relay.one", "wss://relay.two" };
+    const uri = try buildBunkerUri(gpa, remote, &relays, "s3cr3t");
+    defer gpa.free(uri);
+    // Relay URLs are percent-encoded in the output.
+    try testing.expect(std.mem.indexOf(u8, uri, "wss%3A%2F%2Frelay.one") != null);
+
+    var parsed = try parseBunkerUri(gpa, uri);
+    defer parsed.deinit();
+    try testing.expectEqualSlices(u8, &remote, &parsed.value.remote_signer_pubkey);
+    try testing.expectEqual(@as(usize, 2), parsed.value.relays.len);
+    try testing.expectEqualStrings("wss://relay.one", parsed.value.relays[0]);
+    try testing.expectEqualStrings("wss://relay.two", parsed.value.relays[1]);
+    try testing.expectEqualStrings("s3cr3t", parsed.value.secret.?);
+}
+
+test "NIP-46 nostrconnect uri build/parse round trip" {
+    const gpa = testing.allocator;
+    const client = [_]u8{0x5f} ** 32;
+    const relays = [_][]const u8{"wss://relay.example.com"};
+    const uri = try buildNostrConnectUri(gpa, client, .{
+        .relays = &relays,
+        .secret = "abc",
+        .perms = "sign_event:1,nip44_encrypt",
+        .name = "My Client",
+    });
+    defer gpa.free(uri);
+
+    var parsed = try parseNostrConnectUri(gpa, uri);
+    defer parsed.deinit();
+    try testing.expectEqualSlices(u8, &client, &parsed.value.client_pubkey);
+    try testing.expectEqualStrings("wss://relay.example.com", parsed.value.relays[0]);
+    try testing.expectEqualStrings("abc", parsed.value.secret);
+    try testing.expectEqualStrings("sign_event:1,nip44_encrypt", parsed.value.perms.?);
+    try testing.expectEqualStrings("My Client", parsed.value.name.?);
+    try testing.expectEqual(@as(?[]const u8, null), parsed.value.url);
+}
+
+test "NIP-46 uri parsing rejects bad input" {
+    const gpa = testing.allocator;
+    // Wrong scheme.
+    try testing.expectError(Error.InvalidUri, parseBunkerUri(gpa, "https://example.com"));
+    // Pubkey is not 64 hex chars.
+    try testing.expectError(Error.InvalidUri, parseBunkerUri(gpa, "bunker://deadbeef?relay=wss://r"));
+    // nostrconnect without the required secret.
+    try testing.expectError(
+        Error.InvalidUri,
+        parseNostrConnectUri(gpa, "nostrconnect://" ++ ("ab" ** 32) ++ "?relay=wss://r"),
+    );
 }
