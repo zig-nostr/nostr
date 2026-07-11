@@ -325,13 +325,118 @@ pub const Store = struct {
         try check(c.mdb_txn_begin(self.env, null, @intCast(c.MDB_RDONLY), &txn));
         defer c.mdb_txn_abort(txn);
 
+        // An explicit id list is already a bounded candidate set: fetch each
+        // id directly. Every other filter shape is served by a bounded
+        // newest-first merge over the relevant index, which stops at `limit`
+        // instead of materializing every matching event first.
+        if (filter.ids) |ids| {
+            var seen: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
+            defer seen.deinit(gpa);
+            var candidates: std.ArrayList([32]u8) = .empty;
+            defer candidates.deinit(gpa);
+            for (ids) |id| try addCandidate(gpa, &candidates, &seen, id);
+            return self.collectResults(txn, gpa, candidates.items, filter, filter.limit);
+        }
+
+        return self.queryMerged(txn, gpa, filter);
+    }
+
+    /// Answers `filter` by walking the most selective index newest-first and
+    /// stopping once `filter.limit` events match, instead of collecting every
+    /// candidate up front. One reverse cursor is opened per index prefix (per
+    /// author / kind / tag value, or the whole created_at index when the
+    /// filter has no selective constraint), and a k-way merge on the keys'
+    /// embedded `[time][id]` suffix yields candidates globally newest-first —
+    /// so the work is proportional to the events *returned* (plus any
+    /// rejected along the way), not to the total matching history.
+    fn queryMerged(self: *Store, txn: ?*c.MDB_txn, gpa: std.mem.Allocator, filter: Filter) Error!QueryResult {
+        var scratch = std.heap.ArenaAllocator.init(gpa);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+
+        // The index time-keys are order-preserving, so since/until become key
+        // bounds: streams start at `until` and stop below `since`, both
+        // inclusive, matching `Filter.matches`.
+        const until_key = orderKey(filter.until orelse std.math.maxInt(i64));
+        const since_key = orderKey(filter.since orelse std.math.minInt(i64));
+
+        var streams: std.ArrayList(RevStream) = .empty;
+        defer for (streams.items) |*s| {
+            if (s.cursor != null) c.mdb_cursor_close(s.cursor);
+        };
+
+        if (filter.authors) |authors| {
+            for (authors) |a| {
+                const s = try streams.addOne(sa);
+                try revStreamInit(s, txn, self.idx_author_dbi, sa, &a, until_key, since_key);
+            }
+        } else if (filter.kinds) |kinds| {
+            for (kinds) |kd| {
+                var kb: [2]u8 = undefined;
+                std.mem.writeInt(u16, &kb, kd, .big);
+                const s = try streams.addOne(sa);
+                try revStreamInit(s, txn, self.idx_kind_dbi, sa, &kb, until_key, since_key);
+            }
+        } else if (filter.tags != null and filter.tags.?.len > 0) {
+            const tf = filter.tags.?[0];
+            for (tf.values) |value| {
+                const prefix = try sa.alloc(u8, 1 + value.len);
+                prefix[0] = tf.letter;
+                @memcpy(prefix[1..], value);
+                const s = try streams.addOne(sa);
+                try revStreamInit(s, txn, self.idx_tag_dbi, sa, prefix, until_key, since_key);
+            }
+        } else {
+            const s = try streams.addOne(sa);
+            try revStreamInit(s, txn, self.idx_created_dbi, sa, &.{}, until_key, since_key);
+        }
+
+        const arena = try gpa.create(std.heap.ArenaAllocator);
+        arena.* = std.heap.ArenaAllocator.init(gpa);
+        errdefer {
+            arena.deinit();
+            gpa.destroy(arena);
+        }
+        const aa = arena.allocator();
+
+        var matched: std.ArrayList(Event) = .empty;
+        defer matched.deinit(gpa);
         var seen: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
         defer seen.deinit(gpa);
-        var candidates: std.ArrayList([32]u8) = .empty;
-        defer candidates.deinit(gpa);
-        try self.collectCandidates(txn, gpa, filter, &candidates, &seen);
 
-        return self.collectResults(txn, gpa, candidates.items, filter, filter.limit);
+        const limit: usize = if (filter.limit) |l| l else std.math.maxInt(usize);
+        while (matched.items.len < limit) {
+            // Pop the globally newest candidate: largest (time, id) suffix
+            // across the live streams. Stream counts are small (one per
+            // author/kind/tag value), so a linear pick beats heap overhead.
+            var best: ?usize = null;
+            for (streams.items, 0..) |s, i| {
+                if (!s.live) continue;
+                if (best == null or revStreamNewer(s, streams.items[best.?])) best = i;
+            }
+            const bi = best orelse break;
+            const id = streams.items[bi].id;
+            try revStreamAdvance(&streams.items[bi], since_key);
+
+            // The same event can surface from two streams (e.g. two queried
+            // tag values on one event); yield it once.
+            const gop = try seen.getOrPut(gpa, id);
+            if (gop.found_existing) continue;
+
+            var k = val(&id);
+            var v: c.MDB_val = undefined;
+            const rc = c.mdb_get(txn, self.events_dbi, &k, &v);
+            if (rc == c.MDB_NOTFOUND) continue;
+            try check(rc);
+            const ev = try decodeEvent(aa, valBytes(v));
+            if (!filter.matches(ev)) continue;
+            try matched.append(gpa, ev);
+        }
+
+        // The merge yields (created_at desc, id desc) — the same order the
+        // sort-based path produced — so results are returned as popped.
+        const events = try aa.dupe(Event, matched.items);
+        return QueryResult{ .arena = arena, .events = events };
     }
 
     /// Returns the direct-message conversation between pubkeys `a` and `b`
@@ -486,50 +591,6 @@ pub const Store = struct {
 
         try check(c.mdb_txn_commit(txn));
         return evicted;
-    }
-
-    /// Populates `candidates` (deduplicated via `seen`) with event ids to
-    /// evaluate, chosen from the most selective index the filter allows.
-    fn collectCandidates(
-        self: *Store,
-        txn: ?*c.MDB_txn,
-        gpa: std.mem.Allocator,
-        filter: Filter,
-        candidates: *std.ArrayList([32]u8),
-        seen: *std.AutoHashMapUnmanaged([32]u8, void),
-    ) Error!void {
-        if (filter.ids) |ids| {
-            for (ids) |id| try addCandidate(gpa, candidates, seen, id);
-            return;
-        }
-        if (filter.authors) |authors| {
-            for (authors) |a| try scanPrefix(txn, self.idx_author_dbi, gpa, &a, candidates, seen);
-            return;
-        }
-        if (filter.kinds) |kinds| {
-            for (kinds) |kd| {
-                var kb: [2]u8 = undefined;
-                std.mem.writeInt(u16, &kb, kd, .big);
-                try scanPrefix(txn, self.idx_kind_dbi, gpa, &kb, candidates, seen);
-            }
-            return;
-        }
-        if (filter.tags) |tag_filters| {
-            if (tag_filters.len > 0) {
-                const tf = tag_filters[0];
-                var prefix: std.ArrayList(u8) = .empty;
-                defer prefix.deinit(gpa);
-                for (tf.values) |value| {
-                    prefix.clearRetainingCapacity();
-                    try prefix.append(gpa, tf.letter);
-                    try prefix.appendSlice(gpa, value);
-                    try scanPrefix(txn, self.idx_tag_dbi, gpa, prefix.items, candidates, seen);
-                }
-                return;
-            }
-        }
-        // No selective constraint: walk every event by the created_at index.
-        try scanPrefix(txn, self.idx_created_dbi, gpa, &.{}, candidates, seen);
     }
 
     // -- Ingestion ----------------------------------------------------------
@@ -901,6 +962,108 @@ fn scanPrefix(
         try addCandidate(gpa, candidates, seen, key[key.len - 32 ..][0..32].*);
     }
     if (rc != c.MDB_SUCCESS and rc != c.MDB_NOTFOUND) return error.Lmdb;
+}
+
+/// One reverse (newest-first) walk over the keys of a single index prefix.
+/// While `live`, `tk`/`id` hold the `[time][id]` suffix of the entry the
+/// cursor is parked on. The cursor belongs to the caller's transaction and
+/// must be closed by the caller.
+const RevStream = struct {
+    cursor: ?*c.MDB_cursor = null,
+    prefix: []const u8 = &.{},
+    live: bool = false,
+    tk: [8]u8 = undefined,
+    id: [32]u8 = undefined,
+};
+
+/// Opens `s` over `dbi` and parks it on the newest in-range entry: the
+/// largest key with `prefix` whose time-key is <= `until_key` (and >=
+/// `since_key`). `prefix` is duplicated into `aa`, which must outlive the
+/// stream.
+fn revStreamInit(
+    s: *RevStream,
+    txn: ?*c.MDB_txn,
+    dbi: c.MDB_dbi,
+    aa: std.mem.Allocator,
+    prefix: []const u8,
+    until_key: [8]u8,
+    since_key: [8]u8,
+) Error!void {
+    s.* = .{ .prefix = try aa.dupe(u8, prefix) };
+    try check(c.mdb_cursor_open(txn, dbi, &s.cursor));
+
+    // Seek target: the largest possible in-range key. MDB_SET_RANGE parks on
+    // the first key >= target, so stepping back once (unless the target
+    // itself exists) lands on the newest key <= target.
+    const seek = try aa.alloc(u8, prefix.len + 40);
+    @memcpy(seek[0..prefix.len], prefix);
+    @memcpy(seek[prefix.len..][0..8], &until_key);
+    @memset(seek[prefix.len + 8 ..], 0xFF);
+
+    var k = val(seek);
+    var v: c.MDB_val = undefined;
+    var rc = c.mdb_cursor_get(s.cursor, &k, &v, c.MDB_SET_RANGE);
+    if (rc == c.MDB_NOTFOUND) {
+        rc = c.mdb_cursor_get(s.cursor, &k, &v, c.MDB_LAST);
+        if (rc == c.MDB_NOTFOUND) return; // empty index: stream stays dead
+        try check(rc);
+    } else {
+        try check(rc);
+        if (!std.mem.eql(u8, valBytes(k), seek)) {
+            rc = c.mdb_cursor_get(s.cursor, &k, &v, c.MDB_PREV);
+            if (rc == c.MDB_NOTFOUND) return;
+            try check(rc);
+        }
+    }
+    try revStreamSettle(s, since_key);
+}
+
+/// Parks `s` on the cursor's current entry if it is in range, else walks
+/// backwards to the next in-range entry. Keys that share the prefix but have
+/// a different length belong to longer tag values interleaved in the same
+/// region and are skipped; a same-length key older than `since_key` ends the
+/// stream, since everything before it is older still.
+fn revStreamSettle(s: *RevStream, since_key: [8]u8) Error!void {
+    var k: c.MDB_val = undefined;
+    var v: c.MDB_val = undefined;
+    var rc = c.mdb_cursor_get(s.cursor, &k, &v, c.MDB_GET_CURRENT);
+    while (rc == c.MDB_SUCCESS) : (rc = c.mdb_cursor_get(s.cursor, &k, &v, c.MDB_PREV)) {
+        const key = valBytes(k);
+        if (!std.mem.startsWith(u8, key, s.prefix)) break;
+        if (key.len != s.prefix.len + 40) continue;
+        const tk: [8]u8 = key[s.prefix.len..][0..8].*;
+        if (std.mem.order(u8, &tk, &since_key) == .lt) break;
+        s.tk = tk;
+        s.id = key[s.prefix.len + 8 ..][0..32].*;
+        s.live = true;
+        return;
+    }
+    if (rc != c.MDB_SUCCESS and rc != c.MDB_NOTFOUND) return error.Lmdb;
+    s.live = false;
+}
+
+/// Steps `s` back one entry and re-parks it on the next in-range entry, or
+/// marks it dead when the range is exhausted.
+fn revStreamAdvance(s: *RevStream, since_key: [8]u8) Error!void {
+    var k: c.MDB_val = undefined;
+    var v: c.MDB_val = undefined;
+    const rc = c.mdb_cursor_get(s.cursor, &k, &v, c.MDB_PREV);
+    if (rc == c.MDB_NOTFOUND) {
+        s.live = false;
+        return;
+    }
+    try check(rc);
+    try revStreamSettle(s, since_key);
+}
+
+/// True if live stream `a` is parked on a newer entry than live stream `b`:
+/// larger (time-key, id), matching `lessByTimeDesc`'s ordering.
+fn revStreamNewer(a: RevStream, b: RevStream) bool {
+    return switch (std.mem.order(u8, &a.tk, &b.tk)) {
+        .gt => true,
+        .lt => false,
+        .eq => std.mem.order(u8, &a.id, &b.id) == .gt,
+    };
 }
 
 /// Order-preserving big-endian encoding of an `i64` timestamp: flipping the
@@ -1363,6 +1526,94 @@ test "store: query drives off indexes and returns newest-first" {
         var r = try store.query(gpa, .{ .tags = &[_]filter_mod.TagFilter{.{ .letter = 'p', .values = &vals }} });
         defer r.deinit();
         try std.testing.expectEqual(@as(usize, 0), r.events.len);
+    }
+}
+
+test "store: bounded query merges streams newest-first and stops at limit" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var store = try openTempStore(&tmp, "bounded.mdb", &buf);
+    defer store.deinit();
+
+    const gpa = std.testing.allocator;
+    // Two authors with interleaved timestamps and a created_at tie (200)
+    // across streams, so the merge must interleave and tie-break by id.
+    _ = try store.putEvent(gpa, qEvent(1, author_a, 1, 100, &.{}));
+    _ = try store.putEvent(gpa, qEvent(2, author_a, 1, 200, &.{}));
+    _ = try store.putEvent(gpa, qEvent(5, author_b, 1, 200, &.{}));
+    _ = try store.putEvent(gpa, qEvent(6, author_b, 1, 300, &.{}));
+
+    var seeds: [8]u8 = undefined;
+    const both = [_][32]u8{ author_a, author_b };
+
+    // Global newest-first across streams; the 200/200 tie prefers the
+    // larger id (5 over 2), matching the unbounded path's ordering.
+    {
+        var r = try store.query(gpa, .{ .authors = &both });
+        defer r.deinit();
+        try std.testing.expectEqualSlices(u8, &[_]u8{ 6, 5, 2, 1 }, resultSeeds(r, &seeds));
+    }
+    // The limit cuts mid-tie: only the tie winner is returned.
+    {
+        var r = try store.query(gpa, .{ .authors = &both, .limit = 2 });
+        defer r.deinit();
+        try std.testing.expectEqualSlices(u8, &[_]u8{ 6, 5 }, resultSeeds(r, &seeds));
+    }
+    // A limit larger than the match count returns everything.
+    {
+        var r = try store.query(gpa, .{ .authors = &both, .limit = 10 });
+        defer r.deinit();
+        try std.testing.expectEqualSlices(u8, &[_]u8{ 6, 5, 2, 1 }, resultSeeds(r, &seeds));
+    }
+    // `until` bounds where the reverse walk starts; both endpoints inclusive.
+    {
+        var r = try store.query(gpa, .{ .authors = &both, .since = 100, .until = 200 });
+        defer r.deinit();
+        try std.testing.expectEqualSlices(u8, &[_]u8{ 5, 2, 1 }, resultSeeds(r, &seeds));
+    }
+}
+
+test "store: bounded tag query skips longer values interleaved in the same key region" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var store = try openTempStore(&tmp, "tagscan.mdb", &buf);
+    defer store.deinit();
+
+    const gpa = std.testing.allocator;
+    // "ca" is a strict prefix of "cafe", so both values' index keys share a
+    // key region and the reverse walk for one must step over the other's
+    // entries (their keys have a different length) without ending the scan.
+    const tag_ca = [_]Tag{&[_][]const u8{ "p", "ca" }};
+    const tag_cafe = [_]Tag{&[_][]const u8{ "p", "cafe" }};
+    _ = try store.putEvent(gpa, qEvent(1, author_a, 1, 100, &tag_ca));
+    _ = try store.putEvent(gpa, qEvent(2, author_a, 1, 200, &tag_cafe));
+    _ = try store.putEvent(gpa, qEvent(3, author_b, 1, 300, &tag_ca));
+
+    var seeds: [8]u8 = undefined;
+
+    // Querying "ca" walks past the interleaved "cafe" key to reach both
+    // "ca" events, newest-first.
+    {
+        const vals = [_][]const u8{"ca"};
+        var r = try store.query(gpa, .{ .tags = &[_]filter_mod.TagFilter{.{ .letter = 'p', .values = &vals }} });
+        defer r.deinit();
+        try std.testing.expectEqualSlices(u8, &[_]u8{ 3, 1 }, resultSeeds(r, &seeds));
+    }
+    // Querying "cafe" matches only the exact value.
+    {
+        const vals = [_][]const u8{"cafe"};
+        var r = try store.query(gpa, .{ .tags = &[_]filter_mod.TagFilter{.{ .letter = 'p', .values = &vals }} });
+        defer r.deinit();
+        try std.testing.expectEqualSlices(u8, &[_]u8{2}, resultSeeds(r, &seeds));
+    }
+    // Both values in one tag filter: each event once, newest-first.
+    {
+        const vals = [_][]const u8{ "ca", "cafe" };
+        var r = try store.query(gpa, .{ .tags = &[_]filter_mod.TagFilter{.{ .letter = 'p', .values = &vals }} });
+        defer r.deinit();
+        try std.testing.expectEqualSlices(u8, &[_]u8{ 3, 2, 1 }, resultSeeds(r, &seeds));
     }
 }
 
