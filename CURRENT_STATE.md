@@ -4,9 +4,10 @@ Updated inside every PR that changes it. Never updated locally after merge.
 
 ## Version
 
-`v0.3.0` — Milestones A2 (library core), A3 (transport), and A4 (local-first
+`v0.3.1` — Milestones A2 (library core), A3 (transport), and A4 (local-first
 event store) complete; A5's NIP-44 v2 encryption and NIP-46 remote-signing
-protocol layer have landed (the native signer app is in progress).
+protocol layer have landed (the native signer app is in progress), plus a
+macOS hostname-resolution fix for the live relay dialer (#41).
 
 ## Active milestone
 
@@ -73,6 +74,8 @@ library-side cryptographic groundwork is landing first.)
   against the spec's example token). Relay I/O is left to the app.
 - **Tagged `v0.3.0`** — NIP-44 v2 encryption and the NIP-46 remote-signing
   protocol layer; the native signer app continues in `zig-nostr/signer`.
+- **Tagged `v0.3.1`** — the live relay dialer resolves hostnames via the
+  system resolver (`getaddrinfo`), fixing a macOS DNS hang (#41).
 
 ## What's in progress
 
