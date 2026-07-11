@@ -4,11 +4,12 @@ Updated inside every PR that changes it. Never updated locally after merge.
 
 ## Version
 
-`v0.3.2` — Milestones A2 (library core), A3 (transport), and A4 (local-first
+`v0.3.3` — Milestones A2 (library core), A3 (transport), and A4 (local-first
 event store) complete; A5's NIP-44 v2 encryption and NIP-46 remote-signing
-protocol layer have landed (the native signer app is in progress), plus two
-fixes to the live relay dialer: macOS hostname resolution (#41) and a websocket
-handshake deadlock that stopped a signer from receiving requests (#44).
+protocol layer have landed (the native signer app is in progress), plus a run
+of fixes to the live relay dialer: macOS hostname resolution (#41), a websocket
+handshake deadlock that stopped a signer from receiving requests (#44), and a
+follow-up so the same read fix doesn't fail the TLS (`wss://`) handshake (#46).
 
 ## Active milestone
 
@@ -80,6 +81,9 @@ library-side cryptographic groundwork is landing first.)
 - **Tagged `v0.3.2`** — fixed a websocket handshake deadlock in the live relay
   dialer (`IoStream.read` filled its whole buffer instead of returning a single
   read), so a running signer now actually receives requests over a relay (#44).
+- **Tagged `v0.3.3`** — follow-up: `IoStream.read` retries past a zero-length
+  read (a TLS record with no application data) instead of reporting EOF, so the
+  read fix no longer fails the `wss://` handshake (#46).
 
 ## What's in progress
 
