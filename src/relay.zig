@@ -261,6 +261,7 @@ pub fn Connection(comptime Stream: type) type {
 
 const net = std.Io.net;
 const tls = std.crypto.tls;
+const posix = std.posix;
 
 /// Adapts a pair of std `Io.Reader`/`Io.Writer` to the two-method stream
 /// interface `Connection` expects. This is the exact bridge the live dialer
@@ -352,6 +353,50 @@ pub const Relay = struct {
     }
 };
 
+/// Resolves `host` with the system resolver (libc `getaddrinfo`) and connects a
+/// TCP stream to `port`, trying each returned address until one connects.
+///
+/// We deliberately bypass std's built-in DNS resolver (`net.HostName.connect`):
+/// it reads nameservers from `/etc/resolv.conf`, but on macOS that file is empty
+/// (name resolution is handled by the system configuration framework, not
+/// resolv.conf), so std falls back to querying `127.0.0.1:53` — where nothing is
+/// listening — and a hostname lookup hangs indefinitely. `getaddrinfo` uses the
+/// OS resolver and works on both macOS and Linux. It needs libc, which the
+/// library already links for libsecp256k1 and LMDB. A numeric host (an IP
+/// literal) resolves through the same path.
+fn resolveAndConnect(gpa: std.mem.Allocator, io: std.Io, host: []const u8, port: u16) !net.Stream {
+    const host_z = try gpa.dupeZ(u8, host);
+    defer gpa.free(host_z);
+
+    var res: ?*std.c.addrinfo = null;
+    if (@intFromEnum(std.c.getaddrinfo(host_z.ptr, null, null, &res)) != 0)
+        return error.NameResolutionFailed;
+    const list = res orelse return error.NameResolutionFailed;
+    defer std.c.freeaddrinfo(list);
+
+    var last_err: anyerror = error.NameResolutionFailed;
+    var node: ?*std.c.addrinfo = list;
+    while (node) |ai| : (node = ai.next) {
+        const raw = ai.addr orelse continue;
+        const address: net.IpAddress = switch (@as(posix.sa_family_t, @intCast(ai.family))) {
+            posix.AF.INET => .{ .ip4 = .{
+                .port = port,
+                .bytes = @bitCast(@as(*const posix.sockaddr.in, @ptrCast(@alignCast(raw))).addr),
+            } },
+            posix.AF.INET6 => .{ .ip6 = .{
+                .port = port,
+                .bytes = @as(*const posix.sockaddr.in6, @ptrCast(@alignCast(raw))).addr,
+            } },
+            else => continue,
+        };
+        return address.connect(io, .{ .mode = .stream }) catch |err| {
+            last_err = err;
+            continue;
+        };
+    }
+    return last_err;
+}
+
 /// Connects to the relay at `url` (`ws://` or `wss://`), performing the TCP
 /// connect, the TLS handshake for `wss://` (verifying the server certificate
 /// against the system CA bundle), and the websocket opening handshake. Returns
@@ -366,8 +411,7 @@ pub fn dial(gpa: std.mem.Allocator, io: std.Io, url: []const u8) !*Relay {
     errdefer gpa.destroy(transport);
     transport.tls_state = null;
 
-    const host = try net.HostName.init(parsed.host);
-    transport.tcp = try host.connect(io, parsed.port, .{ .mode = .stream });
+    transport.tcp = try resolveAndConnect(gpa, io, parsed.host, parsed.port);
     errdefer transport.tcp.close(io);
 
     transport.tcp_read_buffer = try gpa.alloc(u8, 64 * 1024);
@@ -769,6 +813,7 @@ test "live dialer is semantically analyzed" {
     // the `Relay` methods) forces full type-checking so the live TCP/TLS path
     // is kept compiling by CI even though it is exercised only by hand.
     _ = &dial;
+    _ = &resolveAndConnect;
     _ = &Relay.publish;
     _ = &Relay.subscribe;
     _ = &Relay.unsubscribe;
