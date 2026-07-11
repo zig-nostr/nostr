@@ -12,7 +12,7 @@ transport with the outbox model, NIP-44/NIP-17 encrypted messaging, and a
 zero-copy local event store modeled on
 [nostrdb](https://github.com/damus-io/nostrdb).
 
-**Status: pre-alpha, `v0.2.0`.** The library core, relay transport, and the
+**Status: pre-alpha, `v0.2.1`.** The library core, relay transport, and the
 local-first event store have shipped:
 
 - **Milestone A2 — library core:** secp256k1 keys and BIP-340 Schnorr
@@ -37,7 +37,7 @@ milestone roadmap.
 ## Install
 
 ```sh
-zig fetch --save https://github.com/zig-nostr/nostr/archive/refs/tags/v0.2.0.tar.gz
+zig fetch --save https://github.com/zig-nostr/nostr/archive/refs/tags/v0.2.1.tar.gz
 ```
 
 Then in `build.zig`:

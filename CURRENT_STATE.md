@@ -4,8 +4,8 @@ Updated inside every PR that changes it. Never updated locally after merge.
 
 ## Version
 
-`v0.2.0` — Milestones A2 (library core), A3 (transport), and A4 (local-first
-event store) complete.
+`v0.2.1` — Milestones A2 (library core), A3 (transport), and A4 (local-first
+event store) complete, plus the bounded-query performance patch (#33).
 
 ## Active milestone
 
@@ -54,6 +54,11 @@ event store) complete.
   NIP-09 deletion, a direct-message conversation index, local-first
   reconciliation, a size-cap cache, and a benchmark (`src/bench.zig`).
 - **Tagged `v0.2.0`** — Milestones A3 and A4 complete, issues #3 and #4 closed.
+- Bounded query planning (#33): `query` walks the indexes newest-first via
+  reverse cursors and a k-way merge, stopping at `limit` — a 500-note
+  20-author home feed at 100k stored events dropped from ~26 ms to ~0.28 ms;
+  the multi-author feed shape is covered in `src/bench.zig`.
+- **Tagged `v0.2.1`** — bounded-query performance patch.
 
 ## What's in progress
 
