@@ -160,7 +160,42 @@ pub const Signer = struct {
         std.debug.assert(out_len == out.len);
         return out;
     }
+
+    /// NIP-44 ECDH. Returns the 32-byte x-coordinate of the shared point
+    /// (secret_key * peer_pubkey), where `peer_pubkey` is a Nostr x-only key
+    /// lifted to its even-Y curve point. NIP-44 v2 derives its conversation
+    /// key from this raw x-coordinate, not libsecp256k1's default
+    /// SHA256-hashed ECDH output — hence the custom hash callback.
+    pub fn sharedSecretX(self: Signer, secret_key: SecretKey, peer_pubkey: PublicKey) Error![32]u8 {
+        // Lift the 32-byte x-only key to a compressed point with even Y.
+        var compressed: [33]u8 = undefined;
+        compressed[0] = 0x02;
+        @memcpy(compressed[1..], &peer_pubkey);
+        var pubkey: c.secp256k1_pubkey = undefined;
+        if (c.secp256k1_ec_pubkey_parse(self.ctx, &pubkey, &compressed, compressed.len) != 1) {
+            return Error.InvalidPublicKey;
+        }
+        var out: [32]u8 = undefined;
+        if (c.secp256k1_ecdh(self.ctx, &out, &pubkey, &secret_key, &ecdhCopyX, null) != 1) {
+            return Error.InvalidSecretKey;
+        }
+        return out;
+    }
 };
+
+/// libsecp256k1 ECDH hash function that copies the shared point's x-coordinate
+/// out verbatim. NIP-44 v2 uses this raw x value directly as the ECDH output.
+fn ecdhCopyX(
+    output: [*c]u8,
+    x32: [*c]const u8,
+    y32: [*c]const u8,
+    data: ?*anyopaque,
+) callconv(.c) c_int {
+    _ = y32;
+    _ = data;
+    @memcpy(output[0..32], x32[0..32]);
+    return 1;
+}
 
 // ---------------------------------------------------------------------------
 // Tests

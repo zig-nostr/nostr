@@ -61,8 +61,10 @@ const Secp256k1 = struct {
 };
 
 /// Compiles bitcoin-core/libsecp256k1 as a static library with the
-/// schnorrsig + extrakeys modules enabled (schnorrsig depends on extrakeys),
-/// and produces a translate-c module exposing its C API to Zig.
+/// schnorrsig + extrakeys + ecdh modules enabled (schnorrsig depends on
+/// extrakeys; ecdh backs NIP-44), and produces a translate-c module exposing
+/// its C API to Zig. The translate-c root is a small umbrella header
+/// (src/secp256k1_bindings.h) so keys.zig and nip44.zig share one binding.
 fn buildSecp256k1(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
@@ -93,7 +95,7 @@ fn buildSecp256k1(
     lib.installHeadersDirectory(upstream.path("include"), "", .{});
 
     const translate_c = b.addTranslateC(.{
-        .root_source_file = upstream.path("include/secp256k1_schnorrsig.h"),
+        .root_source_file = b.path("src/secp256k1_bindings.h"),
         .target = target,
         .optimize = optimize,
     });
@@ -108,6 +110,7 @@ fn buildSecp256k1(
 const secp_flags = &.{
     "-DENABLE_MODULE_SCHNORRSIG=1",
     "-DENABLE_MODULE_EXTRAKEYS=1",
+    "-DENABLE_MODULE_ECDH=1",
 };
 
 const Lmdb = struct {
