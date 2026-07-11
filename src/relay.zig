@@ -277,7 +277,18 @@ pub const IoStream = struct {
     transport_writer: ?*std.Io.Writer = null,
 
     pub fn read(self: IoStream, buffer: []u8) std.Io.Reader.ShortError!usize {
-        return self.reader.readSliceShort(buffer);
+        // One read of whatever is available. NOT `readSliceShort`, which loops
+        // until it has filled the *whole* buffer (or hit EOF) — a deadlock
+        // against a relay that sends a short message and then waits for us, e.g.
+        // the 101 handshake response: it fills 129 of a 4096-byte buffer and
+        // blocks forever waiting for bytes the relay will never send until we
+        // reply. `readVec` returns after a single read (a short read, including
+        // zero, is not end-of-stream), exactly like a POSIX `read`.
+        var data: [1][]u8 = .{buffer};
+        return self.reader.readVec(&data) catch |err| switch (err) {
+            error.EndOfStream => 0,
+            error.ReadFailed => error.ReadFailed,
+        };
     }
 
     pub fn writeAll(self: IoStream, bytes: []const u8) std.Io.Writer.Error!void {
@@ -793,7 +804,7 @@ test "IoStream drives a Connection over real std Io.Reader/Writer" {
     var conn = LiveConnection.init(allocator, std.testing.io, .{ .reader = &reader, .writer = &out.writer });
     defer conn.deinit();
 
-    // Reading a relay message flows through IoStream.read -> readSliceShort.
+    // Reading a relay message flows through IoStream.read -> a single readVec.
     var m = (try conn.receive()).?;
     defer m.deinit();
     try std.testing.expectEqualStrings("live", m.value.notice.message);
@@ -805,6 +816,50 @@ test "IoStream drives a Connection over real std Io.Reader/Writer" {
     defer written.deinit(allocator);
     const frame = (try websocket.decodeFrame(written.items)).?;
     try std.testing.expectEqualStrings("[\"CLOSE\",\"s1\"]", frame.payload);
+}
+
+test "IoStream.read returns a single short read and never blocks to fill the buffer" {
+    // Regression (relay handshake deadlock): IoStream.read must return whatever
+    // ONE read yields, POSIX-style. It once used `readSliceShort`, which loops
+    // until the *whole* buffer is full — so the WS handshake, reading a short
+    // 101 response into a 4 KiB buffer, blocked forever waiting for bytes the
+    // relay never sends until we reply, and the subscription REQ was never sent.
+    //
+    // A reader that hands out 5 bytes per `readVec` must therefore yield exactly
+    // 5 from a 4 KiB read; the buggy fill-the-buffer version would loop and
+    // return the whole input. (A live end-to-end check lives outside CI, since
+    // it needs a real relay — this pins the read primitive that broke.)
+    const Chunked = struct {
+        data: []const u8,
+        pos: usize = 0,
+        reader: std.Io.Reader,
+
+        fn readVec(r: *std.Io.Reader, dest: [][]u8) std.Io.Reader.Error!usize {
+            const self: *@This() = @fieldParentPtr("reader", r);
+            if (self.pos >= self.data.len) return error.EndOfStream;
+            const dst = dest[0];
+            const n = @min(@min(@as(usize, 5), dst.len), self.data.len - self.pos);
+            @memcpy(dst[0..n], self.data[self.pos..][0..n]);
+            self.pos += n;
+            return n;
+        }
+        fn noStream(_: *std.Io.Reader, _: *std.Io.Writer, _: std.Io.Limit) std.Io.Reader.StreamError!usize {
+            return error.ReadFailed; // unused: IoStream.read only calls readVec
+        }
+    };
+
+    const vtable: std.Io.Reader.VTable = .{ .stream = Chunked.noStream, .readVec = Chunked.readVec };
+    var empty: [0]u8 = .{};
+    var cr = Chunked{ .data = "hello world, well over one five-byte chunk", .reader = .{ .vtable = &vtable, .buffer = &empty, .seek = 0, .end = 0 } };
+
+    var write_scratch: [1]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&write_scratch);
+    const stream: IoStream = .{ .reader = &cr.reader, .writer = &writer };
+
+    var buffer: [4096]u8 = undefined;
+    const n = try stream.read(&buffer);
+    try std.testing.expectEqual(@as(usize, 5), n);
+    try std.testing.expectEqualStrings("hello", buffer[0..n]);
 }
 
 test "live dialer is semantically analyzed" {
