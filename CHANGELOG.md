@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-07-12
+
 ### Fixed
 
 - The live relay connection no longer deadlocks the websocket opening
