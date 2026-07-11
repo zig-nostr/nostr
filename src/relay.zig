@@ -277,18 +277,26 @@ pub const IoStream = struct {
     transport_writer: ?*std.Io.Writer = null,
 
     pub fn read(self: IoStream, buffer: []u8) std.Io.Reader.ShortError!usize {
-        // One read of whatever is available. NOT `readSliceShort`, which loops
-        // until it has filled the *whole* buffer (or hit EOF) — a deadlock
-        // against a relay that sends a short message and then waits for us, e.g.
-        // the 101 handshake response: it fills 129 of a 4096-byte buffer and
-        // blocks forever waiting for bytes the relay will never send until we
-        // reply. `readVec` returns after a single read (a short read, including
-        // zero, is not end-of-stream), exactly like a POSIX `read`.
+        // Return whatever a single read makes available, like a POSIX `read` —
+        // NOT `readSliceShort`, which loops until the *whole* buffer is full (or
+        // EOF). Filling deadlocks against a relay that sends a short message and
+        // then waits for us: the 101 handshake response is ~129 bytes, so
+        // `readSliceShort` on a 4096-byte buffer blocks forever waiting for the
+        // rest, and the subscription is never sent.
+        //
+        // `readVec` reads once, but a short read of *zero* is "no bytes yet, not
+        // end of stream" (e.g. a TLS record that carried no application data) —
+        // reporting that as EOF fails the handshake read. So loop past a bare
+        // zero (the underlying read blocks between records) and return on the
+        // first real bytes or a genuine end of stream.
         var data: [1][]u8 = .{buffer};
-        return self.reader.readVec(&data) catch |err| switch (err) {
-            error.EndOfStream => 0,
-            error.ReadFailed => error.ReadFailed,
-        };
+        while (true) {
+            const n = self.reader.readVec(&data) catch |err| switch (err) {
+                error.EndOfStream => return 0,
+                error.ReadFailed => return error.ReadFailed,
+            };
+            if (n != 0) return n;
+        }
     }
 
     pub fn writeAll(self: IoStream, bytes: []const u8) std.Io.Writer.Error!void {
@@ -860,6 +868,44 @@ test "IoStream.read returns a single short read and never blocks to fill the buf
     const n = try stream.read(&buffer);
     try std.testing.expectEqual(@as(usize, 5), n);
     try std.testing.expectEqualStrings("hello", buffer[0..n]);
+}
+
+test "IoStream.read retries past a zero-length read instead of reporting EOF" {
+    // A `readVec` of zero without EndOfStream means "no bytes yet" — e.g. a TLS
+    // record carrying no application data. `read` must retry, not report EOF,
+    // or the WS handshake read fails against a real (TLS) relay. This is the
+    // case a naive single-`readVec` got wrong.
+    const ZeroThenData = struct {
+        calls: usize = 0,
+        reader: std.Io.Reader,
+
+        fn readVec(r: *std.Io.Reader, dest: [][]u8) std.Io.Reader.Error!usize {
+            const self: *@This() = @fieldParentPtr("reader", r);
+            self.calls += 1;
+            if (self.calls == 1) return 0; // a zero-length read that is NOT EOF
+            const msg = "data";
+            const n = @min(msg.len, dest[0].len);
+            @memcpy(dest[0][0..n], msg[0..n]);
+            return n;
+        }
+        fn noStream(_: *std.Io.Reader, _: *std.Io.Writer, _: std.Io.Limit) std.Io.Reader.StreamError!usize {
+            return error.ReadFailed;
+        }
+    };
+
+    const vtable: std.Io.Reader.VTable = .{ .stream = ZeroThenData.noStream, .readVec = ZeroThenData.readVec };
+    var empty: [0]u8 = .{};
+    var zd = ZeroThenData{ .reader = .{ .vtable = &vtable, .buffer = &empty, .seek = 0, .end = 0 } };
+
+    var write_scratch: [1]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&write_scratch);
+    const stream: IoStream = .{ .reader = &zd.reader, .writer = &writer };
+
+    var buffer: [4096]u8 = undefined;
+    const n = try stream.read(&buffer);
+    try std.testing.expectEqual(@as(usize, 4), n);
+    try std.testing.expectEqualStrings("data", buffer[0..n]);
+    try std.testing.expectEqual(@as(usize, 2), zd.calls); // retried past the zero
 }
 
 test "live dialer is semantically analyzed" {
