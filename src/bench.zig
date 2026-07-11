@@ -4,11 +4,13 @@
 //! environment variable to change the count, and build in a release mode for
 //! representative numbers, e.g. `BENCH_N=100000 zig build bench -Doptimize=ReleaseFast`.
 //!
-//! It fills a fresh store with `num_events` events spread across a fixed number
-//! of authors, times the ingest, then repeatedly runs a 500-note author feed
-//! query and reports the best (warm) latency — the acceptance metric for the
-//! local-first cache. Results print to stderr; the temporary database is
-//! removed on exit.
+//! It fills a fresh store with `num_events` events spread across a fixed
+//! number of authors, times the ingest, then measures two warm query shapes —
+//! a multi-author home feed (`feed_authors` authors, kind 1, 500 notes) and a
+//! single-author profile (500 notes) — reporting the best latency of each.
+//! The feed shape is the hottest path of a client and the acceptance metric
+//! for the local-first cache. Results print to stderr; the temporary database
+//! is removed on exit.
 
 const std = @import("std");
 const nostr = @import("nostr");
@@ -18,6 +20,7 @@ const Event = nostr.event.Event;
 const Filter = nostr.filter.Filter;
 
 const num_authors: u64 = 100;
+const feed_authors: usize = 20;
 const feed_limit: u32 = 500;
 const query_reps: usize = 50;
 const db_path = "zig-nostr-bench.mdb";
@@ -84,39 +87,67 @@ pub fn main() !void {
     const ingest_ns: u64 = @intCast(std.Io.Timestamp.now(io, .awake).nanoseconds - ingest_start.nanoseconds);
     const ingest_per_s = @as(f64, @floatFromInt(n)) * 1e9 / @as(f64, @floatFromInt(ingest_ns));
 
-    // -- Warm-cache query: a `feed_limit`-note author feed --
-    const feed = Filter{ .authors = &[_][32]u8{authorPubkey(0)}, .limit = feed_limit };
-    {
-        var warm = try store.query(gpa, feed); // prime the mmap / page cache
-        warm.deinit();
-    }
-    var best_ns: u64 = std.math.maxInt(u64);
-    var feed_len: usize = 0;
-    var rep: usize = 0;
-    while (rep < query_reps) : (rep += 1) {
-        const q_start = std.Io.Timestamp.now(io, .awake);
-        var r = try store.query(gpa, feed);
-        const dt: u64 = @intCast(std.Io.Timestamp.now(io, .awake).nanoseconds - q_start.nanoseconds);
-        feed_len = r.events.len;
-        r.deinit();
-        if (dt < best_ns) best_ns = dt;
-    }
-    const best_us = @as(f64, @floatFromInt(best_ns)) / 1e3;
+    // -- Warm-cache queries --
+    //
+    // Home feed: the followed-authors timeline every client renders first.
+    var feed_pubkeys: [feed_authors][32]u8 = undefined;
+    for (&feed_pubkeys, 0..) |*pk, i| pk.* = authorPubkey(i);
+    const feed = Filter{
+        .authors = &feed_pubkeys,
+        .kinds = &[_]u16{1},
+        .limit = feed_limit,
+    };
+    // Profile: a single author's recent notes.
+    const profile = Filter{ .authors = &[_][32]u8{authorPubkey(0)}, .limit = feed_limit };
+
+    const feed_best = try bestQuery(gpa, io, &store, feed);
+    const profile_best = try bestQuery(gpa, io, &store, profile);
 
     std.debug.print(
         \\zig-nostr store benchmark
-        \\  events ingested : {d}
-        \\  authors         : {d}
-        \\  ingest          : {d:.0} events/s ({d:.2} ms total)
-        \\  warm feed query : {d} notes in {d:.1} us (best of {d})
+        \\  events ingested    : {d}
+        \\  authors            : {d}
+        \\  ingest             : {d:.0} events/s ({d:.2} ms total)
+        \\  warm feed query    : {d} notes in {d:.1} us (best of {d}; {d} authors, kind 1)
+        \\  warm profile query : {d} notes in {d:.1} us (best of {d})
         \\
     , .{
         n,
         num_authors,
         ingest_per_s,
         @as(f64, @floatFromInt(ingest_ns)) / 1e6,
-        feed_len,
-        best_us,
+        feed_best.notes,
+        @as(f64, @floatFromInt(feed_best.ns)) / 1e3,
+        query_reps,
+        feed_authors,
+        profile_best.notes,
+        @as(f64, @floatFromInt(profile_best.ns)) / 1e3,
         query_reps,
     });
+}
+
+/// Runs `f` once to warm the mmap/page cache, then `query_reps` times,
+/// returning the best latency and the result count.
+fn bestQuery(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    store: *Store,
+    f: Filter,
+) !struct { ns: u64, notes: usize } {
+    var notes: usize = 0;
+    {
+        var warm = try store.query(gpa, f);
+        notes = warm.events.len;
+        warm.deinit();
+    }
+    var best_ns: u64 = std.math.maxInt(u64);
+    var rep: usize = 0;
+    while (rep < query_reps) : (rep += 1) {
+        const q_start = std.Io.Timestamp.now(io, .awake);
+        var r = try store.query(gpa, f);
+        const dt: u64 = @intCast(std.Io.Timestamp.now(io, .awake).nanoseconds - q_start.nanoseconds);
+        r.deinit();
+        if (dt < best_ns) best_ns = dt;
+    }
+    return .{ .ns = best_ns, .notes = notes };
 }
