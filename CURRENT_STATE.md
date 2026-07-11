@@ -64,12 +64,18 @@ library-side cryptographic groundwork is landing first.)
   HKDF-derived keys over a libsecp256k1 ECDH shared secret, verified against
   the official NIP-44 test vectors (conversation keys, message keys, padding,
   and encrypt/decrypt round-trips). Groundwork for the A5 NIP-46 bunker.
+- NIP-46 remote-signing core (`src/nip46.zig`): the request/response messages
+  and JSON, the kind:24133 NIP-44 envelope (`seal`/`open`), and a transport-
+  agnostic `Bunker` dispatcher (connect/sign_event/ping/get_public_key/
+  nip44_encrypt/nip44_decrypt) behind an injectable approval `Policy`. Relay
+  I/O is left to the app; connection URIs are the next slice.
 
 ## What's in progress
 
-- A5 (Showcase 1): NIP-44 v2 encryption has landed in the library. Next: the
-  NIP-46 request/response message types and the transport-agnostic
-  client/bunker protocol logic, then the native signer app in its own repo.
+- A5 (Showcase 1): NIP-44 v2 encryption and the NIP-46 protocol core
+  (messages, kind:24133 envelope, bunker dispatch) have landed in the library.
+  Next: the `bunker://` / `nostrconnect://` connection URIs, then the native
+  signer app in its own repo.
 
 ## What's next
 
@@ -103,4 +109,5 @@ library-side cryptographic groundwork is landing first.)
 | Transport & outbox (NIP-65) | done |
 | Local event store | done |
 | NIP-44 v2 encryption | done |
+| NIP-46 remote signing (protocol core) | done |
 | NIP-17/59 + signer interface | not started |
