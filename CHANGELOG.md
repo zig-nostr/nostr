@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The live relay connection no longer fails the TLS websocket handshake. The
+  v0.3.2 read fix returned after a single `readVec`, but a `readVec` of *zero*
+  bytes means "no application data yet", not end-of-stream — a TLS record can
+  carry none — so reporting it as EOF failed the handshake against real `wss://`
+  relays (it was fine for plaintext `ws://`). `IoStream.read` now retries past a
+  bare zero read and returns only on the first real bytes or a genuine end of
+  stream. Verified live: `ws://` and `wss://` both complete the handshake and a
+  full request round-trip over a local relay. (#46)
+
 ## [0.3.2] - 2026-07-12
 
 ### Fixed
