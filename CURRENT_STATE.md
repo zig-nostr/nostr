@@ -9,7 +9,8 @@ event store) complete, plus the bounded-query performance patch (#33).
 
 ## Active milestone
 
-**A5 — Showcase 1: native Signer + NIP-46 bunker.** (Not yet started.)
+**A5 — Showcase 1: native Signer + NIP-46 bunker.** (In progress — the
+library-side cryptographic groundwork is landing first.)
 
 ## What's done
 
@@ -59,10 +60,16 @@ event store) complete, plus the bounded-query performance patch (#33).
   20-author home feed at 100k stored events dropped from ~26 ms to ~0.28 ms;
   the multi-author feed shape is covered in `src/bench.zig`.
 - **Tagged `v0.2.1`** — bounded-query performance patch.
+- NIP-44 v2 encryption (`src/nip44.zig`): ChaCha20 + HMAC-SHA256 with
+  HKDF-derived keys over a libsecp256k1 ECDH shared secret, verified against
+  the official NIP-44 test vectors (conversation keys, message keys, padding,
+  and encrypt/decrypt round-trips). Groundwork for the A5 NIP-46 bunker.
 
 ## What's in progress
 
-- A5: not yet started — see "What's next".
+- A5 (Showcase 1): NIP-44 v2 encryption has landed in the library. Next: the
+  NIP-46 request/response message types and the transport-agnostic
+  client/bunker protocol logic, then the native signer app in its own repo.
 
 ## What's next
 
@@ -95,4 +102,5 @@ event store) complete, plus the bounded-query performance patch (#33).
 | NIP-06 derivation | done |
 | Transport & outbox (NIP-65) | done |
 | Local event store | done |
-| Encryption (NIP-44/17/59) + signer interface | not started |
+| NIP-44 v2 encryption | done |
+| NIP-17/59 + signer interface | not started |
