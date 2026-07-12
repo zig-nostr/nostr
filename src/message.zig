@@ -66,6 +66,17 @@ pub fn encodeClose(
     return list.toOwnedSlice(allocator);
 }
 
+/// Encodes `["AUTH", <event>]` — the client's NIP-42 authentication response
+/// (a signed `kind:22242` event; see `nip42.authEvent`).
+pub fn encodeAuth(allocator: std.mem.Allocator, ev: Event) std.mem.Allocator.Error![]u8 {
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(allocator);
+    try list.appendSlice(allocator, "[\"AUTH\",");
+    try appendEvent(&list, allocator, ev);
+    try list.append(allocator, ']');
+    return list.toOwnedSlice(allocator);
+}
+
 /// Serializes a full event object into `list` (shared by `encodeEvent` and
 /// the tests). Mirrors `event.toJson` but writes in place.
 fn appendEvent(
@@ -96,6 +107,9 @@ pub const RelayMessage = union(enum) {
     closed: struct { subscription_id: []const u8, message: []const u8 },
     /// `["NOTICE", <message>]` — a human-readable relay notice.
     notice: struct { message: []const u8 },
+    /// `["AUTH", <challenge>]` — a NIP-42 authentication challenge; sign a
+    /// `kind:22242` event (see `nip42.authEvent`) and reply with `encodeAuth`.
+    auth: struct { challenge: []const u8 },
 };
 
 pub const ParsedRelayMessage = struct {
@@ -154,6 +168,12 @@ pub fn parseRelayMessage(gpa: std.mem.Allocator, json_text: []const u8) Error!Pa
         if (items.len < 2) return Error.InvalidMessage;
         const msg = asString(items[1]) orelse return Error.InvalidMessage;
         break :blk .{ .notice = .{ .message = msg } };
+    } else if (std.mem.eql(u8, tag, "AUTH")) blk: {
+        // NIP-42: relay → client is `["AUTH", <challenge-string>]`. (The client's
+        // reply carries an event object instead; that direction is `encodeAuth`.)
+        if (items.len < 2) return Error.InvalidMessage;
+        const challenge = asString(items[1]) orelse return Error.InvalidMessage;
+        break :blk .{ .auth = .{ .challenge = challenge } };
     } else {
         return Error.InvalidMessage;
     };
@@ -309,6 +329,27 @@ test "parse EOSE, CLOSED, NOTICE" {
         defer p.deinit();
         try std.testing.expectEqualStrings("rate limited", p.value.notice.message);
     }
+}
+
+test "parse AUTH challenge" {
+    const allocator = std.testing.allocator;
+    var p = try parseRelayMessage(allocator, "[\"AUTH\",\"challenge-abc123\"]");
+    defer p.deinit();
+    try std.testing.expectEqualStrings("challenge-abc123", p.value.auth.challenge);
+}
+
+test "encodeAuth wraps a signed event as [\"AUTH\", <event>]" {
+    const allocator = std.testing.allocator;
+    const s = try encodeAuth(allocator, sampleEvent());
+    defer allocator.free(s);
+    try std.testing.expect(std.mem.startsWith(u8, s, "[\"AUTH\",{"));
+    try std.testing.expect(std.mem.endsWith(u8, s, "}]"));
+    // The wrapped object parses back as the original event.
+    const inner = s["[\"AUTH\",".len .. s.len - 1];
+    var parsed = try event_mod.fromJson(allocator, inner);
+    defer parsed.deinit();
+    try std.testing.expectEqualSlices(u8, &sampleEvent().id, &parsed.value.id);
+    try std.testing.expectEqualStrings("hello", parsed.value.content);
 }
 
 test "parse rejects malformed messages" {
