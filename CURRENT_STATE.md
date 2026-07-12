@@ -4,15 +4,16 @@ Updated inside every PR that changes it. Never updated locally after merge.
 
 ## Version
 
-`v0.3.4` — Milestones A2 (library core), A3 (transport), and A4 (local-first
-event store) complete; A5's NIP-44 v2 encryption and NIP-46 remote-signing
-protocol layer have landed (the native signer app is in progress), plus a run
-of fixes to the live relay dialer: macOS hostname resolution (#41), a websocket
-handshake deadlock that stopped a signer from receiving requests (#44), a
-follow-up so the same read fix doesn't fail the TLS (`wss://`) handshake (#46),
-and a receive-path stall that withheld each `wss://` request until the next
-record arrived — the real cause of non-delivery over public relays like damus,
-so a signer now works end-to-end over `relay.damus.io` (#48, #49).
+`v0.3.5` — Milestones A2 (library core), A3 (transport), and A4 (local-first
+event store) complete; A5's NIP-44 v2 encryption, the NIP-46 remote-signing
+protocol layer, and NIP-42 client authentication have landed (the native signer,
+Signet, is in progress), plus a run of fixes to the live relay dialer: macOS
+hostname resolution (#41), a websocket handshake deadlock that stopped a signer
+from receiving requests (#44), a follow-up so the same read fix doesn't fail the
+TLS (`wss://`) handshake (#46), and a receive-path stall that withheld each
+`wss://` request until the next record arrived — the real cause of non-delivery
+over public relays like damus, so a signer now works end-to-end over
+`relay.damus.io` (#48, #49).
 
 ## Active milestone
 
@@ -93,16 +94,22 @@ library-side cryptographic groundwork is landing first.)
   which blocked on the *next* TLS record and stalled `wss://` request delivery.
   A full NIP-46 round-trip now completes over `relay.damus.io` at sub-second
   latency; this — not NIP-42 AUTH — was the public-relay delivery gap (#48, #49).
+- **Tagged `v0.3.5`** — NIP-42 client authentication (`src/nip42.zig`): a signer
+  answers a relay's `["AUTH", <challenge>]` with a signed `kind:22242` event and
+  re-subscribes once accepted, so it can serve NIP-46 over relays that require
+  auth. Also fixes the WebSocket `Host` header to carry non-default ports, which
+  relays match against the auth event's `relay` tag. Verified live against a
+  relay requiring NIP-42 (#52).
 
 ## What's in progress
 
 - A5 (Showcase 1): the NIP-46 library layer is complete — NIP-44 v2 encryption,
-  the messages, the kind:24133 envelope, the bunker dispatch, and the
-  connection URIs. The native signer built on it — **Signet**
-  (`zig-nostr/signet`) — is a headless daemon plus a native approval GUI,
-  packaged as one macOS `.app`, working end-to-end over public relays. Next:
-  NIP-42 relay authentication (for relays that require it) and a signed,
-  notarized distributable.
+  the messages, the kind:24133 envelope, the bunker dispatch, the connection
+  URIs, and NIP-42 client authentication. The native signer built on it —
+  **Signet** (`zig-nostr/signet`) — is a headless daemon plus a native approval
+  GUI, packaged as one macOS `.app`, working end-to-end over public relays
+  (including those that require NIP-42 auth). Next: a signed, notarized
+  distributable.
 
 ## What's next
 
@@ -137,4 +144,5 @@ library-side cryptographic groundwork is landing first.)
 | Local event store | done |
 | NIP-44 v2 encryption | done |
 | NIP-46 remote signing (protocol + URIs) | done |
+| NIP-42 client authentication | done |
 | NIP-17/59 + signer interface | not started |
