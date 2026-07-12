@@ -78,7 +78,8 @@ library-side cryptographic groundwork is landing first.)
   `nostrconnect://` connection URIs (parse + build, percent-decoding, verified
   against the spec's example token). Relay I/O is left to the app.
 - **Tagged `v0.3.0`** — NIP-44 v2 encryption and the NIP-46 remote-signing
-  protocol layer; the native signer app continues in `zig-nostr/signer`.
+  protocol layer; the native signer built on it, **Signet**, lives in
+  `zig-nostr/signet`.
 - **Tagged `v0.3.1`** — the live relay dialer resolves hostnames via the
   system resolver (`getaddrinfo`), fixing a macOS DNS hang (#41).
 - **Tagged `v0.3.2`** — fixed a websocket handshake deadlock in the live relay
@@ -97,9 +98,11 @@ library-side cryptographic groundwork is landing first.)
 
 - A5 (Showcase 1): the NIP-46 library layer is complete — NIP-44 v2 encryption,
   the messages, the kind:24133 envelope, the bunker dispatch, and the
-  connection URIs. Next: the native signer app in its own repo
-  (`zig-nostr/signer`), which needs two decisions — creating that public repo
-  and the macOS GUI approach.
+  connection URIs. The native signer built on it — **Signet**
+  (`zig-nostr/signet`) — is a headless daemon plus a native approval GUI,
+  packaged as one macOS `.app`, working end-to-end over public relays. Next:
+  NIP-42 relay authentication (for relays that require it) and a signed,
+  notarized distributable.
 
 ## What's next
 
