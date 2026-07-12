@@ -8,6 +8,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.5] - 2026-07-12
+
+### Added
+
+- NIP-42 authentication of clients to relays (`src/nip42.zig`): `authEvent`
+  builds and signs the `kind:22242` event (a `relay` tag and the relay's
+  `challenge`) that answers a relay's `["AUTH", <challenge>]`. `message.zig`
+  parses that challenge into a new `RelayMessage.auth` variant (it previously
+  returned `InvalidMessage`, dropping the connection) and `encodeAuth` emits the
+  client's `["AUTH", <event>]` reply; `Connection.authenticate` /
+  `Relay.authenticate` send it. This lets a signer serve NIP-46 over relays that
+  gate reads/writes behind authentication. Verified live against a relay
+  requiring NIP-42 (`nak serve --auth`): full round-trip, valid signed event.
+
+### Fixed
+
+- The WebSocket opening handshake now includes a non-default port in the `Host`
+  header (RFC 9110 §7.2) — `Host: relay.example.com:8443`, not just
+  `Host: relay.example.com`. Relays that derive their canonical URL from `Host`
+  compare it against a NIP-42 auth event's `relay` tag; omitting the port made
+  them mismatch and reject the authentication. Default ports (80/443) stay
+  omitted, so standard `ws://`/`wss://` relays are unaffected. Adds
+  `relay.Url.hostHeader`.
+
 ## [0.3.4] - 2026-07-12
 
 ### Fixed
