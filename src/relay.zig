@@ -34,6 +34,18 @@ pub const Url = struct {
     port: u16,
     /// Borrows from the input string; defaults to "/".
     path: []const u8,
+
+    /// The HTTP `Host` header value: the host, plus `:port` when the port is
+    /// non-default for the scheme (RFC 9110 §7.2 — 80 for `ws`, 443 for `wss`).
+    /// Sending the port matters for relays that derive their own canonical URL
+    /// from `Host`: a NIP-42 auth event's `relay` tag (the full dialed URL) must
+    /// match it, or the relay rejects the authentication. `buf` needs room for
+    /// the host plus `:65535`; falls back to the bare host if it doesn't fit.
+    pub fn hostHeader(self: Url, buf: []u8) []const u8 {
+        const default_port: u16 = if (self.secure) 443 else 80;
+        if (self.port == default_port) return self.host;
+        return std.fmt.bufPrint(buf, "{s}:{d}", .{ self.host, self.port }) catch self.host;
+    }
 };
 
 pub const UrlError = error{ InvalidUrl, UnsupportedScheme };
@@ -168,6 +180,14 @@ pub fn Connection(comptime Stream: type) type {
         /// Cancels a subscription: sends `["CLOSE", <id>]`.
         pub fn unsubscribe(self: *Self, subscription_id: []const u8) !void {
             const text = try message.encodeClose(self.allocator, subscription_id);
+            defer self.allocator.free(text);
+            try self.sendText(text);
+        }
+
+        /// Answers a NIP-42 challenge: sends `["AUTH", <event>]`. `ev` is a
+        /// signed `kind:22242` event (build it with `nip42.authEvent`).
+        pub fn authenticate(self: *Self, ev: Event) !void {
+            const text = try message.encodeAuth(self.allocator, ev);
             defer self.allocator.free(text);
             try self.sendText(text);
         }
@@ -370,6 +390,9 @@ pub const Relay = struct {
     pub fn unsubscribe(self: *Relay, subscription_id: []const u8) !void {
         return self.conn.unsubscribe(subscription_id);
     }
+    pub fn authenticate(self: *Relay, ev: Event) !void {
+        return self.conn.authenticate(ev);
+    }
     pub fn receive(self: *Relay) !?message.ParsedRelayMessage {
         return self.conn.receive();
     }
@@ -503,7 +526,8 @@ pub fn dial(gpa: std.mem.Allocator, io: std.Io, url: []const u8) !*Relay {
     };
     errdefer relay.conn.deinit();
 
-    try relay.conn.handshake(parsed.host, parsed.path);
+    var host_buf: [263]u8 = undefined; // max host (253) + ":65535"
+    try relay.conn.handshake(parsed.hostHeader(&host_buf), parsed.path);
     return relay;
 }
 
@@ -764,6 +788,46 @@ test "receive returns null on a close frame" {
     try std.testing.expect((try conn.receive()) == null);
 }
 
+test "NIP-42: receive an AUTH challenge, then authenticate writes the signed reply" {
+    const allocator = std.testing.allocator;
+    var written: std.ArrayList(u8) = .empty;
+    defer written.deinit(allocator);
+
+    // The relay issues a NIP-42 challenge; this once failed to parse (dropping
+    // the connection) — now it surfaces as an `auth` message.
+    var script: std.ArrayList(u8) = .empty;
+    defer script.deinit(allocator);
+    try appendServerText(&script, allocator, "[\"AUTH\",\"chal-xyz\"]");
+
+    var server = FakeStream{ .to_read = script.items, .written = &written, .allocator = allocator };
+    var conn = newConn(allocator, &server);
+    defer conn.deinit();
+
+    var m = (try conn.receive()).?;
+    defer m.deinit();
+    try std.testing.expectEqualStrings("chal-xyz", m.value.auth.challenge);
+
+    // Sign the kind:22242 auth event for that challenge and send it back.
+    const nip42 = @import("nip42.zig");
+    const keys_mod = @import("keys.zig");
+    var signer = keys_mod.Signer.init();
+    defer signer.deinit();
+    const secret = try @import("hex.zig").decodeFixed(32, "b7e151628aed2a6abf7158809cf4f3c762e7160f38b4da56a784d9045190cfef");
+    const kp = try signer.keyPairFromSecretKey(secret);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const ev = try nip42.authEvent(arena.allocator(), signer, kp, "wss://relay.example.com", m.value.auth.challenge, 1_700_000_000, null);
+    try conn.authenticate(ev);
+
+    // The written client frame is `["AUTH", {<kind:22242 event>}]`.
+    const frame = (try websocket.decodeFrame(written.items)).?;
+    try std.testing.expect(std.mem.startsWith(u8, frame.payload, "[\"AUTH\",{"));
+    try std.testing.expect(std.mem.indexOf(u8, frame.payload, "\"kind\":22242") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame.payload, "wss://relay.example.com") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame.payload, "chal-xyz") != null);
+}
+
 /// Appends an unmasked server text frame (supports arbitrary lengths).
 fn appendServerText(list: *std.ArrayList(u8), allocator: std.mem.Allocator, text: []const u8) !void {
     try list.append(allocator, 0x81);
@@ -807,6 +871,18 @@ test "parseUrl handles schemes, ports, paths, and IPv6" {
     try std.testing.expectError(UrlError.UnsupportedScheme, parseUrl("http://x"));
     try std.testing.expectError(UrlError.InvalidUrl, parseUrl("wss://"));
     try std.testing.expectError(UrlError.InvalidUrl, parseUrl("ws://host:notaport"));
+}
+
+test "hostHeader includes only non-default ports" {
+    var buf: [300]u8 = undefined;
+    // Default ports (443 for wss, 80 for ws) are omitted…
+    try std.testing.expectEqualStrings("relay.example.com", (try parseUrl("wss://relay.example.com")).hostHeader(&buf));
+    try std.testing.expectEqualStrings("relay.example.com", (try parseUrl("wss://relay.example.com:443")).hostHeader(&buf));
+    try std.testing.expectEqualStrings("relay.example.com", (try parseUrl("ws://relay.example.com:80")).hostHeader(&buf));
+    // …non-default ports are carried, so a relay deriving its URL from Host
+    // matches the NIP-42 auth event's `relay` tag.
+    try std.testing.expectEqualStrings("localhost:10547", (try parseUrl("ws://localhost:10547")).hostHeader(&buf));
+    try std.testing.expectEqualStrings("relay.example.com:8443", (try parseUrl("wss://relay.example.com:8443")).hostHeader(&buf));
 }
 
 test "IoStream drives a Connection over real std Io.Reader/Writer" {
@@ -936,6 +1012,7 @@ test "live dialer is semantically analyzed" {
     _ = &Relay.publish;
     _ = &Relay.subscribe;
     _ = &Relay.unsubscribe;
+    _ = &Relay.authenticate;
     _ = &Relay.receive;
     _ = &Relay.deinit;
 }
