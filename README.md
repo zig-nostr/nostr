@@ -32,8 +32,8 @@ local-first event store, and the NIP-46 signer protocol layer have shipped:
   encryption and the NIP-46 remote-signing ("bunker") protocol — the
   request/response messages, the `kind:24133` envelope, a transport-agnostic
   dispatcher behind an approval policy, and the `bunker://` / `nostrconnect://`
-  connection URIs. The native signer app is being built in
-  [`zig-nostr/signer`](https://github.com/zig-nostr/signer).
+  connection URIs. The native signer built on this — **Signet** — lives in
+  [`zig-nostr/signet`](https://github.com/zig-nostr/signet).
 
 Native signer, messenger, and reader showcases land in upcoming milestones —
 see [`CURRENT_STATE.md`](CURRENT_STATE.md) for what's in progress and the
