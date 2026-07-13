@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- NIP-49 now Unicode-NFKC-normalizes the password before the scrypt KDF, as the
+  spec requires (`src/nip49.zig`). Previously non-ASCII passwords were passed
+  through unnormalized, so this library and another NIP-49 implementation could
+  derive different keys from the same password typed in a different Unicode form
+  — a silent decryption failure. Normalization uses the pure-Zig `zg` Unicode
+  library and keeps an allocation-free fast path for ASCII passwords (#18).
+
 ## [0.3.5] - 2026-07-12
 
 ### Added

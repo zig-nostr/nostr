@@ -13,6 +13,10 @@
             .url = "git+https://github.com/LMDB/lmdb#ce201088de95d26fc0da36ba805bf2ddc2ba74ff",
             .hash = "N-V-__8AAHEsCACb_b9D1HnCysDKIhKFOrITbxYh9JRh9ix5",
         },
+        .zg = .{
+            .url = "git+https://codeberg.org/atman/zg?ref=v0.16.2#ce364b17d60b28fda1af24c6575b93c47afe043e",
+            .hash = "zg-0.16.2-oGqU3HqftgI6rwFS90ypwfjgToH8Pz829OKuFURlm773",
+        },
     },
     .paths = .{
         "build.zig",

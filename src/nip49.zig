@@ -2,15 +2,13 @@
 //!
 //! scrypt-derived symmetric key + XChaCha20-Poly1305, bech32-encoded.
 //!
-//! Known limitation: the spec requires the password to be Unicode-NFKC-
-//! normalized before use. This module does not perform that normalization
-//! (Zig's standard library has no Unicode normalization support), so
-//! callers passing non-ASCII passwords are responsible for normalizing them
-//! first if they need byte-for-byte interop with other NIP-49
-//! implementations on the same non-normalized input.
+//! Per the spec, the password is Unicode-NFKC-normalized before the KDF (via
+//! the pure-Zig `zg` Normalize module), so the same password derives the same
+//! key across implementations regardless of its input Unicode form.
 
 const std = @import("std");
 const bech32 = @import("bech32.zig");
+const Normalize = @import("Normalize");
 
 pub const Error = bech32.Error || std.Io.RandomSecureError || error{
     InvalidPrefix,
@@ -55,9 +53,16 @@ pub fn encrypt(
     var nonce: [nonce_len]u8 = undefined;
     try io.randomSecure(&nonce);
 
+    // NIP-49 requires the password to be NFKC-normalized before the KDF, so the
+    // same password derives the same key across implementations regardless of
+    // Unicode form. nfkc() returns the input unchanged, without allocating, when
+    // it is ASCII-only or already normalized.
+    const norm_pw = try Normalize.nfkc(allocator, password);
+    defer norm_pw.deinit(allocator);
+
     var key: [key_len]u8 = undefined;
     defer std.crypto.secureZero(u8, &key);
-    std.crypto.pwhash.scrypt.kdf(allocator, &key, password, &salt, .{ .ln = log_n, .r = 8, .p = 1 }) catch
+    std.crypto.pwhash.scrypt.kdf(allocator, &key, norm_pw.slice, &salt, .{ .ln = log_n, .r = 8, .p = 1 }) catch
         return Error.WeakParameters;
 
     const ad = [ad_len]u8{@intFromEnum(key_security)};
@@ -119,9 +124,12 @@ pub fn decrypt(allocator: std.mem.Allocator, ncryptsec: []const u8, password: []
     i += tag_len;
     std.debug.assert(i == payload_len);
 
+    const norm_pw = try Normalize.nfkc(allocator, password);
+    defer norm_pw.deinit(allocator);
+
     var key: [key_len]u8 = undefined;
     defer std.crypto.secureZero(u8, &key);
-    std.crypto.pwhash.scrypt.kdf(allocator, &key, password, salt, .{ .ln = @intCast(log_n), .r = 8, .p = 1 }) catch
+    std.crypto.pwhash.scrypt.kdf(allocator, &key, norm_pw.slice, salt, .{ .ln = @intCast(log_n), .r = 8, .p = 1 }) catch
         return Error.WeakParameters;
 
     var privkey: [key_len]u8 = undefined;
@@ -167,4 +175,32 @@ test "decrypt rejects wrong password" {
     defer allocator.free(ncryptsec);
 
     try std.testing.expectError(Error.DecryptionFailed, decrypt(allocator, ncryptsec, "wrong password"));
+}
+
+test "NFKC: compatibility-equivalent passwords derive the same key" {
+    const allocator = std.testing.allocator;
+    const privkey = try hexToBytes32("67dea2ed018072d675f5415ecfaed7d2597555e202d85b3d65ea4e58d2d92ffa");
+
+    // U+FB00 (ﬀ, LATIN SMALL LIGATURE FF) is NFKC-compatibility-equal to "ff".
+    // Encrypting with one form and decrypting with the other only works if the
+    // password is normalized before the KDF.
+    const ncryptsec = try encrypt(allocator, std.testing.io, privkey, "\u{FB00}", 16, .known_secure);
+    defer allocator.free(ncryptsec);
+
+    const decrypted = try decrypt(allocator, ncryptsec, "ff");
+    try std.testing.expectEqualSlices(u8, &privkey, &decrypted);
+}
+
+test "NFKC: precomposed and decomposed accents derive the same key" {
+    const allocator = std.testing.allocator;
+    const privkey = try hexToBytes32("67dea2ed018072d675f5415ecfaed7d2597555e202d85b3d65ea4e58d2d92ffa");
+
+    // "café" with a precomposed é (U+00E9) vs a decomposed e + combining acute
+    // accent (U+0065 U+0301). NFKC maps both to the same normal form, so the
+    // round trip across forms succeeds.
+    const ncryptsec = try encrypt(allocator, std.testing.io, privkey, "caf\u{00E9}", 16, .known_secure);
+    defer allocator.free(ncryptsec);
+
+    const decrypted = try decrypt(allocator, ncryptsec, "cafe\u{0301}");
+    try std.testing.expectEqualSlices(u8, &privkey, &decrypted);
 }
