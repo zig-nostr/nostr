@@ -4,10 +4,12 @@ Updated inside every PR that changes it. Never updated locally after merge.
 
 ## Version
 
-`v0.3.5` — Milestones A2 (library core), A3 (transport), and A4 (local-first
-event store) complete; A5's NIP-44 v2 encryption, the NIP-46 remote-signing
-protocol layer, and NIP-42 client authentication have landed (the native signer,
-Signet, is in progress), plus a run of fixes to the live relay dialer: macOS
+`v0.3.5` — Milestones A2 (library core), A3 (transport), A4 (local-first
+event store), and A5 (native Signer) complete. A5's NIP-44 v2 encryption, the
+NIP-46 remote-signing protocol layer, and NIP-42 client authentication landed in
+the library, and the native signer built on them — Signet — ships as a
+downloadable macOS app working end-to-end over public relays. Plus a run of
+fixes to the live relay dialer: macOS
 hostname resolution (#41), a websocket handshake deadlock that stopped a signer
 from receiving requests (#44), a follow-up so the same read fix doesn't fail the
 TLS (`wss://`) handshake (#46), and a receive-path stall that withheld each
@@ -17,8 +19,10 @@ over public relays like damus, so a signer now works end-to-end over
 
 ## Active milestone
 
-**A5 — Showcase 1: native Signer + NIP-46 bunker.** (In progress — the
-library-side cryptographic groundwork is landing first.)
+**A8 — Docs, benchmarks & built-with.** (In progress.) A5 (native Signer,
+shipped as Signet) and A2–A4 are complete; the remaining showcases — A6 (NIP-17
+messenger) and A7 (read-only reader) — are the final milestones, sequenced after
+A8.
 
 ## What's done
 
@@ -103,22 +107,27 @@ library-side cryptographic groundwork is landing first.)
 
 ## What's in progress
 
-- A5 (Showcase 1): the NIP-46 library layer is complete — NIP-44 v2 encryption,
-  the messages, the kind:24133 envelope, the bunker dispatch, the connection
-  URIs, and NIP-42 client authentication. The native signer built on it —
-  **Signet** (`zig-nostr/signet`) — is a headless daemon plus a native approval
-  GUI, packaged as one macOS `.app`, working end-to-end over public relays
-  (including those that require NIP-42 auth). Next: a signed, notarized
-  distributable.
+- A8 (Docs, benchmarks & built-with): a public docs/showcase site and
+  consolidated own-numbers benchmarks for what has shipped — the library core,
+  the local-first store, and the native signer (Signet) — plus a "built with
+  zig-nostr" page. Decoupled from the not-yet-built messenger/reader showcases;
+  their cross-suite interop matrix and suite-wide `v0.3.0` tag are revisited
+  after A6/A7.
+
+Just completed — A5 (native Signer): **Signet** (`zig-nostr/signet`) is a
+headless daemon plus a native approval GUI, packaged as one macOS `.app` with a
+one-line installer, working end-to-end over public relays (including those that
+require NIP-42 auth), the key never leaving the daemon. Remaining polish
+(notarization) is deferred.
 
 ## What's next
 
-1. A5: native key manager — create/import key, NIP-49 at-rest encryption, a
-   local signing API.
-2. A5: NIP-46 bunker (`sign_event`/`get_public_key`/`nip44_encrypt`/
-   `nip44_decrypt`/`ping`) with per-request approval.
-3. A6+: NIP-44 v2 encryption and NIP-17 private messaging, then the read-only
-   outbox client — see the project board for the full roadmap.
+1. A8: publish the docs/showcase site, own-numbers benchmarks, and the "built
+   with zig-nostr" page.
+2. A6 (final): NIP-17 private messaging (gift-wrapped DMs) on the library and
+   local store, signing via Signet.
+3. A7 (final): read-only outbox client with local-first rendering — see the
+   project board for the full roadmap.
 
 ## Known blockers / pending decisions
 
@@ -145,4 +154,6 @@ library-side cryptographic groundwork is landing first.)
 | NIP-44 v2 encryption | done |
 | NIP-46 remote signing (protocol + URIs) | done |
 | NIP-42 client authentication | done |
-| NIP-17/59 + signer interface | not started |
+| Native signer app (Signet) | done — `zig-nostr/signet` |
+| NIP-17/59 messaging (A6) | not started |
+| Read-only reader client (A7) | not started |

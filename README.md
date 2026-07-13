@@ -28,17 +28,19 @@ local-first event store, and the NIP-46 signer protocol layer have shipped:
   insert ingestion (dedup, replaceable/parameterized, NIP-09 deletion), a
   direct-message conversation index, local-first reconciliation, and a
   size-cap cache.
-- **Milestone A5 (in progress) — signer protocol layer:** NIP-44 v2 payload
-  encryption and the NIP-46 remote-signing ("bunker") protocol — the
-  request/response messages, the `kind:24133` envelope, a transport-agnostic
-  dispatcher behind an approval policy, and the `bunker://` / `nostrconnect://`
-  connection URIs. The native signer built on this — **Signet** — lives in
-  [`zig-nostr/signet`](https://github.com/zig-nostr/signet).
+- **Milestone A5 — signer:** NIP-44 v2 payload encryption, the NIP-46
+  remote-signing ("bunker") protocol — the request/response messages, the
+  `kind:24133` envelope, a transport-agnostic dispatcher behind an approval
+  policy, and the `bunker://` / `nostrconnect://` connection URIs — and NIP-42
+  client authentication. The native signer built on this — **Signet** — ships as
+  a downloadable macOS app that keeps your key off every client and approves each
+  request; [`zig-nostr/signet`](https://github.com/zig-nostr/signet).
 
-Native signer, messenger, and reader showcases land in upcoming milestones —
-see [`CURRENT_STATE.md`](CURRENT_STATE.md) for what's in progress and the
-[project board](https://github.com/orgs/zig-nostr/projects) for the full
-milestone roadmap.
+The signer showcase (A5) has shipped. Documentation and benchmarks (A8) are the
+current focus; the DM messenger (A6) and read-only reader (A7) showcases are the
+final milestones that follow. See [`CURRENT_STATE.md`](CURRENT_STATE.md) for
+detail and the [project board](https://github.com/orgs/zig-nostr/projects) for
+the full milestone roadmap.
 
 ## Install
 
