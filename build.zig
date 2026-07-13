@@ -27,6 +27,13 @@ pub fn build(b: *std.Build) void {
     mod.addImport("lmdb", lmdb.c_module);
     mod.linkLibrary(lmdb.library);
 
+    // NFKC password normalization for NIP-49 (src/nip49.zig). zg is a pure-Zig
+    // Unicode library; we import only its Normalize module to keep the footprint
+    // small. Normalize.nfkc has a built-in ASCII fast-path (no allocation for
+    // ASCII-only input), so the common password path stays allocation-free.
+    const zg = b.dependency("zg", .{ .target = target, .optimize = optimize });
+    mod.addImport("Normalize", zg.module("Normalize"));
+
     const mod_tests = b.addTest(.{
         .root_module = mod,
     });

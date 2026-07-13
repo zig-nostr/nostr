@@ -32,8 +32,8 @@ library-side cryptographic groundwork is landing first.)
   against the official spec vectors (`src/bech32.zig`, `src/nip19.zig`).
 - NIP-49 encrypted private key storage (`ncryptsec`): scrypt +
   XChaCha20-Poly1305, verified against the official decryption vector
-  (`src/nip49.zig`). Password NFKC normalization not implemented (documented
-  limitation — Zig std has no Unicode normalization).
+  (`src/nip49.zig`). Passwords are NFKC-normalized before the KDF (via the
+  pure-Zig `zg` library) for byte-for-byte interop across implementations.
 - NIP-01 event model: `Event` struct, canonical serialization, sha256 id
   computation, wire JSON encode/decode (`src/hex.zig`, `src/event.zig`),
   verified against hand-computed sha256 oracle vectors.
