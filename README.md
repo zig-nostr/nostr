@@ -146,9 +146,8 @@ one core:
 - **[Signet](https://github.com/zig-nostr/signet)** — *shipped.* A native macOS
   remote signer (NIP-46 bunker): your key lives in a local daemon, every signing
   request waits for your approval, and the `nsec` never enters a client.
-- **Plaza** — *in progress.* The flagship: a fast, local-first client organized
-  around community "places," where you browse and post within two minutes and
-  the feed renders from disk.
+- **Plaza** — *in progress.* The flagship: a fast, local-first client where you
+  browse and post within two minutes and the feed renders from disk.
 - **Messenger** — *planned.* Private NIP-17 direct messages, signing through
   Signet.
 
