@@ -16,7 +16,7 @@ it like [Signet](https://github.com/zig-nostr/signet), a remote signer that keep
 your key off every client. Full docs, benchmarks, and the ecosystem overview
 live at [zignostr.com](https://zignostr.com).
 
-> **Status: pre-alpha (`v0.3.5`).** The library core, transport, local-first
+> **Status: pre-alpha (`v0.3.6`).** The library core, transport, local-first
 > store, and signer protocol have shipped and are covered by tests. APIs may
 > still change before 1.0.
 
@@ -66,7 +66,7 @@ Methodology and the full write-up are on the
 Add the library to your `build.zig.zon`:
 
 ```sh
-zig fetch --save https://github.com/zig-nostr/nostr/archive/refs/tags/v0.3.5.tar.gz
+zig fetch --save https://github.com/zig-nostr/nostr/archive/refs/tags/v0.3.6.tar.gz
 ```
 
 Wire the module in `build.zig`:

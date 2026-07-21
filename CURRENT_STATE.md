@@ -4,12 +4,14 @@ Updated inside every PR that changes it. Never updated locally after merge.
 
 ## Version
 
-`v0.3.5` — Milestones A2 (library core), A3 (transport), A4 (local-first
+`v0.3.6` — Milestones A2 (library core), A3 (transport), A4 (local-first
 event store), and A5 (native Signer) complete. A5's NIP-44 v2 encryption, the
 NIP-46 remote-signing protocol layer, and NIP-42 client authentication landed in
 the library, and the native signer built on them — Signet — ships as a
-downloadable macOS app working end-to-end over public relays. Plus a run of
-fixes to the live relay dialer: macOS
+downloadable macOS app working end-to-end over public relays. The signer's own
+core — the encrypted key at rest, the serving loop, and the authorization
+policy — now lives in the library too, so a signer is a shell over it rather
+than a fork. Plus a run of fixes to the live relay dialer: macOS
 hostname resolution (#41), a websocket handshake deadlock that stopped a signer
 from receiving requests (#44), a follow-up so the same read fix doesn't fail the
 TLS (`wss://`) handshake (#46), and a receive-path stall that withheld each
@@ -104,6 +106,15 @@ A8.
   auth. Also fixes the WebSocket `Host` header to carry non-default ports, which
   relays match against the auth event's `relay` tag. Verified live against a
   relay requiring NIP-42 (#52).
+- **Tagged `v0.3.6`** — signer support in the library (experimental, pre-1.0):
+  `keystore` for the encrypted key at rest (NIP-49 `ncryptsec` plus a `0600` key
+  file), `signer` with the transport serve loop that answers kind:24133 requests
+  over any relay connection (with NIP-42 auth, proven hermetically), and
+  `nip46.PolicyConfig` for least-privilege method and event-kind allowlists.
+  Signet now consumes these rather than carrying its own copies. Also
+  NFKC-normalizes NIP-49 passwords before the scrypt KDF, as the spec requires,
+  so the same password in a different Unicode form no longer derives a different
+  key (#18, #60).
 
 ## What's in progress
 
