@@ -288,6 +288,78 @@ pub fn approveAll() Policy {
     return .{ .decideFn = &approveAllFn };
 }
 
+/// Operator-configured least-privilege authorization, built into a `Policy`.
+/// A null allowlist means "no restriction"; a non-null one is an allowlist.
+/// `connect`, `ping`, and `logout` are always permitted (rejecting them would
+/// only break the client handshake, not protect the key), and an unknown method
+/// fails closed. The default (both allowlists null) decides in O(1) with no
+/// allocation; a kind allowlist parses only a `sign_event` template's `kind`
+/// field, off the hot path and dwarfed by the signing a permitted request
+/// triggers. Pass to `policy()` by pointer as `ctx`, so it must outlive the
+/// bunker that holds the returned policy.
+pub const PolicyConfig = struct {
+    /// Allocator used to parse an event template's kind when `allowed_kinds`
+    /// is set; unused when it is null.
+    gpa: std.mem.Allocator,
+    /// Key-touching methods the signer will honor; null = no restriction.
+    /// `connect`/`ping`/`logout` are always allowed regardless.
+    allowed_methods: ?[]const Method = null,
+    /// Event kinds the signer will `sign_event` for; null = any kind.
+    allowed_kinds: ?[]const u16 = null,
+
+    /// Builds the `Policy` backed by this config. `self` must outlive the
+    /// bunker that holds the returned policy (it is threaded through as `ctx`).
+    pub fn policy(self: *const PolicyConfig) Policy {
+        return .{ .ctx = @constCast(self), .decideFn = &decidePolicyConfig };
+    }
+};
+
+/// Methods a `PolicyConfig` never restricts: rejecting them would break the
+/// NIP-46 handshake/liveness, not protect the key.
+fn policyConfigAlwaysAllowed(method: Method) bool {
+    return switch (method) {
+        .connect, .ping, .logout => true,
+        else => false,
+    };
+}
+
+fn decidePolicyConfig(ctx: ?*anyopaque, request: *const Request) Decision {
+    const cfg: *const PolicyConfig = @ptrCast(@alignCast(ctx.?));
+
+    // Unknown/unsupported method: fail closed. (The bunker rejects these too,
+    // but the policy must never approve something it can't classify.)
+    const method = Method.fromString(request.method) orelse return .reject;
+
+    if (!policyConfigAlwaysAllowed(method)) {
+        if (cfg.allowed_methods) |allowed| {
+            if (std.mem.indexOfScalar(Method, allowed, method) == null) return .reject;
+        }
+    }
+
+    if (method == .sign_event) {
+        if (cfg.allowed_kinds) |kinds| {
+            const event_kind = signEventKind(cfg.gpa, request) orelse return .reject;
+            if (std.mem.indexOfScalar(u16, kinds, event_kind) == null) return .reject;
+        }
+    }
+
+    return .approve;
+}
+
+/// Parses the `kind` from a `sign_event` request's event template (params[0]),
+/// or null if it is missing or unparseable (the caller treats null as "deny").
+pub fn signEventKind(gpa: std.mem.Allocator, request: *const Request) ?u16 {
+    if (request.params.len < 1) return null;
+    const parsed = std.json.parseFromSlice(
+        struct { kind: u16 },
+        gpa,
+        request.params[0],
+        .{ .ignore_unknown_fields = true },
+    ) catch return null;
+    defer parsed.deinit();
+    return parsed.value.kind;
+}
+
 /// A `Response` whose owned strings are backed by an arena. Call `deinit`.
 pub const OwnedResponse = struct {
     arena: *std.heap.ArenaAllocator,
@@ -984,4 +1056,66 @@ test "NIP-46 uri parsing rejects bad input" {
         Error.InvalidUri,
         parseNostrConnectUri(gpa, "nostrconnect://" ++ ("ab" ** 32) ++ "?relay=wss://r"),
     );
+}
+
+test "PolicyConfig default approves every supported request" {
+    var cfg = PolicyConfig{ .gpa = testing.allocator };
+    const p = cfg.policy();
+
+    const gpk = Request{ .id = "1", .method = "get_public_key", .params = &.{} };
+    try testing.expectEqual(Decision.approve, p.decide(&gpk));
+
+    const tmpl = "{\"kind\":4,\"content\":\"x\",\"tags\":[],\"created_at\":1}";
+    const se = Request{ .id = "2", .method = "sign_event", .params = &[_][]const u8{tmpl} };
+    try testing.expectEqual(Decision.approve, p.decide(&se));
+}
+
+test "PolicyConfig method allowlist blocks a key-touching method but never connect/ping" {
+    const allowed = [_]Method{ .get_public_key, .sign_event };
+    var cfg = PolicyConfig{ .gpa = testing.allocator, .allowed_methods = &allowed };
+    const p = cfg.policy();
+
+    // A sign-only bunker refuses nip44_decrypt so a client can't read the
+    // user's DMs through it.
+    const dec = Request{ .id = "1", .method = "nip44_decrypt", .params = &[_][]const u8{ "aa", "bb" } };
+    try testing.expectEqual(Decision.reject, p.decide(&dec));
+
+    // connect/ping are always allowed even though they're not listed.
+    const con = Request{ .id = "2", .method = "connect", .params = &.{} };
+    try testing.expectEqual(Decision.approve, p.decide(&con));
+    const png = Request{ .id = "3", .method = "ping", .params = &.{} };
+    try testing.expectEqual(Decision.approve, p.decide(&png));
+
+    // A listed method still passes.
+    const gpk = Request{ .id = "4", .method = "get_public_key", .params = &.{} };
+    try testing.expectEqual(Decision.approve, p.decide(&gpk));
+}
+
+test "PolicyConfig kind allowlist gates sign_event by event kind, failing closed" {
+    const kinds = [_]u16{1};
+    var cfg = PolicyConfig{ .gpa = testing.allocator, .allowed_kinds = &kinds };
+    const p = cfg.policy();
+
+    const note = "{\"kind\":1,\"content\":\"gm\",\"tags\":[],\"created_at\":1}";
+    const ok = Request{ .id = "1", .method = "sign_event", .params = &[_][]const u8{note} };
+    try testing.expectEqual(Decision.approve, p.decide(&ok));
+
+    const del = "{\"kind\":5,\"content\":\"\",\"tags\":[],\"created_at\":1}";
+    const no = Request{ .id = "2", .method = "sign_event", .params = &[_][]const u8{del} };
+    try testing.expectEqual(Decision.reject, p.decide(&no));
+
+    // Unparseable template → deny.
+    const junk = Request{ .id = "3", .method = "sign_event", .params = &[_][]const u8{"not json"} };
+    try testing.expectEqual(Decision.reject, p.decide(&junk));
+
+    // A kind restriction doesn't affect non-signing methods.
+    const gpk = Request{ .id = "4", .method = "get_public_key", .params = &.{} };
+    try testing.expectEqual(Decision.approve, p.decide(&gpk));
+}
+
+test "PolicyConfig rejects an unknown method" {
+    var cfg = PolicyConfig{ .gpa = testing.allocator };
+    const p = cfg.policy();
+    const bogus = Request{ .id = "1", .method = "delete_everything", .params = &.{} };
+    try testing.expectEqual(Decision.reject, p.decide(&bogus));
 }

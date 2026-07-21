@@ -21,6 +21,12 @@ pub const websocket = @import("websocket.zig");
 pub const relay = @import("relay.zig");
 pub const nip65 = @import("nip65.zig");
 pub const store = @import("store.zig");
+// Signer support (experimental, pre-1.0): the at-rest key file and the
+// NIP-46 signer-side serving loop, so a signer is a thin shell over the
+// library rather than a fork of it. The authorization policy lives with the
+// rest of NIP-46 in `nip46` (see `nip46.PolicyConfig`).
+pub const keystore = @import("keystore.zig");
+pub const signer = @import("signer.zig");
 
 test "module compiles and version is set" {
     try std.testing.expect(version.len > 0);
