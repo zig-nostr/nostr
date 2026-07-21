@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Signer support (experimental, pre-1.0), so a NIP-46 signer is a thin shell
+  over the library rather than a fork of it: a `keystore` module for the
+  encrypted key at rest (NIP-49 `ncryptsec` plus a `0600` key file), a `signer`
+  module with the transport serve loop that answers kind:24133 requests over any
+  relay connection (with NIP-42 auth), and `nip46.PolicyConfig` for
+  least-privilege method and event-kind allowlists. The serve loop is proven
+  hermetically against an in-memory connection. The loopback IPC wire types are
+  intentionally deferred until an HTTP signer consumes them, so the library ships
+  no unused surface.
+
 ### Fixed
 
 - NIP-49 now Unicode-NFKC-normalizes the password before the scrypt KDF, as the
