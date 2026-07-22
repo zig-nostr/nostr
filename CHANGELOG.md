@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.7] - 2026-07-22
+
 ### Added
 
 - The signer loopback protocol's wire types (`src/signer_ipc.zig`, experimental,
