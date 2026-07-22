@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The signer loopback protocol's wire types (`src/signer_ipc.zig`, experimental,
+  pre-1.0): the request/response bodies a keyholder daemon and its clients
+  exchange over local HTTP, one shape per endpoint (`/pubkey`, `/setup`,
+  `/sign`, and the batched `/nip44/encrypt` + `/nip44/decrypt`), plus the
+  shared failure body. Living in the library means every product speaks the
+  identical protocol without sharing a server; transport, ports, and
+  authentication stay product concerns. Deferred from 0.3.6 until an HTTP
+  signer consumed them; the Plaza helper now does.
+
 ## [0.3.6] - 2026-07-21
 
 ### Added
