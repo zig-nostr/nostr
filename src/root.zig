@@ -27,6 +27,11 @@ pub const store = @import("store.zig");
 // rest of NIP-46 in `nip46` (see `nip46.PolicyConfig`).
 pub const keystore = @import("keystore.zig");
 pub const signer = @import("signer.zig");
+// The signer loopback protocol's wire types (experimental, pre-1.0): the
+// request/response bodies a keyholder daemon and its clients exchange over
+// local HTTP, so every product speaks the identical protocol without sharing
+// a server. Transport, ports, and authentication stay product concerns.
+pub const signer_ipc = @import("signer_ipc.zig");
 
 test "module compiles and version is set" {
     try std.testing.expect(version.len > 0);
