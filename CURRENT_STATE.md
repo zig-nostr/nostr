@@ -4,7 +4,7 @@ Updated inside every PR that changes it. Never updated locally after merge.
 
 ## Version
 
-`v0.3.6` — Milestones A2 (library core), A3 (transport), A4 (local-first
+`v0.3.7` — Milestones A2 (library core), A3 (transport), A4 (local-first
 event store), and A5 (native Signer) complete. A5's NIP-44 v2 encryption, the
 NIP-46 remote-signing protocol layer, and NIP-42 client authentication landed in
 the library, and the native signer built on them — Signet — ships as a
@@ -115,6 +115,12 @@ A8.
   NFKC-normalizes NIP-49 passwords before the scrypt KDF, as the spec requires,
   so the same password in a different Unicode form no longer derives a different
   key (#18, #60).
+- **Tagged `v0.3.7`** — the signer loopback protocol's wire types
+  (`signer_ipc`, experimental, pre-1.0): the request/response bodies a keyholder
+  daemon and its clients exchange over local HTTP (`/pubkey`, `/setup`, `/sign`,
+  and the batched `/nip44/encrypt` + `/nip44/decrypt`), so every product speaks
+  the identical protocol without sharing a server. Deferred from 0.3.6 until an
+  HTTP signer consumed them; the Plaza signer helper now does (#62).
 
 ## What's in progress
 
