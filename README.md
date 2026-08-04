@@ -12,7 +12,7 @@ remote-signing protocol. It's the base layer a fast, native Nostr app is built
 on: no browser, no Electron, the protocol running close to the metal.
 
 It's also the core of a small ecosystem — the library, plus native apps built on
-it like [Signet](https://github.com/zig-nostr/signet), a remote signer that keeps
+it like [Notary](https://github.com/zig-nostr/notary), a remote signer that keeps
 your key off every client. Full docs, benchmarks, and the ecosystem overview
 live at [zignostr.com](https://zignostr.com).
 
@@ -143,13 +143,13 @@ Planned NIPs arrive with the showcase apps below.
 The library is proven by native apps built on it — the ecosystem forming around
 one core:
 
-- **[Signet](https://github.com/zig-nostr/signet)** — *shipped.* A native macOS
+- **[Notary](https://github.com/zig-nostr/notary)**: *shipped.* A native macOS
   remote signer (NIP-46 bunker): your key lives in a local daemon, every signing
   request waits for your approval, and the `nsec` never enters a client.
 - **Plaza** — *in progress.* The flagship: a fast, local-first client where you
   browse and post within two minutes and the feed renders from disk.
 - **Messenger** — *planned.* Private NIP-17 direct messages, signing through
-  Signet.
+  Notary.
 
 ## Roadmap
 

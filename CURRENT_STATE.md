@@ -7,7 +7,7 @@ Updated inside every PR that changes it. Never updated locally after merge.
 `v0.3.7` — Milestones A2 (library core), A3 (transport), A4 (local-first
 event store), and A5 (native Signer) complete. A5's NIP-44 v2 encryption, the
 NIP-46 remote-signing protocol layer, and NIP-42 client authentication landed in
-the library, and the native signer built on them — Signet — ships as a
+the library, and the native signer built on them, Notary, ships as a
 downloadable macOS app working end-to-end over public relays. The signer's own
 core — the encrypted key at rest, the serving loop, and the authorization
 policy — now lives in the library too, so a signer is a shell over it rather
@@ -22,7 +22,7 @@ over public relays like damus, so a signer now works end-to-end over
 ## Active milestone
 
 **A8 — Docs, benchmarks & built-with.** (In progress.) A5 (native Signer,
-shipped as Signet) and A2–A4 are complete; the remaining showcases — A6 (NIP-17
+shipped as Notary) and A2–A4 are complete; the remaining showcases, A6 (NIP-17
 messenger) and A7 (read-only reader) — are the final milestones, sequenced after
 A8.
 
@@ -85,8 +85,8 @@ A8.
   `nostrconnect://` connection URIs (parse + build, percent-decoding, verified
   against the spec's example token). Relay I/O is left to the app.
 - **Tagged `v0.3.0`** — NIP-44 v2 encryption and the NIP-46 remote-signing
-  protocol layer; the native signer built on it, **Signet**, lives in
-  `zig-nostr/signet`.
+  protocol layer; the native signer built on it, **Notary**, lives in
+  `zig-nostr/notary`.
 - **Tagged `v0.3.1`** — the live relay dialer resolves hostnames via the
   system resolver (`getaddrinfo`), fixing a macOS DNS hang (#41).
 - **Tagged `v0.3.2`** — fixed a websocket handshake deadlock in the live relay
@@ -111,7 +111,7 @@ A8.
   file), `signer` with the transport serve loop that answers kind:24133 requests
   over any relay connection (with NIP-42 auth, proven hermetically), and
   `nip46.PolicyConfig` for least-privilege method and event-kind allowlists.
-  Signet now consumes these rather than carrying its own copies. Also
+  Notary now consumes these rather than carrying its own copies. Also
   NFKC-normalizes NIP-49 passwords before the scrypt KDF, as the spec requires,
   so the same password in a different Unicode form no longer derives a different
   key (#18, #60).
@@ -126,12 +126,12 @@ A8.
 
 - A8 (Docs, benchmarks & built-with): a public docs/showcase site and
   consolidated own-numbers benchmarks for what has shipped — the library core,
-  the local-first store, and the native signer (Signet) — plus a "built with
+  the local-first store, and the native signer (Notary): plus a "built with
   zig-nostr" page. Decoupled from the not-yet-built messenger/reader showcases;
   their cross-suite interop matrix and suite-wide `v0.3.0` tag are revisited
   after A6/A7.
 
-Just completed — A5 (native Signer): **Signet** (`zig-nostr/signet`) is a
+Just completed, A5 (native Signer): **Notary** (`zig-nostr/notary`) is a
 headless daemon plus a native approval GUI, packaged as one macOS `.app` with a
 one-line installer, working end-to-end over public relays (including those that
 require NIP-42 auth), the key never leaving the daemon. Remaining polish
@@ -142,7 +142,7 @@ require NIP-42 auth), the key never leaving the daemon. Remaining polish
 1. A8: publish the docs/showcase site, own-numbers benchmarks, and the "built
    with zig-nostr" page.
 2. A6 (final): NIP-17 private messaging (gift-wrapped DMs) on the library and
-   local store, signing via Signet.
+   local store, signing via Notary.
 3. A7 (final): read-only outbox client with local-first rendering — see the
    project board for the full roadmap.
 
@@ -171,6 +171,6 @@ require NIP-42 auth), the key never leaving the daemon. Remaining polish
 | NIP-44 v2 encryption | done |
 | NIP-46 remote signing (protocol + URIs) | done |
 | NIP-42 client authentication | done |
-| Native signer app (Signet) | done — `zig-nostr/signet` |
+| Native signer app (Notary) | done, `zig-nostr/notary` |
 | NIP-17/59 messaging (A6) | not started |
 | Read-only reader client (A7) | not started |
