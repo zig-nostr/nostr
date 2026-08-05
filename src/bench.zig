@@ -4,13 +4,20 @@
 //! environment variable to change the count, and build in a release mode for
 //! representative numbers, e.g. `BENCH_N=100000 zig build bench -Doptimize=ReleaseFast`.
 //!
-//! It fills a fresh store with `num_events` events spread across a fixed
-//! number of authors, times the ingest, then measures two warm query shapes —
-//! a multi-author home feed (`feed_authors` authors, kind 1, 500 notes) and a
-//! single-author profile (500 notes) — reporting the best latency of each.
-//! The feed shape is the hottest path of a client and the acceptance metric
-//! for the local-first cache. Results print to stderr; the temporary database
-//! is removed on exit.
+//! It fills a fresh store with `num_events` events spread across a fixed number
+//! of authors, each of whom has a profile buried under everything they have
+//! posted since, times the ingest, then measures three warm query shapes: a
+//! multi-author home feed (`feed_authors` authors, kind 1, 500 notes), one
+//! author's timeline (500 events, any kind), and one author's profile (kind 0,
+//! one event). It reports the best latency of each, plus how many index entries
+//! the profile fetch read to return its one event.
+//!
+//! The feed shape is the hottest path of a client and the acceptance metric for
+//! the local-first cache. The profile shape is the one a store of a single kind
+//! cannot measure at all, because there is nothing of the wrong kind to read
+//! past, which is why this fills a mixed store.
+//!
+//! Results print to stderr; the temporary database is removed on exit.
 
 const std = @import("std");
 const nostr = @import("nostr");
@@ -27,6 +34,12 @@ const db_path = "zig-nostr-bench.mdb";
 
 /// Builds a distinct, cheap event: id and author derived from `i` so that
 /// author `i % num_authors` accumulates a contiguous run of events.
+///
+/// The first event of each author is their profile and everything after it is a
+/// note, which is the shape a real store has: a `kind:0` written once, buried
+/// under everything its author has posted since. A store of one kind cannot
+/// tell whether a filter is being answered from an index that suits it, because
+/// there is nothing of the wrong kind to read past.
 fn makeEvent(i: u64) Event {
     var id = [_]u8{0} ** 32;
     std.mem.writeInt(u64, id[0..8], i +% 1, .little);
@@ -36,9 +49,9 @@ fn makeEvent(i: u64) Event {
         .id = id,
         .pubkey = pubkey,
         .created_at = @intCast(i),
-        .kind = 1,
+        .kind = if (i < num_authors) 0 else 1,
         .tags = &.{},
-        .content = "benchmark event content",
+        .content = if (i < num_authors) "{\"name\":\"benchmark\"}" else "benchmark event content",
         .sig = [_]u8{0} ** 64,
     };
 }
@@ -97,10 +110,19 @@ pub fn main() !void {
         .kinds = &[_]u16{1},
         .limit = feed_limit,
     };
-    // Profile: a single author's recent notes.
-    const profile = Filter{ .authors = &[_][32]u8{authorPubkey(0)}, .limit = feed_limit };
+    // Timeline: a single author's recent events, whatever they are.
+    const timeline = Filter{ .authors = &[_][32]u8{authorPubkey(0)}, .limit = feed_limit };
+    // Profile: one author's `kind:0`. What a client asks for every time it has
+    // to put a name on a note, and the shape that has to reach past everything
+    // that author has written since they set it.
+    const profile = Filter{
+        .authors = &[_][32]u8{authorPubkey(0)},
+        .kinds = &[_]u16{0},
+        .limit = 1,
+    };
 
     const feed_best = try bestQuery(gpa, io, &store, feed);
+    const timeline_best = try bestQuery(gpa, io, &store, timeline);
     const profile_best = try bestQuery(gpa, io, &store, profile);
 
     std.debug.print(
@@ -109,7 +131,8 @@ pub fn main() !void {
         \\  authors            : {d}
         \\  ingest             : {d:.0} events/s ({d:.2} ms total)
         \\  warm feed query    : {d} notes in {d:.1} us (best of {d}; {d} authors, kind 1)
-        \\  warm profile query : {d} notes in {d:.1} us (best of {d})
+        \\  warm timeline query: {d} events in {d:.1} us (best of {d}; 1 author, any kind)
+        \\  warm profile query : {d} event in {d:.1} us (best of {d}; 1 author, kind 0, {d} entries examined)
         \\
     , .{
         n,
@@ -120,24 +143,33 @@ pub fn main() !void {
         @as(f64, @floatFromInt(feed_best.ns)) / 1e3,
         query_reps,
         feed_authors,
+        timeline_best.notes,
+        @as(f64, @floatFromInt(timeline_best.ns)) / 1e3,
+        query_reps,
         profile_best.notes,
         @as(f64, @floatFromInt(profile_best.ns)) / 1e3,
         query_reps,
+        profile_best.examined,
     });
 }
 
 /// Runs `f` once to warm the mmap/page cache, then `query_reps` times,
-/// returning the best latency and the result count.
+/// returning the best latency, the result count, and how many index entries the
+/// query read to produce it. The last one is the part a stopwatch cannot show:
+/// a query reading far more than it returns is answering from an index that
+/// does not suit it, whatever the clock says on the day.
 fn bestQuery(
     gpa: std.mem.Allocator,
     io: std.Io,
     store: *Store,
     f: Filter,
-) !struct { ns: u64, notes: usize } {
+) !struct { ns: u64, notes: usize, examined: usize } {
     var notes: usize = 0;
+    var examined: usize = 0;
     {
         var warm = try store.query(gpa, f);
         notes = warm.events.len;
+        examined = warm.examined;
         warm.deinit();
     }
     var best_ns: u64 = std.math.maxInt(u64);
@@ -149,5 +181,5 @@ fn bestQuery(
         r.deinit();
         if (dt < best_ns) best_ns = dt;
     }
-    return .{ .ns = best_ns, .notes = notes };
+    return .{ .ns = best_ns, .notes = notes, .examined = examined };
 }
