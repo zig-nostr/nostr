@@ -4,7 +4,7 @@ Updated inside every PR that changes it. Never updated locally after merge.
 
 ## Version
 
-`v0.3.7` — Milestones A2 (library core), A3 (transport), A4 (local-first
+`v0.3.8`. Milestones A2 (library core), A3 (transport), A4 (local-first
 event store), and A5 (native Signer) complete. A5's NIP-44 v2 encryption, the
 NIP-46 remote-signing protocol layer, and NIP-42 client authentication landed in
 the library, and the native signer built on them, Notary, ships as a
@@ -121,6 +121,17 @@ A8.
   and the batched `/nip44/encrypt` + `/nip44/decrypt`), so every product speaks
   the identical protocol without sharing a server. Deferred from 0.3.6 until an
   HTTP signer consumed them; the Plaza signer helper now does (#62).
+- **Tagged `v0.3.8`**: the store serves a filter naming both authors and kinds
+  from an index on the pair, instead of the author index. Asking for one
+  account's `kind:0` used to walk back through everything they had posted since
+  they set it: 501 index entries read to return 1, and the cost of reading
+  somebody's name grew with how much they had written. It now reads one entry,
+  7.4us against 392.2us at a hundred thousand events. Existing databases fill
+  the index on open, checked by count so an interrupted fill repairs itself,
+  because an empty index and an author who has written nothing are the same
+  answer to a query. `QueryResult.examined` reports the entries a query read, so
+  the benchmark and the tests can assert on work done rather than on a clock
+  (#66, #67).
 
 ## What's in progress
 
