@@ -44,15 +44,22 @@ numbers — measured with the in-repo benchmark and reproducible on your machine
 (Apple Silicon, `ReleaseFast`, warm cache, best of 50; events spread across 100
 authors; a 20-author `kind:1` feed returning 500 notes):
 
-| Store size | Feed query (500 notes) | Profile query | Ingest |
-|----|----|----|----|
-| 20,000 events | 0.26 ms | 0.09 ms | ~135k events/s |
-| 100,000 events | 0.28 ms | 0.25 ms | ~135k events/s |
+| Store size | Feed query (500 notes) | Timeline query (1 author) | Profile query | Ingest |
+|----|----|----|----|----|
+| 20,000 events | 0.25 ms | 0.09 ms | 0.007 ms | ~170k events/s |
+| 100,000 events | 0.28 ms | 0.24 ms | 0.008 ms | ~149k events/s |
 
-The headline isn't the ~0.28 ms feed query — it's that 5× more stored events
+The headline isn't the ~0.28 ms feed query, it's that 5x more stored events
 barely moves it. The bounded query planner walks the indexes newest-first and
 stops at `limit`, so latency tracks the page size you ask for, not the size of
 the store.
+
+The profile query is the same point made sharply. Fetching one account's
+`kind:0` out of a hundred thousand events reads exactly one index entry, no
+matter how much that account has posted since they set it, because a filter
+naming both authors and kinds is served by an index on the pair. The benchmark
+prints that entry count next to the latency: it is the part a stopwatch cannot
+tell you.
 
 ```sh
 BENCH_N=100000 zig build bench -Doptimize=ReleaseFast

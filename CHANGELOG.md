@@ -8,6 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The store benchmark fills a mixed-kind store and measures a real profile
+  fetch. Every event it stored was `kind:1`, so no query in it ever had anything
+  of the wrong kind to read past, and the row the README called the profile
+  query was one author's timeline: authors only, no kind, 500 events. A store of
+  a single kind cannot show whether a filter is answered from an index that
+  suits it, which is why the cost of a profile fetch went unmeasured for as long
+  as it did. Each author now has a `kind:0` buried under everything they have
+  posted since, the timeline row is named for what it measures, and a third row
+  fetches one profile: 7.4us reading a single index entry, against 392.2us
+  reading a thousand of them on the author index.
+
+  The benchmark reports entries examined next to each latency, which is the part
+  a stopwatch on a shared machine cannot report.
+
 ### Fixed
 
 - A filter naming both authors and kinds is served by its own
