@@ -2315,3 +2315,57 @@ test "store: a database written before the author+kind index still reads" {
     defer all.deinit();
     try std.testing.expectEqual(@as(usize, 8), all.events.len);
 }
+
+test "store: authors, kinds and a time window are all applied together" {
+    // The composite index seeks past a 34-byte prefix rather than a 32-byte
+    // one, so an off-by-two there would put the `since`/`until` bounds in the
+    // wrong place and quietly return the wrong window. Nothing else in the
+    // suite asks for authors, kinds and a time range at once.
+    const gpa = std.testing.allocator;
+    var signer = try keys.Signer.initRandomized(std.testing.io);
+    defer signer.deinit();
+    const a = try signer.generateKeyPair(std.testing.io);
+    const b = try signer.generateKeyPair(std.testing.io);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var store = try openTempStore(&tmp, "window.mdb", &buf);
+    defer store.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Both authors write both kinds, once per second from 100 to 109.
+    for (0..10) |i| {
+        const t = 100 + @as(i64, @intCast(i));
+        for ([_]keys.KeyPair{ a, b }) |kp| {
+            for ([_]u16{ 1, 7 }) |kd| {
+                const body = try std.fmt.allocPrint(arena, "k{d} t{d}", .{ kd, t });
+                const ev = try event.create(arena, signer, kp, t, kd, &.{}, body, null);
+                _ = try store.ingest(arena, ev, .{});
+            }
+        }
+    }
+
+    var r = try store.query(gpa, .{
+        .authors = &[_][32]u8{a.public_key},
+        .kinds = &[_]u16{1},
+        .since = 103,
+        .until = 106,
+    });
+    defer r.deinit();
+
+    // One author, one kind, four seconds inclusive: 103, 104, 105, 106.
+    try std.testing.expectEqual(@as(usize, 4), r.events.len);
+    for (r.events) |ev| {
+        try std.testing.expectEqualSlices(u8, &a.public_key, &ev.pubkey);
+        try std.testing.expectEqual(@as(u16, 1), ev.kind);
+        try std.testing.expect(ev.created_at >= 103 and ev.created_at <= 106);
+    }
+    // Newest first, and nothing outside the window was read to get there.
+    try std.testing.expectEqual(@as(i64, 106), r.events[0].created_at);
+    try std.testing.expectEqual(@as(i64, 103), r.events[3].created_at);
+    try std.testing.expectEqual(@as(usize, 4), r.examined);
+}
