@@ -140,6 +140,12 @@ pub const Store = struct {
     /// checked on every open rather than recorded once, which also repairs a
     /// database that an interrupted fill, or a build without this index, has
     /// since written to.
+    ///
+    /// The fill commits as a single transaction, so a second process opening
+    /// the same pre-index database while this one is filling reads the empty
+    /// index until that commit lands, and an authors-and-kinds query in that
+    /// window comes back empty. It is a one-time upgrade window that closes on
+    /// its own, because that process fills the index too.
     fn fillAuthorKindIndex(self: *Store) Error!void {
         const complete = complete: {
             var txn: ?*c.MDB_txn = null;

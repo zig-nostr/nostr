@@ -35,7 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Ingest writes one more index entry per event, which measured 5.6% fewer
   events per second (153,370/s against 144,723/s, best of three runs at 100,000
-  events).
+  events). The store now opens ten named sub-databases rather than nine, so an
+  `OpenOptions.max_dbs` set explicitly below ten no longer opens; the default of
+  16 is unaffected.
 
 ### Added
 
