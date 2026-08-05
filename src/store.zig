@@ -2369,3 +2369,79 @@ test "store: authors, kinds and a time window are all applied together" {
     try std.testing.expectEqual(@as(i64, 103), r.events[3].created_at);
     try std.testing.expectEqual(@as(usize, 4), r.examined);
 }
+
+test "store: the author+kind index stays whole through deletes and replaces" {
+    // The fill triggers on the index not holding one entry per event, so a
+    // write path that maintained the author index but forgot this one would
+    // not fail a query: it would make every open rebuild the whole index, and
+    // on a real store that is a startup pause with nothing to explain it. This
+    // asserts the invariant directly after each kind of write.
+    const gpa = std.testing.allocator;
+    var signer = try keys.Signer.initRandomized(std.testing.io);
+    defer signer.deinit();
+    const kp = try signer.generateKeyPair(std.testing.io);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var store = try openTempStore(&tmp, "whole.mdb", &buf);
+    defer store.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const entries = struct {
+        fn f(s: *Store, dbi: c.MDB_dbi) !usize {
+            var txn: ?*c.MDB_txn = null;
+            try check(c.mdb_txn_begin(s.env, null, @intCast(c.MDB_RDONLY), &txn));
+            defer c.mdb_txn_abort(txn);
+            var st: c.MDB_stat = undefined;
+            try check(c.mdb_stat(txn, dbi, &st));
+            return st.ms_entries;
+        }
+    }.f;
+    // Plain events.
+    for (0..5) |i| {
+        const body = try std.fmt.allocPrint(arena, "note {d}", .{i});
+        const ev = try event.create(arena, signer, kp, 1_000 + @as(i64, @intCast(i)), 1, &.{}, body, null);
+        _ = try store.ingest(arena, ev, .{});
+    }
+    try std.testing.expectEqual(
+        try entries(&store, store.events_dbi),
+        try entries(&store, store.idx_author_kind_dbi),
+    );
+
+    // A replaceable event, then a newer one superseding it.
+    const p1 = try event.create(arena, signer, kp, 2_000, 0, &.{}, "{\"name\":\"one\"}", null);
+    _ = try store.ingest(arena, p1, .{});
+    const p2 = try event.create(arena, signer, kp, 2_001, 0, &.{}, "{\"name\":\"two\"}", null);
+    _ = try store.ingest(arena, p2, .{});
+    try std.testing.expectEqual(
+        try entries(&store, store.events_dbi),
+        try entries(&store, store.idx_author_kind_dbi),
+    );
+
+    // A NIP-09 deletion of one of the notes.
+    const victim = blk: {
+        var r = try store.query(gpa, .{ .authors = &[_][32]u8{kp.public_key}, .kinds = &[_]u16{1}, .limit = 1 });
+        defer r.deinit();
+        break :blk r.events[0].id;
+    };
+    const id_hex = try hex.encode(arena, &victim);
+    const tags = [_]Tag{&[_][]const u8{ "e", id_hex }};
+    const del = try event.create(arena, signer, kp, 3_000, 5, &tags, "", null);
+    _ = try store.ingest(arena, del, .{});
+    try std.testing.expectEqual(
+        try entries(&store, store.events_dbi),
+        try entries(&store, store.idx_author_kind_dbi),
+    );
+
+    // And so a reopen finds nothing to fill: the newest profile is still the
+    // one query returns, and it is the second one.
+    var r = try store.query(gpa, .{ .authors = &[_][32]u8{kp.public_key}, .kinds = &[_]u16{0} });
+    defer r.deinit();
+    try std.testing.expectEqual(@as(usize, 1), r.events.len);
+    try std.testing.expectEqualStrings("{\"name\":\"two\"}", r.events[0].content);
+    try std.testing.expectEqual(@as(usize, 1), r.examined);
+}
