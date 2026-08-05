@@ -8,6 +8,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A filter naming both authors and kinds is served by its own
+  `pubkey ++ kind ++ time ++ id` index instead of the author index, so it no
+  longer reads past everything those authors wrote in other kinds and rejects
+  each one after decoding it. Asking a store that holds 500 of an account's
+  notes for that account's `kind:0` examined 501 index entries and now examines
+  1. The shape is not unusual: a profile is written once and posted over ever
+  since, so the cost of reading somebody's name used to grow with how much they
+  had said since they set it. Refreshing profiles across a 1024-account follow
+  list measured 11,457us and now measures 302us, and scales with the length of
+  the list rather than with the length of those accounts' timelines.
+
+  A filter broad enough that pairing every author with every kind would open
+  more than 4096 cursors still reads the author index, because at that width
+  most of what it yields is accepted anyway.
+
+  Existing databases are filled on open. The index is rebuilt whenever it does
+  not hold one entry per stored event, rather than on a recorded one-time
+  upgrade, so a database an older build has written to since is repaired too.
+  This is checked on every open because getting it wrong is silent: to a query,
+  an index that is not there yet and an author who has written nothing are the
+  same answer, and a reader would open the app to a blank feed and an empty
+  contact list with nothing to suggest the events were still on disk.
+
+  Ingest writes one more index entry per event, which measured 5.6% fewer
+  events per second (153,370/s against 144,723/s, best of three runs at 100,000
+  events). The store now opens ten named sub-databases rather than nine, so an
+  `OpenOptions.max_dbs` set explicitly below ten no longer opens; the default of
+  16 is unaffected.
+
+### Added
+
+- `QueryResult.examined`: how many index entries the merge popped to produce
+  the results, including the ones it read and rejected. The gap between it and
+  `events.len` is a query's waste, and it is what makes "this filter is being
+  answered from an index that suits it" something a test can assert. Elapsed
+  time cannot tell a wasted walk from a busy machine.
+
 ## [0.3.7] - 2026-07-22
 
 ### Added

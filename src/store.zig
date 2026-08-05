@@ -26,6 +26,17 @@ const Event = event.Event;
 const Tag = event.Tag;
 const Filter = filter_mod.Filter;
 
+/// How many cursors a single merged query will open before it stops pairing
+/// authors with kinds and reads the author index instead.
+///
+/// The merge picks the newest entry across live streams by scanning them, so
+/// every stream costs a comparison per event returned. Pairing is worth that as
+/// long as the streams stay few: a client asking for one kind from a full
+/// contact list is a few hundred. A filter broad enough to pass this is one
+/// where most of what the author index yields would be accepted anyway, which
+/// is the case the author index is already good at.
+const max_merge_streams = 4096;
+
 pub const Error = error{
     /// LMDB returned a non-success, non-`NOTFOUND` status code.
     Lmdb,
@@ -44,6 +55,15 @@ pub const Store = struct {
     events_dbi: c.MDB_dbi,
     /// Index: pubkey ++ time-key ++ id -> (empty).
     idx_author_dbi: c.MDB_dbi,
+    /// Index: pubkey ++ kind(be u16) ++ time-key ++ id -> (empty).
+    ///
+    /// Serves the common filter that names both authors and kinds. Without it
+    /// such a filter walks the author index, which is every kind that author
+    /// ever wrote, and rejects the wrong ones after decoding them. That is the
+    /// difference between reading a profile and reading a timeline: asking for
+    /// one account's kind:0 walks back through every note they have posted
+    /// since they last edited it.
+    idx_author_kind_dbi: c.MDB_dbi,
     /// Index: kind(be u16) ++ time-key ++ id -> (empty).
     idx_kind_dbi: c.MDB_dbi,
     /// Index: time-key ++ id -> (empty). Drives "everything, newest first".
@@ -94,6 +114,7 @@ pub const Store = struct {
             .kv_dbi = try openDb(txn, "kv"),
             .events_dbi = try openDb(txn, "events"),
             .idx_author_dbi = try openDb(txn, "idx_author"),
+            .idx_author_kind_dbi = try openDb(txn, "idx_author_kind"),
             .idx_kind_dbi = try openDb(txn, "idx_kind"),
             .idx_created_dbi = try openDb(txn, "idx_created"),
             .idx_tag_dbi = try openDb(txn, "idx_tag"),
@@ -102,7 +123,74 @@ pub const Store = struct {
             .idx_convo_dbi = try openDb(txn, "idx_convo"),
         };
         try check(c.mdb_txn_commit(txn));
-        return store;
+
+        var opened = store;
+        try opened.fillAuthorKindIndex();
+        return opened;
+    }
+
+    /// Builds `idx_author_kind` from the stored events unless it already holds
+    /// one entry per event, which is the invariant `applyIndexes` maintains.
+    ///
+    /// A database written before this index existed has none of it, and at
+    /// query time an empty index is indistinguishable from an author who has
+    /// written nothing. A reader upgrading would open the app to a blank feed,
+    /// an empty contact list and a profile with no name, and nothing about that
+    /// looks like a missing index: it looks like the account. So the count is
+    /// checked on every open rather than recorded once, which also repairs a
+    /// database that an interrupted fill, or a build without this index, has
+    /// since written to.
+    ///
+    /// The fill commits as a single transaction, so a second process opening
+    /// the same pre-index database while this one is filling reads the empty
+    /// index until that commit lands, and an authors-and-kinds query in that
+    /// window comes back empty. It is a one-time upgrade window that closes on
+    /// its own, because that process fills the index too.
+    fn fillAuthorKindIndex(self: *Store) Error!void {
+        const complete = complete: {
+            var txn: ?*c.MDB_txn = null;
+            try check(c.mdb_txn_begin(self.env, null, @intCast(c.MDB_RDONLY), &txn));
+            defer c.mdb_txn_abort(txn);
+            var events_stat: c.MDB_stat = undefined;
+            var index_stat: c.MDB_stat = undefined;
+            try check(c.mdb_stat(txn, self.events_dbi, &events_stat));
+            try check(c.mdb_stat(txn, self.idx_author_kind_dbi, &index_stat));
+            break :complete events_stat.ms_entries == index_stat.ms_entries;
+        };
+        if (complete) return;
+
+        var txn: ?*c.MDB_txn = null;
+        try check(c.mdb_txn_begin(self.env, null, 0, &txn));
+        errdefer c.mdb_txn_abort(txn);
+
+        // Emptied first, so a half-written index is replaced rather than added
+        // to. `mdb_drop` with 0 keeps the sub-database itself.
+        try check(c.mdb_drop(txn, self.idx_author_kind_dbi, 0));
+
+        var cursor: ?*c.MDB_cursor = null;
+        try check(c.mdb_cursor_open(txn, self.events_dbi, &cursor));
+        var k: c.MDB_val = undefined;
+        var v: c.MDB_val = undefined;
+        var rc = c.mdb_cursor_get(cursor, &k, &v, c.MDB_FIRST);
+        while (rc == c.MDB_SUCCESS) : (rc = c.mdb_cursor_get(cursor, &k, &v, c.MDB_NEXT)) {
+            const bytes = valBytes(v);
+            if (bytes.len < header_len) return error.CorruptRecord;
+            // Header fields only: the key needs the pubkey, kind and time, and
+            // decoding every event's tags to reach them would turn a one-time
+            // upgrade into a visible pause.
+            const view = EventView{ .bytes = bytes };
+            var key: [74]u8 = undefined;
+            @memcpy(key[0..32], view.pubkey());
+            std.mem.writeInt(u16, key[32..34], view.kind(), .big);
+            key[34..42].* = orderKey(view.createdAt());
+            @memcpy(key[42..74], view.id());
+            try indexOp(txn, self.idx_author_kind_dbi, &key, .put);
+        }
+        if (rc != c.MDB_NOTFOUND) try check(rc);
+        // Closed while the transaction is still live: a write transaction's
+        // cursors must not outlive it.
+        c.mdb_cursor_close(cursor);
+        try check(c.mdb_txn_commit(txn));
     }
 
     /// Flushes and closes the environment. The handle is invalid afterwards.
@@ -207,6 +295,11 @@ pub const Store = struct {
         try key.appendSlice(gpa, &ev.id);
         try indexOp(txn, self.idx_created_dbi, key.items, op);
 
+        // Big-endian so the index key sorts by kind, shared by both indexes
+        // below.
+        var kb: [2]u8 = undefined;
+        std.mem.writeInt(u16, &kb, ev.kind, .big);
+
         // author index: [pubkey][time][id]
         key.clearRetainingCapacity();
         try key.appendSlice(gpa, &ev.pubkey);
@@ -214,9 +307,15 @@ pub const Store = struct {
         try key.appendSlice(gpa, &ev.id);
         try indexOp(txn, self.idx_author_dbi, key.items, op);
 
+        // author+kind index: [pubkey][kind big-endian][time][id]
+        key.clearRetainingCapacity();
+        try key.appendSlice(gpa, &ev.pubkey);
+        try key.appendSlice(gpa, &kb);
+        try key.appendSlice(gpa, &tk);
+        try key.appendSlice(gpa, &ev.id);
+        try indexOp(txn, self.idx_author_kind_dbi, key.items, op);
+
         // kind index: [kind big-endian][time][id]
-        var kb: [2]u8 = undefined;
-        std.mem.writeInt(u16, &kb, ev.kind, .big);
         key.clearRetainingCapacity();
         try key.appendSlice(gpa, &kb);
         try key.appendSlice(gpa, &tk);
@@ -365,7 +464,35 @@ pub const Store = struct {
             if (s.cursor != null) c.mdb_cursor_close(s.cursor);
         };
 
-        if (filter.authors) |authors| {
+        // A filter naming both authors and kinds is served by the composite
+        // index, one stream per (author, kind) pair, so a stream only ever
+        // walks entries the filter can accept. Naming the authors alone would
+        // make the merge step through every other kind those authors wrote and
+        // throw each one away after a decode.
+        //
+        // The pairing is a product, and the merge picks the newest across live
+        // streams linearly, so a filter with many of both is left on the author
+        // index: paying a decode per rejected event beats paying a cursor and a
+        // comparison per pair.
+        const author_kind: ?[]const u16 = blk: {
+            const authors = filter.authors orelse break :blk null;
+            const kinds = filter.kinds orelse break :blk null;
+            const pairs = std.math.mul(usize, authors.len, kinds.len) catch break :blk null;
+            if (pairs > max_merge_streams) break :blk null;
+            break :blk kinds;
+        };
+
+        if (author_kind) |kinds| {
+            for (filter.authors.?) |a| {
+                for (kinds) |kd| {
+                    var prefix: [34]u8 = undefined;
+                    @memcpy(prefix[0..32], &a);
+                    std.mem.writeInt(u16, prefix[32..34], kd, .big);
+                    const s = try streams.addOne(sa);
+                    try revStreamInit(s, txn, self.idx_author_kind_dbi, sa, &prefix, until_key, since_key);
+                }
+            }
+        } else if (filter.authors) |authors| {
             for (authors) |a| {
                 const s = try streams.addOne(sa);
                 try revStreamInit(s, txn, self.idx_author_dbi, sa, &a, until_key, since_key);
@@ -404,6 +531,7 @@ pub const Store = struct {
         var seen: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
         defer seen.deinit(gpa);
 
+        var examined: usize = 0;
         const limit: usize = if (filter.limit) |l| l else std.math.maxInt(usize);
         while (matched.items.len < limit) {
             // Pop the globally newest candidate: largest (time, id) suffix
@@ -416,6 +544,7 @@ pub const Store = struct {
             }
             const bi = best orelse break;
             const id = streams.items[bi].id;
+            examined += 1;
             try revStreamAdvance(&streams.items[bi], since_key);
 
             // The same event can surface from two streams (e.g. two queried
@@ -436,7 +565,7 @@ pub const Store = struct {
         // The merge yields (created_at desc, id desc) — the same order the
         // sort-based path produced — so results are returned as popped.
         const events = try aa.dupe(Event, matched.items);
-        return QueryResult{ .arena = arena, .events = events };
+        return QueryResult{ .arena = arena, .events = events, .examined = examined };
     }
 
     /// Returns the direct-message conversation between pubkeys `a` and `b`
@@ -496,7 +625,8 @@ pub const Store = struct {
 
         const count = if (limit) |l| @min(@as(usize, l), matched.items.len) else matched.items.len;
         const events = try aa.dupe(Event, matched.items[0..count]);
-        return QueryResult{ .arena = arena, .events = events };
+        // An explicit id list is its own candidate set: every id named is read.
+        return QueryResult{ .arena = arena, .events = events, .examined = candidate_ids.len };
     }
 
     // -- Local-first reconciliation -----------------------------------------
@@ -820,6 +950,15 @@ pub const StoredEvent = struct {
 pub const QueryResult = struct {
     arena: *std.heap.ArenaAllocator,
     events: []Event,
+    /// How many index entries the merge popped to produce `events`, including
+    /// the ones it read and then rejected.
+    ///
+    /// The difference between this and `events.len` is the query's waste, and
+    /// it is the only way to see from the outside whether a filter is being
+    /// answered from an index that suits it or by reading past everything that
+    /// does not match. A wall-clock assertion cannot tell those apart on a busy
+    /// machine; this can.
+    examined: usize = 0,
 
     pub fn deinit(self: *QueryResult) void {
         const gpa = self.arena.child_allocator;
@@ -2081,4 +2220,234 @@ test "store: evictToCap removes the oldest events and their indexes" {
 
     // Already under the cap: nothing to do.
     try std.testing.expectEqual(@as(usize, 0), try store.evictToCap(gpa, 10));
+}
+
+test "store: a profile is found without reading the notes written since" {
+    // The shape every Nostr client asks for constantly: one account's kind:0,
+    // which they set once and have posted over ever since. Answered from the
+    // author index it means walking back through the whole timeline and
+    // decoding each note to find out it is the wrong kind, so the cost of
+    // reading somebody's name grows with how much they have written.
+    //
+    // Asserted on entries examined rather than elapsed time: a stopwatch on a
+    // loaded machine cannot tell a wasted walk from a busy CPU, and this can.
+    const gpa = std.testing.allocator;
+    var signer = try keys.Signer.initRandomized(std.testing.io);
+    defer signer.deinit();
+    const kp = try signer.generateKeyPair(std.testing.io);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var store = try openTempStore(&tmp, "author-kind.mdb", &buf);
+    defer store.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The profile first, then everything they have said since.
+    const profile = try event.create(arena, signer, kp, 1_000, 0, &.{}, "{\"name\":\"me\"}", null);
+    _ = try store.ingest(arena, profile, .{});
+    const notes = 500;
+    for (0..notes) |i| {
+        const body = try std.fmt.allocPrint(arena, "note {d}", .{i});
+        const ev = try event.create(arena, signer, kp, 2_000 + @as(i64, @intCast(i)), 1, &.{}, body, null);
+        _ = try store.ingest(arena, ev, .{});
+    }
+
+    var r = try store.query(gpa, .{ .authors = &[_][32]u8{kp.public_key}, .kinds = &[_]u16{0} });
+    defer r.deinit();
+    try std.testing.expectEqual(@as(usize, 1), r.events.len);
+    try std.testing.expectEqualStrings("{\"name\":\"me\"}", r.events[0].content);
+    // One entry: the profile itself. Anything near `notes` means the query
+    // walked the timeline to get here.
+    try std.testing.expectEqual(@as(usize, 1), r.examined);
+}
+
+test "store: a database written before the author+kind index still reads" {
+    // An index that does not exist yet and an author who has written nothing
+    // look identical from a query, so an upgrade that skipped the fill would
+    // not fail: it would open to a blank feed, an empty contact list and a
+    // profile with no name, and every one of those reads as the account rather
+    // than as a bug. This drops the index the way an older build leaves it and
+    // asserts the next open repairs it.
+    const gpa = std.testing.allocator;
+    var signer = try keys.Signer.initRandomized(std.testing.io);
+    defer signer.deinit();
+    const kp = try signer.generateKeyPair(std.testing.io);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = testStorePath(&tmp, "legacy.mdb", &buf);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    {
+        var store = try Store.open(path.ptr, .{});
+        defer store.deinit();
+        const profile = try event.create(arena, signer, kp, 1_000, 0, &.{}, "{\"name\":\"me\"}", null);
+        _ = try store.ingest(arena, profile, .{});
+        for (0..8) |i| {
+            const body = try std.fmt.allocPrint(arena, "note {d}", .{i});
+            const ev = try event.create(arena, signer, kp, 2_000 + @as(i64, @intCast(i)), 1, &.{}, body, null);
+            _ = try store.ingest(arena, ev, .{});
+        }
+
+        // Leave it as a database from before this index existed.
+        var txn: ?*c.MDB_txn = null;
+        try check(c.mdb_txn_begin(store.env, null, 0, &txn));
+        try check(c.mdb_drop(txn, store.idx_author_kind_dbi, 0));
+        try check(c.mdb_txn_commit(txn));
+
+        // The bad path, proven bad: with the index emptied, the same query
+        // this store answers correctly above finds nothing at all.
+        var blind = try store.query(gpa, .{ .authors = &[_][32]u8{kp.public_key}, .kinds = &[_]u16{0} });
+        defer blind.deinit();
+        try std.testing.expectEqual(@as(usize, 0), blind.events.len);
+    }
+
+    var reopened = try Store.open(path.ptr, .{});
+    defer reopened.deinit();
+    var r = try reopened.query(gpa, .{ .authors = &[_][32]u8{kp.public_key}, .kinds = &[_]u16{0} });
+    defer r.deinit();
+    try std.testing.expectEqual(@as(usize, 1), r.events.len);
+    try std.testing.expectEqualStrings("{\"name\":\"me\"}", r.events[0].content);
+
+    var all = try reopened.query(gpa, .{ .authors = &[_][32]u8{kp.public_key}, .kinds = &[_]u16{1} });
+    defer all.deinit();
+    try std.testing.expectEqual(@as(usize, 8), all.events.len);
+}
+
+test "store: authors, kinds and a time window are all applied together" {
+    // The composite index seeks past a 34-byte prefix rather than a 32-byte
+    // one, so an off-by-two there would put the `since`/`until` bounds in the
+    // wrong place and quietly return the wrong window. Nothing else in the
+    // suite asks for authors, kinds and a time range at once.
+    const gpa = std.testing.allocator;
+    var signer = try keys.Signer.initRandomized(std.testing.io);
+    defer signer.deinit();
+    const a = try signer.generateKeyPair(std.testing.io);
+    const b = try signer.generateKeyPair(std.testing.io);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var store = try openTempStore(&tmp, "window.mdb", &buf);
+    defer store.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Both authors write both kinds, once per second from 100 to 109.
+    for (0..10) |i| {
+        const t = 100 + @as(i64, @intCast(i));
+        for ([_]keys.KeyPair{ a, b }) |kp| {
+            for ([_]u16{ 1, 7 }) |kd| {
+                const body = try std.fmt.allocPrint(arena, "k{d} t{d}", .{ kd, t });
+                const ev = try event.create(arena, signer, kp, t, kd, &.{}, body, null);
+                _ = try store.ingest(arena, ev, .{});
+            }
+        }
+    }
+
+    var r = try store.query(gpa, .{
+        .authors = &[_][32]u8{a.public_key},
+        .kinds = &[_]u16{1},
+        .since = 103,
+        .until = 106,
+    });
+    defer r.deinit();
+
+    // One author, one kind, four seconds inclusive: 103, 104, 105, 106.
+    try std.testing.expectEqual(@as(usize, 4), r.events.len);
+    for (r.events) |ev| {
+        try std.testing.expectEqualSlices(u8, &a.public_key, &ev.pubkey);
+        try std.testing.expectEqual(@as(u16, 1), ev.kind);
+        try std.testing.expect(ev.created_at >= 103 and ev.created_at <= 106);
+    }
+    // Newest first, and nothing outside the window was read to get there.
+    try std.testing.expectEqual(@as(i64, 106), r.events[0].created_at);
+    try std.testing.expectEqual(@as(i64, 103), r.events[3].created_at);
+    try std.testing.expectEqual(@as(usize, 4), r.examined);
+}
+
+test "store: the author+kind index stays whole through deletes and replaces" {
+    // The fill triggers on the index not holding one entry per event, so a
+    // write path that maintained the author index but forgot this one would
+    // not fail a query: it would make every open rebuild the whole index, and
+    // on a real store that is a startup pause with nothing to explain it. This
+    // asserts the invariant directly after each kind of write.
+    const gpa = std.testing.allocator;
+    var signer = try keys.Signer.initRandomized(std.testing.io);
+    defer signer.deinit();
+    const kp = try signer.generateKeyPair(std.testing.io);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var store = try openTempStore(&tmp, "whole.mdb", &buf);
+    defer store.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const entries = struct {
+        fn f(s: *Store, dbi: c.MDB_dbi) !usize {
+            var txn: ?*c.MDB_txn = null;
+            try check(c.mdb_txn_begin(s.env, null, @intCast(c.MDB_RDONLY), &txn));
+            defer c.mdb_txn_abort(txn);
+            var st: c.MDB_stat = undefined;
+            try check(c.mdb_stat(txn, dbi, &st));
+            return st.ms_entries;
+        }
+    }.f;
+    // Plain events.
+    for (0..5) |i| {
+        const body = try std.fmt.allocPrint(arena, "note {d}", .{i});
+        const ev = try event.create(arena, signer, kp, 1_000 + @as(i64, @intCast(i)), 1, &.{}, body, null);
+        _ = try store.ingest(arena, ev, .{});
+    }
+    try std.testing.expectEqual(
+        try entries(&store, store.events_dbi),
+        try entries(&store, store.idx_author_kind_dbi),
+    );
+
+    // A replaceable event, then a newer one superseding it.
+    const p1 = try event.create(arena, signer, kp, 2_000, 0, &.{}, "{\"name\":\"one\"}", null);
+    _ = try store.ingest(arena, p1, .{});
+    const p2 = try event.create(arena, signer, kp, 2_001, 0, &.{}, "{\"name\":\"two\"}", null);
+    _ = try store.ingest(arena, p2, .{});
+    try std.testing.expectEqual(
+        try entries(&store, store.events_dbi),
+        try entries(&store, store.idx_author_kind_dbi),
+    );
+
+    // A NIP-09 deletion of one of the notes.
+    const victim = blk: {
+        var r = try store.query(gpa, .{ .authors = &[_][32]u8{kp.public_key}, .kinds = &[_]u16{1}, .limit = 1 });
+        defer r.deinit();
+        break :blk r.events[0].id;
+    };
+    const id_hex = try hex.encode(arena, &victim);
+    const tags = [_]Tag{&[_][]const u8{ "e", id_hex }};
+    const del = try event.create(arena, signer, kp, 3_000, 5, &tags, "", null);
+    _ = try store.ingest(arena, del, .{});
+    try std.testing.expectEqual(
+        try entries(&store, store.events_dbi),
+        try entries(&store, store.idx_author_kind_dbi),
+    );
+
+    // And so a reopen finds nothing to fill: the newest profile is still the
+    // one query returns, and it is the second one.
+    var r = try store.query(gpa, .{ .authors = &[_][32]u8{kp.public_key}, .kinds = &[_]u16{0} });
+    defer r.deinit();
+    try std.testing.expectEqual(@as(usize, 1), r.events.len);
+    try std.testing.expectEqualStrings("{\"name\":\"two\"}", r.events[0].content);
+    try std.testing.expectEqual(@as(usize, 1), r.examined);
 }
