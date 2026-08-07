@@ -173,9 +173,17 @@ The library foundation has shipped: keys, transport, the local-first store and
 the signer protocol. Both apps are downloadable and both keep growing, so what
 comes next lands inside them rather than as new apps.
 
+In spec terms, the library still owes NIP-17 private direct messages, with the
+NIP-59 gift wrap that carries them, and a `search` field on `Filter` for NIP-50.
+Most of what remains is app work on protocol the library already exports:
+reactions, reposts and zap receipts behind notifications, NIP-51 bookmarks and
+mutes, Blossom uploads so a picture can be posted, NIP-57 zaps paid through a
+NIP-47 wallet, and NIP-29 groups. The [NIP support
+page](https://zignostr.com/nips) maps each one to the milestone that lands it.
+
 There are no dates. The [roadmap](https://zignostr.com/roadmap) is an order, and
-it also names what is deliberately not being built, which is the half most
-roadmaps leave out.
+it also names what is deliberately not being built (set-reconciliation sync,
+NIP-77, is on that list), which is the half most roadmaps leave out.
 
 See [`CURRENT_STATE.md`](CURRENT_STATE.md) for exactly what's in progress, the
 [roadmap](https://zignostr.com/roadmap) for the sequence, and the
