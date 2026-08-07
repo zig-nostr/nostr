@@ -161,8 +161,8 @@ one core:
   remote signer (NIP-46 bunker): your key lives in a local daemon, every signing
   request waits for your approval, and the `nsec` never enters a client.
 - **[Plaza](https://github.com/zig-nostr/plaza)**: *shipped.* The flagship: a
-  fast, local-first client where you browse and post within two minutes and the
-  feed renders from disk. A downloadable macOS app.
+  fast, local-first client where you read without an account, post in four
+  clicks, and the feed renders from disk. A downloadable macOS app.
 
 Private messages, zaps and groups land inside Plaza rather than as separate apps.
 A messenger you have to switch to is one you stop using.
