@@ -31,7 +31,8 @@ on the roadmap while groups, messages, media and payments are still landing.
   NIP-46 signer. Your key lives in a local daemon, nothing signs without your
   approval, and the `nsec` never enters a client.
 - **[Plaza](https://github.com/zig-nostr/plaza)** `v0.2.0`: the flagship client.
-  Browse and post within two minutes, with the feed rendered from disk. Reads
+  Read without an account, post in four clicks, with the feed rendered from
+  disk. Reads
   every account you follow, with no cap on how far you can scroll.
 
 Both are downloadable. What comes next lands inside them rather than as new apps.
