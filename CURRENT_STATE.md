@@ -1,187 +1,47 @@
-# Current State
+# Current state
 
-Updated inside every PR that changes it. Never updated locally after merge.
+A snapshot for somebody reading this repo. The
+[roadmap](https://zignostr.com/roadmap) is the plan and the
+[milestones](https://github.com/zig-nostr/plaza/milestones) are the tracker; this
+file only says where things stand today.
 
-## Version
+## The library
 
-`v0.3.8`. Milestones A2 (library core), A3 (transport), A4 (local-first
-event store), and A5 (native Signer) complete. A5's NIP-44 v2 encryption, the
-NIP-46 remote-signing protocol layer, and NIP-42 client authentication landed in
-the library, and the native signer built on them, Notary, ships as a
-downloadable macOS app working end-to-end over public relays. The signer's own
-core — the encrypted key at rest, the serving loop, and the authorization
-policy — now lives in the library too, so a signer is a shell over it rather
-than a fork. Plus a run of fixes to the live relay dialer: macOS
-hostname resolution (#41), a websocket handshake deadlock that stopped a signer
-from receiving requests (#44), a follow-up so the same read fix doesn't fail the
-TLS (`wss://`) handshake (#46), and a receive-path stall that withheld each
-`wss://` request until the next record arrived — the real cause of non-delivery
-over public relays like damus, so a signer now works end-to-end over
-`relay.damus.io` (#48, #49).
+`v0.3.8`. Shipped and covered by tests:
 
-## Active milestone
+- **Core**: secp256k1 keys, BIP-340 Schnorr signatures against the official
+  vectors, the NIP-01 event model, NIP-19/21 encoding, NIP-06 derivation, NIP-49
+  encrypted keys.
+- **Transport**: RFC 6455 WebSocket, a relay connection state machine, a live
+  TCP/TLS dialer, NIP-42 authentication, and the NIP-65 outbox model with no
+  hardcoded relays.
+- **Store**: a memory-mapped LMDB event store with a bounded, newest-first query
+  planner. A 500-note feed query is 0.28 ms at 100,000 stored events, and a
+  profile read is 8 microseconds.
+- **Signing**: NIP-44 v2, and the NIP-46 bunker protocol as both client and
+  server, so a signer is a shell over the library rather than its own
+  implementation.
 
-**A8 — Docs, benchmarks & built-with.** (In progress.) A5 (native Signer,
-shipped as Notary) and A2–A4 are complete; the remaining showcases, A6 (NIP-17
-messenger) and A7 (read-only reader) — are the final milestones, sequenced after
-A8.
+APIs may still change. There is no 1.0 date, and tagging one is deliberately not
+on the roadmap while groups, messages, media and payments are still landing.
 
-## What's done
+## The apps
 
-- Build system: `nostr` module, `zig build test` wired up.
-- CI: Linux + macOS matrix running build/test/fmt.
-- Contributor docs: `AGENTS.md`, `CONTRIBUTING.md`, `SECURITY.md`,
-  `CODEOWNERS`, issue and PR templates.
-- GitHub labels, milestones A1–A8, issues, and public project board.
-- NIP-19 bech32 entity encoding (`npub`/`nsec`/`note` bare,
-  `nprofile`/`nevent`/`naddr`/`nrelay` TLV) + NIP-21 `nostr:` URIs, verified
-  against the official spec vectors (`src/bech32.zig`, `src/nip19.zig`).
-- NIP-49 encrypted private key storage (`ncryptsec`): scrypt +
-  XChaCha20-Poly1305, verified against the official decryption vector
-  (`src/nip49.zig`). Passwords are NFKC-normalized before the KDF (via the
-  pure-Zig `zg` library) for byte-for-byte interop across implementations.
-- NIP-01 event model: `Event` struct, canonical serialization, sha256 id
-  computation, wire JSON encode/decode (`src/hex.zig`, `src/event.zig`),
-  verified against hand-computed sha256 oracle vectors.
-- secp256k1 keys + BIP-340 Schnorr sign/verify (`src/keys.zig`), bound to
-  bitcoin-core/libsecp256k1 (compiled from source, pinned in
-  `build.zig.zon`). Passes the full official BIP-340 test-vector suite
-  (all 19 vectors). This is the credibility-anchor deliverable.
-- Event-level signing (`event.create`/`event.verify`): builds and signs an
-  event from a keypair, and verifies an event by recomputing its canonical
-  id from its own fields (rejecting id/content mismatches) before checking
-  the signature.
-- NIP-06 key derivation (`src/bip39.zig`, `src/nip06.zig`): BIP-39 mnemonic
-  generate/parse/checksum (embedded official English wordlist) and BIP-32
-  HD derivation for `m/44'/1237'/<account>'/0/0`, verified against both
-  official NIP-06 test vectors byte-for-byte.
-- **Tagged `v0.1.0`** — Milestone A2 complete, issue #2 closed.
-- Relay transport (A3): RFC 6455 WebSocket framing + handshake
-  (`src/websocket.zig`), a stream-generic relay connection state machine with
-  NIP-01 subscriptions (`src/relay.zig`), a live TCP/TLS dialer, and the
-  NIP-01 filter/message wire types (`src/filter.zig`, `src/message.zig`).
-- Outbox model (A3): NIP-65 relay lists (`kind:10002`) with read/write
-  routing and zero hardcoded relays (`src/nip65.zig`).
-- Local-first event store (A4): a zero-copy, memory-mapped LMDB store
-  (`src/store.zig`) with a compact binary event record, secondary indexes
-  (author/kind/created_at/tag) and a filter-driven query API, validate-on-
-  insert ingestion with replaceable/parameterized-replaceable upserts and
-  NIP-09 deletion, a direct-message conversation index, local-first
-  reconciliation, a size-cap cache, and a benchmark (`src/bench.zig`).
-- **Tagged `v0.2.0`** — Milestones A3 and A4 complete, issues #3 and #4 closed.
-- Bounded query planning (#33): `query` walks the indexes newest-first via
-  reverse cursors and a k-way merge, stopping at `limit` — a 500-note
-  20-author home feed at 100k stored events dropped from ~26 ms to ~0.28 ms;
-  the multi-author feed shape is covered in `src/bench.zig`.
-- **Tagged `v0.2.1`** — bounded-query performance patch.
-- NIP-44 v2 encryption (`src/nip44.zig`): ChaCha20 + HMAC-SHA256 with
-  HKDF-derived keys over a libsecp256k1 ECDH shared secret, verified against
-  the official NIP-44 test vectors (conversation keys, message keys, padding,
-  and encrypt/decrypt round-trips). Groundwork for the A5 NIP-46 bunker.
-- NIP-46 remote signing (`src/nip46.zig`): the request/response messages and
-  JSON, the kind:24133 NIP-44 envelope (`seal`/`open`), a transport-agnostic
-  `Bunker` dispatcher (connect/sign_event/ping/get_public_key/nip44_encrypt/
-  nip44_decrypt) behind an injectable approval `Policy`, and the `bunker://` /
-  `nostrconnect://` connection URIs (parse + build, percent-decoding, verified
-  against the spec's example token). Relay I/O is left to the app.
-- **Tagged `v0.3.0`** — NIP-44 v2 encryption and the NIP-46 remote-signing
-  protocol layer; the native signer built on it, **Notary**, lives in
-  `zig-nostr/notary`.
-- **Tagged `v0.3.1`** — the live relay dialer resolves hostnames via the
-  system resolver (`getaddrinfo`), fixing a macOS DNS hang (#41).
-- **Tagged `v0.3.2`** — fixed a websocket handshake deadlock in the live relay
-  dialer (`IoStream.read` filled its whole buffer instead of returning a single
-  read), so a running signer now actually receives requests over a relay (#44).
-- **Tagged `v0.3.3`** — follow-up: `IoStream.read` retries past a zero-length
-  read (a TLS record with no application data) instead of reporting EOF, so the
-  read fix no longer fails the `wss://` handshake (#46).
-- **Tagged `v0.3.4`** — `IoStream.read` serves already-buffered bytes and does a
-  single underlying read (`fillMore`) instead of greedily filling via `readVec`,
-  which blocked on the *next* TLS record and stalled `wss://` request delivery.
-  A full NIP-46 round-trip now completes over `relay.damus.io` at sub-second
-  latency; this — not NIP-42 AUTH — was the public-relay delivery gap (#48, #49).
-- **Tagged `v0.3.5`** — NIP-42 client authentication (`src/nip42.zig`): a signer
-  answers a relay's `["AUTH", <challenge>]` with a signed `kind:22242` event and
-  re-subscribes once accepted, so it can serve NIP-46 over relays that require
-  auth. Also fixes the WebSocket `Host` header to carry non-default ports, which
-  relays match against the auth event's `relay` tag. Verified live against a
-  relay requiring NIP-42 (#52).
-- **Tagged `v0.3.6`** — signer support in the library (experimental, pre-1.0):
-  `keystore` for the encrypted key at rest (NIP-49 `ncryptsec` plus a `0600` key
-  file), `signer` with the transport serve loop that answers kind:24133 requests
-  over any relay connection (with NIP-42 auth, proven hermetically), and
-  `nip46.PolicyConfig` for least-privilege method and event-kind allowlists.
-  Notary now consumes these rather than carrying its own copies. Also
-  NFKC-normalizes NIP-49 passwords before the scrypt KDF, as the spec requires,
-  so the same password in a different Unicode form no longer derives a different
-  key (#18, #60).
-- **Tagged `v0.3.7`** — the signer loopback protocol's wire types
-  (`signer_ipc`, experimental, pre-1.0): the request/response bodies a keyholder
-  daemon and its clients exchange over local HTTP (`/pubkey`, `/setup`, `/sign`,
-  and the batched `/nip44/encrypt` + `/nip44/decrypt`), so every product speaks
-  the identical protocol without sharing a server. Deferred from 0.3.6 until an
-  HTTP signer consumed them; the Plaza signer helper now does (#62).
-- **Tagged `v0.3.8`**: the store serves a filter naming both authors and kinds
-  from an index on the pair, instead of the author index. Asking for one
-  account's `kind:0` used to walk back through everything they had posted since
-  they set it: 501 index entries read to return 1, and the cost of reading
-  somebody's name grew with how much they had written. It now reads one entry,
-  7.4us against 392.2us at a hundred thousand events. Existing databases fill
-  the index on open, checked by count so an interrupted fill repairs itself,
-  because an empty index and an author who has written nothing are the same
-  answer to a query. `QueryResult.examined` reports the entries a query read, so
-  the benchmark and the tests can assert on work done rather than on a clock
-  (#66, #67).
+- **[Notary](https://github.com/zig-nostr/notary)** `v0.3.0`: a native macOS
+  NIP-46 signer. Your key lives in a local daemon, nothing signs without your
+  approval, and the `nsec` never enters a client.
+- **[Plaza](https://github.com/zig-nostr/plaza)** `v0.2.0`: the flagship client.
+  Browse and post within two minutes, with the feed rendered from disk. Reads
+  every account you follow, with no cap on how far you can scroll.
 
-## What's in progress
+Both are downloadable. What comes next lands inside them rather than as new apps.
 
-- A8 (Docs, benchmarks & built-with): a public docs/showcase site and
-  consolidated own-numbers benchmarks for what has shipped — the library core,
-  the local-first store, and the native signer (Notary): plus a "built with
-  zig-nostr" page. Decoupled from the not-yet-built messenger/reader showcases;
-  their cross-suite interop matrix and suite-wide `v0.3.0` tag are revisited
-  after A6/A7.
+## What is next
 
-Just completed, A5 (native Signer): **Notary** (`zig-nostr/notary`) is a
-headless daemon plus a native approval GUI, packaged as one macOS `.app` with a
-one-line installer, working end-to-end over public relays (including those that
-require NIP-42 auth), the key never leaving the daemon. Remaining polish
-(notarization) is deferred.
+The ten milestones, in order, are on the
+[roadmap](https://zignostr.com/roadmap). The first is notifications: who acted,
+what they did, and the note it was about, which the current one-line row does not
+say.
 
-## What's next
-
-1. A8: publish the docs/showcase site, own-numbers benchmarks, and the "built
-   with zig-nostr" page.
-2. A6 (final): NIP-17 private messaging (gift-wrapped DMs) on the library and
-   local store, signing via Notary.
-3. A7 (final): read-only outbox client with local-first rendering — see the
-   project board for the full roadmap.
-
-## Known blockers / pending decisions
-
-- None. (The `bitcoin-core/secp256k1` dependency — tag `v0.7.1`, commit
-  `1a53f496` — was approved and is now pinned in `build.zig.zon`.)
-- Note for future randomness-needing APIs: Zig 0.16 removed the
-  `std.crypto.random` global; secure randomness threads an `std.Io` instance
-  through the call (`io.randomSecure(buffer)`), as in `nip49.encrypt` and
-  `keys.Signer.generateKeyPair`/`initRandomized`.
-
-## Package status
-
-| Area | Status |
-|---|---|
-| Repo/CI scaffolding | done |
-| NIP-19/21 encoding | done |
-| NIP-49 encrypted key storage | done |
-| NIP-01 event model | done |
-| secp256k1 keys + BIP-340 sign/verify | done |
-| Event-level sign/verify glue | done |
-| NIP-06 derivation | done |
-| Transport & outbox (NIP-65) | done |
-| Local event store | done |
-| NIP-44 v2 encryption | done |
-| NIP-46 remote signing (protocol + URIs) | done |
-| NIP-42 client authentication | done |
-| Native signer app (Notary) | done, `zig-nostr/notary` |
-| NIP-17/59 messaging (A6) | not started |
-| Read-only reader client (A7) | not started |
+That page also lists what is deliberately **not** being built, and why. Reading
+the second half is the faster way to understand the first.
