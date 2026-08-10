@@ -412,7 +412,7 @@ test "serve rejects a request when the policy denies it" {
     try testing.expect(parsed.value.err.len > 0);
 }
 
-fn denyAllFn(_: ?*anyopaque, _: *const nip46.Request) nip46.Decision {
+fn denyAllFn(_: ?*anyopaque, _: *const nip46.Request, _: [32]u8) nip46.Decision {
     return .reject;
 }
 
