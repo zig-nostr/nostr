@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-11
+
+### Changed
+
+- **Breaking.** A `Policy` is told which client is asking:
+  `decideFn` and `Policy.decide` take the requesting client's pubkey. A policy
+  that cannot see who is asking cannot tell the user either, and an approval
+  prompt that names a method and an event kind but not the requester asks a
+  human to authorize a signature for a stranger with no way to notice. The
+  built-in `PolicyConfig` ignores the new argument; an interactive policy is
+  what needs it.
+
 ## [0.4.0] - 2026-08-10
 
 ### Security

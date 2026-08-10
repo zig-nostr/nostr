@@ -272,14 +272,21 @@ pub const Decision = enum { approve, reject };
 /// `decideFn` (e.g. to reach UI state); it is never dereferenced here.
 pub const Policy = struct {
     ctx: ?*anyopaque = null,
-    decideFn: *const fn (ctx: ?*anyopaque, request: *const Request) Decision,
+    /// `client` is the pubkey of the event that carried the request.
+    ///
+    /// A policy that cannot see who is asking cannot tell the user either, and
+    /// an approval prompt that names a method and an event kind but not the
+    /// requester asks a human to authorize a signature by a stranger with no
+    /// way to notice. The bunker has already established that this client
+    /// connected; the policy is where a decision gets made about it.
+    decideFn: *const fn (ctx: ?*anyopaque, request: *const Request, client: [32]u8) Decision,
 
-    pub fn decide(self: Policy, request: *const Request) Decision {
-        return self.decideFn(self.ctx, request);
+    pub fn decide(self: Policy, request: *const Request, client: [32]u8) Decision {
+        return self.decideFn(self.ctx, request, client);
     }
 };
 
-fn approveAllFn(_: ?*anyopaque, _: *const Request) Decision {
+fn approveAllFn(_: ?*anyopaque, _: *const Request, _: [32]u8) Decision {
     return .approve;
 }
 
@@ -323,7 +330,7 @@ fn policyConfigAlwaysAllowed(method: Method) bool {
     };
 }
 
-fn decidePolicyConfig(ctx: ?*anyopaque, request: *const Request) Decision {
+fn decidePolicyConfig(ctx: ?*anyopaque, request: *const Request, _: [32]u8) Decision {
     const cfg: *const PolicyConfig = @ptrCast(@alignCast(ctx.?));
 
     // Unknown/unsupported method: fail closed. (The bunker rejects these too,
@@ -510,7 +517,7 @@ pub const Bunker = struct {
         if (!openToStrangers(method) and !self.isAuthorized(client))
             return errorResponse(arena, id, "not connected");
 
-        if (self.policy.decide(&request) == .reject)
+        if (self.policy.decide(&request, client) == .reject)
             return errorResponse(arena, id, "request denied");
 
         switch (method) {
@@ -1143,7 +1150,7 @@ test "NIP-46 bunker rejects denied and unknown requests" {
     defer p.deinit();
 
     const reject = struct {
-        fn f(_: ?*anyopaque, _: *const Request) Decision {
+        fn f(_: ?*anyopaque, _: *const Request, _: [32]u8) Decision {
             return .reject;
         }
     }.f;
@@ -1281,11 +1288,11 @@ test "PolicyConfig default approves every supported request" {
     const p = cfg.policy();
 
     const gpk = Request{ .id = "1", .method = "get_public_key", .params = &.{} };
-    try testing.expectEqual(Decision.approve, p.decide(&gpk));
+    try testing.expectEqual(Decision.approve, p.decide(&gpk, [_]u8{0} ** 32));
 
     const tmpl = "{\"kind\":4,\"content\":\"x\",\"tags\":[],\"created_at\":1}";
     const se = Request{ .id = "2", .method = "sign_event", .params = &[_][]const u8{tmpl} };
-    try testing.expectEqual(Decision.approve, p.decide(&se));
+    try testing.expectEqual(Decision.approve, p.decide(&se, [_]u8{0} ** 32));
 }
 
 test "PolicyConfig method allowlist blocks a key-touching method but never connect/ping" {
@@ -1296,17 +1303,17 @@ test "PolicyConfig method allowlist blocks a key-touching method but never conne
     // A sign-only bunker refuses nip44_decrypt so a client can't read the
     // user's DMs through it.
     const dec = Request{ .id = "1", .method = "nip44_decrypt", .params = &[_][]const u8{ "aa", "bb" } };
-    try testing.expectEqual(Decision.reject, p.decide(&dec));
+    try testing.expectEqual(Decision.reject, p.decide(&dec, [_]u8{0} ** 32));
 
     // connect/ping are always allowed even though they're not listed.
     const con = Request{ .id = "2", .method = "connect", .params = &.{} };
-    try testing.expectEqual(Decision.approve, p.decide(&con));
+    try testing.expectEqual(Decision.approve, p.decide(&con, [_]u8{0} ** 32));
     const png = Request{ .id = "3", .method = "ping", .params = &.{} };
-    try testing.expectEqual(Decision.approve, p.decide(&png));
+    try testing.expectEqual(Decision.approve, p.decide(&png, [_]u8{0} ** 32));
 
     // A listed method still passes.
     const gpk = Request{ .id = "4", .method = "get_public_key", .params = &.{} };
-    try testing.expectEqual(Decision.approve, p.decide(&gpk));
+    try testing.expectEqual(Decision.approve, p.decide(&gpk, [_]u8{0} ** 32));
 }
 
 test "PolicyConfig kind allowlist gates sign_event by event kind, failing closed" {
@@ -1316,24 +1323,24 @@ test "PolicyConfig kind allowlist gates sign_event by event kind, failing closed
 
     const note = "{\"kind\":1,\"content\":\"gm\",\"tags\":[],\"created_at\":1}";
     const ok = Request{ .id = "1", .method = "sign_event", .params = &[_][]const u8{note} };
-    try testing.expectEqual(Decision.approve, p.decide(&ok));
+    try testing.expectEqual(Decision.approve, p.decide(&ok, [_]u8{0} ** 32));
 
     const del = "{\"kind\":5,\"content\":\"\",\"tags\":[],\"created_at\":1}";
     const no = Request{ .id = "2", .method = "sign_event", .params = &[_][]const u8{del} };
-    try testing.expectEqual(Decision.reject, p.decide(&no));
+    try testing.expectEqual(Decision.reject, p.decide(&no, [_]u8{0} ** 32));
 
     // Unparseable template → deny.
     const junk = Request{ .id = "3", .method = "sign_event", .params = &[_][]const u8{"not json"} };
-    try testing.expectEqual(Decision.reject, p.decide(&junk));
+    try testing.expectEqual(Decision.reject, p.decide(&junk, [_]u8{0} ** 32));
 
     // A kind restriction doesn't affect non-signing methods.
     const gpk = Request{ .id = "4", .method = "get_public_key", .params = &.{} };
-    try testing.expectEqual(Decision.approve, p.decide(&gpk));
+    try testing.expectEqual(Decision.approve, p.decide(&gpk, [_]u8{0} ** 32));
 }
 
 test "PolicyConfig rejects an unknown method" {
     var cfg = PolicyConfig{ .gpa = testing.allocator };
     const p = cfg.policy();
     const bogus = Request{ .id = "1", .method = "delete_everything", .params = &.{} };
-    try testing.expectEqual(Decision.reject, p.decide(&bogus));
+    try testing.expectEqual(Decision.reject, p.decide(&bogus, [_]u8{0} ** 32));
 }
