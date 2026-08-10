@@ -8,6 +8,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-10
+
+### Security
+
+- A remote signer answers only clients that have connected. The connect secret
+  was checked inside the `connect` branch and nowhere else, and nothing recorded
+  who had passed it, so a client could skip `connect` entirely and send
+  `sign_event` as its first message. A signer's pubkey is published in the
+  `bunker://` token it hands out, in the single-key setup it is the user's own
+  pubkey, and the relays are in that token too, so everything needed to reach a
+  signer is public by design and the secret was doing no work. `Bunker` now
+  keeps the clients that completed a connect and refuses anything key-touching
+  from one it has not heard of. `connect`, `ping` and `get_public_key` stay open
+  (the first is how a client becomes known, the second touches nothing, and the
+  third returns a value already printed in the connection token). `logout`
+  forgets the client. The secret is compared without stopping at the first
+  differing byte.
+
+### Changed
+
+- **Breaking.** `Bunker.handle` takes the requesting client's pubkey and a
+  `*Bunker`, and `signer.serve` takes a `*nip46.Bunker`, because a bunker now
+  keeps the set of connected clients. The serve loop already had the client
+  pubkey in hand and passes it through; callers that drive `Bunker.handle`
+  themselves need to supply the pubkey of the event that carried the request.
+
 ## [0.3.8] - 2026-08-05
 
 ### Changed

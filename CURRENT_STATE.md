@@ -7,7 +7,7 @@ file only says where things stand today.
 
 ## The library
 
-`v0.3.8`. Shipped and covered by tests:
+`v0.4.0`. Shipped and covered by tests:
 
 - **Core**: secp256k1 keys, BIP-340 Schnorr signatures against the official
   vectors, the NIP-01 event model, NIP-19/21 encoding, NIP-06 derivation, NIP-49
