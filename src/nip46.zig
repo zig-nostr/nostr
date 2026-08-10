@@ -381,6 +381,26 @@ const WireTemplate = struct {
 
 /// A NIP-46 remote signer. Holds the libsecp256k1 context and the keys it
 /// operates with, and answers decrypted requests behind an approval `policy`.
+/// Equality that does not stop at the first differing byte.
+///
+/// The connect secret is a bearer token, and an attacker may present a guess as
+/// often as they like. A comparison that returns early tells them how much of
+/// their guess was right. The length is compared openly, which leaks only the
+/// length, as every such comparison does.
+fn secretEql(want: []const u8, got: []const u8) bool {
+    if (want.len != got.len) return false;
+    var diff: u8 = 0;
+    for (want, got) |a, b| diff |= a ^ b;
+    return diff == 0;
+}
+
+/// How many clients a bunker will remember as connected at once.
+///
+/// A person runs a handful: a desktop client, a phone, a web client. The oldest
+/// is dropped when a new one arrives, and a dropped client simply has to
+/// `connect` again, which is a round trip rather than a lockout.
+pub const max_authorized_clients = 16;
+
 pub const Bunker = struct {
     signer: keys.Signer,
     /// The user key used to sign events and perform NIP-44 operations.
@@ -391,20 +411,87 @@ pub const Bunker = struct {
     /// Optional connect secret the client must echo in `connect` params.
     secret: ?[]const u8 = null,
     policy: Policy,
+    /// Clients that have completed `connect`, oldest first.
+    ///
+    /// Without this the connect secret protected nothing. It was checked inside
+    /// the `connect` branch and nowhere else, and nothing recorded who had
+    /// passed it, so a client could skip `connect` entirely and send
+    /// `sign_event` as its first message. That is not a narrow hole: the
+    /// bunker's pubkey is published in the `bunker://` token the user hands
+    /// out, in the single-key setup it IS the user's own pubkey, and the relays
+    /// are in the same token. Everything needed to reach this signer is public
+    /// by design, so who is asking has to be established here.
+    authorized: [max_authorized_clients][32]u8 = undefined,
+    authorized_len: usize = 0,
 
     /// A single-key bunker where the communication and user keys are the same.
     pub fn initSingleKey(signer: keys.Signer, keypair: keys.KeyPair, policy: Policy) Bunker {
         return .{ .signer = signer, .user = keypair, .remote = keypair, .policy = policy };
     }
 
-    /// Answers a decrypted `request`, returning the response to seal back to
-    /// the client. Validation and denied requests become error responses;
-    /// only allocation failures propagate as errors.
+    /// Whether `client` has completed a `connect` with this bunker.
+    pub fn isAuthorized(self: *const Bunker, client: [32]u8) bool {
+        for (self.authorized[0..self.authorized_len]) |known| {
+            if (std.mem.eql(u8, &known, &client)) return true;
+        }
+        return false;
+    }
+
+    /// Records `client` as connected. Idempotent; drops the oldest when full.
+    pub fn authorize(self: *Bunker, client: [32]u8) void {
+        if (self.isAuthorized(client)) return;
+        if (self.authorized_len == self.authorized.len) {
+            std.mem.copyForwards(
+                [32]u8,
+                self.authorized[0 .. self.authorized.len - 1],
+                self.authorized[1..],
+            );
+            self.authorized_len -= 1;
+        }
+        self.authorized[self.authorized_len] = client;
+        self.authorized_len += 1;
+    }
+
+    /// Forgets `client`, so its next request has to connect again.
+    pub fn revoke(self: *Bunker, client: [32]u8) void {
+        for (self.authorized[0..self.authorized_len], 0..) |known, i| {
+            if (!std.mem.eql(u8, &known, &client)) continue;
+            std.mem.copyForwards(
+                [32]u8,
+                self.authorized[i .. self.authorized_len - 1],
+                self.authorized[i + 1 .. self.authorized_len],
+            );
+            self.authorized_len -= 1;
+            return;
+        }
+    }
+
+    /// Whether a method may be answered for a client that has not connected.
+    ///
+    /// `connect` is how a client becomes authorized, `ping` is liveness and
+    /// touches nothing, and `get_public_key` returns a value that is already
+    /// public: it is in the `bunker://` token the user hands out. Everything
+    /// else either uses the key or says what it is willing to do with it, and
+    /// needs a client that got past the secret.
+    fn openToStrangers(method: Method) bool {
+        return switch (method) {
+            .connect, .ping, .get_public_key => true,
+            else => false,
+        };
+    }
+
+    /// Answers a decrypted `request` from `client`, returning the response to
+    /// seal back. Validation, unauthorized and denied requests become error
+    /// responses; only allocation failures propagate as errors.
+    ///
+    /// `client` is the pubkey of the event that carried the request, which is
+    /// the only identity a NIP-46 client has.
     pub fn handle(
-        self: Bunker,
+        self: *Bunker,
         gpa: std.mem.Allocator,
         io: std.Io,
         request: Request,
+        client: [32]u8,
     ) Error!OwnedResponse {
         const arena = try gpa.create(std.heap.ArenaAllocator);
         arena.* = std.heap.ArenaAllocator.init(gpa);
@@ -418,18 +505,29 @@ pub const Bunker = struct {
         const method = Method.fromString(request.method) orelse
             return errorResponse(arena, id, "unsupported method");
 
+        // Who is asking, before what they are asking for. A client that has not
+        // connected is a stranger who read a public pubkey off a public relay.
+        if (!openToStrangers(method) and !self.isAuthorized(client))
+            return errorResponse(arena, id, "not connected");
+
         if (self.policy.decide(&request) == .reject)
             return errorResponse(arena, id, "request denied");
 
         switch (method) {
             .ping => return okResponse(arena, id, try a.dupe(u8, "pong")),
-            .logout => return okResponse(arena, id, try a.dupe(u8, "ack")),
+            .logout => {
+                // Ending a session means ending it: the next request from this
+                // client has to present the secret again.
+                self.revoke(client);
+                return okResponse(arena, id, try a.dupe(u8, "ack"));
+            },
             .connect => {
                 if (self.secret) |want| {
                     const got = if (request.params.len >= 2) request.params[1] else "";
-                    if (!std.mem.eql(u8, want, got))
+                    if (!secretEql(want, got))
                         return errorResponse(arena, id, "invalid secret");
                 }
+                self.authorize(client);
                 return okResponse(arena, id, try a.dupe(u8, "ack"));
             },
             .get_public_key => return okResponse(arena, id, try hex.encode(a, &self.user.public_key)),
@@ -822,7 +920,13 @@ test "NIP-46 open rejects a non-24133 event" {
 /// Runs one full client -> bunker -> client exchange and returns the parsed
 /// response (caller deinits). `bunker` handles the request; the request event
 /// is sealed from the client to the bunker's remote key.
-fn exchange(gpa: std.mem.Allocator, p: *TestParties, bunker: Bunker, req: Request) !ParsedResponse {
+fn connectFirst(gpa: std.mem.Allocator, p: *TestParties, bunker: *Bunker) !void {
+    var resp = try exchange(gpa, p, bunker, .{ .id = "c0", .method = "connect", .params = &.{} });
+    defer resp.deinit();
+    try testing.expectEqualStrings("ack", resp.value.result);
+}
+
+fn exchange(gpa: std.mem.Allocator, p: *TestParties, bunker: *Bunker, req: Request) !ParsedResponse {
     const req_json = try req.toJson(gpa);
     defer gpa.free(req_json);
 
@@ -834,7 +938,7 @@ fn exchange(gpa: std.mem.Allocator, p: *TestParties, bunker: Bunker, req: Reques
     var parsed_req = try parseRequest(gpa, opened);
     defer parsed_req.deinit();
 
-    var resp = try bunker.handle(gpa, testing.io, parsed_req.value);
+    var resp = try bunker.handle(gpa, testing.io, parsed_req.value, req_event.event.pubkey);
     defer resp.deinit();
     const resp_json = try resp.value.toJson(gpa);
     defer gpa.free(resp_json);
@@ -847,17 +951,130 @@ fn exchange(gpa: std.mem.Allocator, p: *TestParties, bunker: Bunker, req: Reques
     return parseResponse(gpa, opened_resp);
 }
 
+test "a client that never connected gets nothing signed" {
+    // The connect secret used to be checked inside the connect branch and
+    // nowhere else, and nothing recorded who had passed it. So a client could
+    // skip connect entirely and send sign_event as its first message, and the
+    // signer would answer. That is not a narrow hole: the bunker's pubkey is
+    // published in the `bunker://` token the user hands out, in the single-key
+    // setup it IS the user's own pubkey, and the relays are in the same token.
+    // Everything needed to reach this signer is public by design.
+    const gpa = testing.allocator;
+    var p = try TestParties.init();
+    defer p.deinit();
+    var bunker = Bunker.initSingleKey(p.signer, p.user, approveAll());
+    bunker.secret = "hunter2";
+
+    const template = "{\"kind\":1,\"content\":\"not yours to sign\",\"tags\":[],\"created_at\":1700000000}";
+    const params = [_][]const u8{template};
+
+    // Straight to sign_event, no connect. This is the whole attack.
+    {
+        var resp = try exchange(gpa, &p, &bunker, .{ .id = "a", .method = "sign_event", .params = &params });
+        defer resp.deinit();
+        try testing.expectEqualStrings("not connected", resp.value.err);
+        try testing.expectEqualStrings("", resp.value.result);
+    }
+    // Decryption is a key operation too, and it is how a private list or a
+    // gift-wrapped message would be read out of the user's account.
+    {
+        const args = [_][]const u8{ "aa" ** 32, "whatever" };
+        var resp = try exchange(gpa, &p, &bunker, .{ .id = "b", .method = "nip44_decrypt", .params = &args });
+        defer resp.deinit();
+        try testing.expectEqualStrings("not connected", resp.value.err);
+    }
+    // A wrong secret does not get you in, and does not leave you half in.
+    {
+        const wrong = [_][]const u8{ "aa" ** 32, "hunter3" };
+        var resp = try exchange(gpa, &p, &bunker, .{ .id = "c", .method = "connect", .params = &wrong });
+        defer resp.deinit();
+        try testing.expectEqualStrings("invalid secret", resp.value.err);
+    }
+    {
+        var resp = try exchange(gpa, &p, &bunker, .{ .id = "d", .method = "sign_event", .params = &params });
+        defer resp.deinit();
+        try testing.expectEqualStrings("not connected", resp.value.err);
+    }
+
+    // The right secret does, and then the same request works. A guard that also
+    // blocks the legitimate client is not a fix.
+    {
+        const right = [_][]const u8{ "aa" ** 32, "hunter2" };
+        var resp = try exchange(gpa, &p, &bunker, .{ .id = "e", .method = "connect", .params = &right });
+        defer resp.deinit();
+        try testing.expectEqualStrings("ack", resp.value.result);
+    }
+    {
+        var resp = try exchange(gpa, &p, &bunker, .{ .id = "f", .method = "sign_event", .params = &params });
+        defer resp.deinit();
+        try testing.expectEqualStrings("", resp.value.err);
+        try testing.expect(resp.value.result.len > 0);
+    }
+
+    // And logout means it: the next request presents the secret again.
+    {
+        var resp = try exchange(gpa, &p, &bunker, .{ .id = "g", .method = "logout", .params = &.{} });
+        defer resp.deinit();
+        try testing.expectEqualStrings("ack", resp.value.result);
+    }
+    {
+        var resp = try exchange(gpa, &p, &bunker, .{ .id = "h", .method = "sign_event", .params = &params });
+        defer resp.deinit();
+        try testing.expectEqualStrings("not connected", resp.value.err);
+    }
+}
+
+test "a bunker remembers several clients and forgets the oldest" {
+    var signer_ctx = keys.Signer.init();
+    defer signer_ctx.deinit();
+    const kp = try signer_ctx.keyPairFromSecretKey([_]u8{0x77} ** 32);
+    var bunker = Bunker.initSingleKey(signer_ctx, kp, approveAll());
+
+    // A person runs a handful of clients at once, so one must not evict another.
+    var first: [32]u8 = undefined;
+    for (0..max_authorized_clients) |i| {
+        var client = [_]u8{0} ** 32;
+        client[0] = @intCast(i + 1);
+        if (i == 0) first = client;
+        bunker.authorize(client);
+        try testing.expect(bunker.isAuthorized(client));
+    }
+    try testing.expect(bunker.isAuthorized(first));
+
+    // Full. The OLDEST goes: a dropped client reconnects, which is one round
+    // trip, where evicting the newest would lock out the client that just
+    // arrived and would loop.
+    const newcomer = [_]u8{0xfe} ** 32;
+    bunker.authorize(newcomer);
+    try testing.expect(bunker.isAuthorized(newcomer));
+    try testing.expect(!bunker.isAuthorized(first));
+    var second = [_]u8{0} ** 32;
+    second[0] = 2;
+    try testing.expect(bunker.isAuthorized(second));
+
+    // Connecting twice is not two entries, or sixteen reconnects would evict
+    // every other client the user has.
+    const before = bunker.authorized_len;
+    bunker.authorize(newcomer);
+    try testing.expectEqual(before, bunker.authorized_len);
+
+    bunker.revoke(newcomer);
+    try testing.expect(!bunker.isAuthorized(newcomer));
+    try testing.expect(bunker.isAuthorized(second));
+}
+
 test "NIP-46 bunker signs an event end to end" {
     const gpa = testing.allocator;
     var p = try TestParties.init();
     defer p.deinit();
-    const bunker = Bunker.initSingleKey(p.signer, p.user, approveAll());
+    var bunker = Bunker.initSingleKey(p.signer, p.user, approveAll());
+    try connectFirst(gpa, &p, &bunker);
 
     const template = "{\"kind\":1,\"content\":\"hello remote\",\"tags\":[],\"created_at\":1700000000}";
     const params = [_][]const u8{template};
     const req = Request{ .id = "sign1", .method = "sign_event", .params = &params };
 
-    var resp = try exchange(gpa, &p, bunker, req);
+    var resp = try exchange(gpa, &p, &bunker, req);
     defer resp.deinit();
 
     try testing.expectEqualStrings("sign1", resp.value.id);
@@ -876,11 +1093,11 @@ test "NIP-46 bunker answers get_public_key and ping" {
     const gpa = testing.allocator;
     var p = try TestParties.init();
     defer p.deinit();
-    const bunker = Bunker.initSingleKey(p.signer, p.user, approveAll());
+    var bunker = Bunker.initSingleKey(p.signer, p.user, approveAll());
 
     {
         const req = Request{ .id = "gp", .method = "get_public_key", .params = &.{} };
-        var resp = try exchange(gpa, &p, bunker, req);
+        var resp = try exchange(gpa, &p, &bunker, req);
         defer resp.deinit();
         const want = try hex.encode(gpa, &p.user.public_key);
         defer gpa.free(want);
@@ -888,7 +1105,7 @@ test "NIP-46 bunker answers get_public_key and ping" {
     }
     {
         const req = Request{ .id = "pg", .method = "ping", .params = &.{} };
-        var resp = try exchange(gpa, &p, bunker, req);
+        var resp = try exchange(gpa, &p, &bunker, req);
         defer resp.deinit();
         try testing.expectEqualStrings("pong", resp.value.result);
     }
@@ -898,7 +1115,8 @@ test "NIP-46 bunker nip44 encrypt then decrypt round trips" {
     const gpa = testing.allocator;
     var p = try TestParties.init();
     defer p.deinit();
-    const bunker = Bunker.initSingleKey(p.signer, p.user, approveAll());
+    var bunker = Bunker.initSingleKey(p.signer, p.user, approveAll());
+    try connectFirst(gpa, &p, &bunker);
 
     // A third party the user is messaging.
     const third = try p.signer.generateKeyPair(testing.io);
@@ -907,14 +1125,14 @@ test "NIP-46 bunker nip44 encrypt then decrypt round trips" {
 
     const enc_params = [_][]const u8{ third_hex, "secret note" };
     const enc_req = Request{ .id = "e", .method = "nip44_encrypt", .params = &enc_params };
-    var enc_resp = try exchange(gpa, &p, bunker, enc_req);
+    var enc_resp = try exchange(gpa, &p, &bunker, enc_req);
     defer enc_resp.deinit();
     try testing.expectEqualStrings("", enc_resp.value.err);
 
     // The user can decrypt its own ciphertext back to the plaintext.
     const dec_params = [_][]const u8{ third_hex, enc_resp.value.result };
     const dec_req = Request{ .id = "d", .method = "nip44_decrypt", .params = &dec_params };
-    var dec_resp = try exchange(gpa, &p, bunker, dec_req);
+    var dec_resp = try exchange(gpa, &p, &bunker, dec_req);
     defer dec_resp.deinit();
     try testing.expectEqualStrings("secret note", dec_resp.value.result);
 }
@@ -929,18 +1147,18 @@ test "NIP-46 bunker rejects denied and unknown requests" {
             return .reject;
         }
     }.f;
-    const bunker = Bunker.initSingleKey(p.signer, p.user, .{ .decideFn = &reject });
+    var bunker = Bunker.initSingleKey(p.signer, p.user, .{ .decideFn = &reject });
 
     const req = Request{ .id = "z", .method = "get_public_key", .params = &.{} };
-    var resp = try exchange(gpa, &p, bunker, req);
+    var resp = try exchange(gpa, &p, &bunker, req);
     defer resp.deinit();
     try testing.expectEqualStrings("request denied", resp.value.err);
     try testing.expectEqualStrings("", resp.value.result);
 
     // Unknown methods are rejected even under an approve-all policy.
-    const open_bunker = Bunker.initSingleKey(p.signer, p.user, approveAll());
+    var open_bunker = Bunker.initSingleKey(p.signer, p.user, approveAll());
     const unknown = Request{ .id = "u", .method = "nip04_encrypt", .params = &.{} };
-    var uresp = try exchange(gpa, &p, open_bunker, unknown);
+    var uresp = try exchange(gpa, &p, &open_bunker, unknown);
     defer uresp.deinit();
     try testing.expectEqualStrings("unsupported method", uresp.value.err);
 }
@@ -959,14 +1177,14 @@ test "NIP-46 connect validates an optional secret" {
     {
         const good = [_][]const u8{ remote_hex, "hunter2" };
         const req = Request{ .id = "c1", .method = "connect", .params = &good };
-        var resp = try exchange(gpa, &p, bunker, req);
+        var resp = try exchange(gpa, &p, &bunker, req);
         defer resp.deinit();
         try testing.expectEqualStrings("ack", resp.value.result);
     }
     {
         const bad = [_][]const u8{ remote_hex, "wrong" };
         const req = Request{ .id = "c2", .method = "connect", .params = &bad };
-        var resp = try exchange(gpa, &p, bunker, req);
+        var resp = try exchange(gpa, &p, &bunker, req);
         defer resp.deinit();
         try testing.expectEqualStrings("invalid secret", resp.value.err);
     }

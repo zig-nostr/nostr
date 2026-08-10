@@ -48,7 +48,7 @@ pub fn serve(
     gpa: std.mem.Allocator,
     io: std.Io,
     conn: anytype,
-    bunker: nip46.Bunker,
+    bunker: *nip46.Bunker,
     remote: keys.KeyPair,
     relay_url: []const u8,
 ) !void {
@@ -147,7 +147,7 @@ fn handleRequest(
     gpa: std.mem.Allocator,
     io: std.Io,
     conn: anytype,
-    bunker: nip46.Bunker,
+    bunker: *nip46.Bunker,
     remote: keys.KeyPair,
     request_event: Event,
 ) !void {
@@ -161,7 +161,7 @@ fn handleRequest(
     const client_hex = try hex.encode(gpa, &request_event.pubkey);
     defer gpa.free(client_hex);
 
-    var response = try bunker.handle(gpa, io, parsed.value);
+    var response = try bunker.handle(gpa, io, parsed.value, request_event.pubkey);
     defer response.deinit();
 
     // Audit line: the request, the client, and the authorization outcome.
@@ -282,8 +282,12 @@ const Harness = struct {
         var conn = relay.Connection(*FakeStream).init(gpa, io, &stream);
         defer conn.deinit();
 
-        const bunker = nip46.Bunker.initSingleKey(self.signer_ctx, self.signer_kp, nip46.approveAll());
-        try serve(gpa, io, &conn, bunker, self.signer_kp, "wss://relay.test");
+        var bunker = nip46.Bunker.initSingleKey(self.signer_ctx, self.signer_kp, nip46.approveAll());
+        // This client has already connected. The connect handshake itself is
+        // covered in nip46.zig; what this loop is being tested for is the
+        // serve path, and a bunker now refuses a client it has never seen.
+        bunker.authorize(self.client_kp.public_key);
+        try serve(gpa, io, &conn, &bunker, self.signer_kp, "wss://relay.test");
 
         // The loop wrote a REQ then an EVENT; find the published EVENT frame and
         // decrypt its content with the client key.
@@ -392,8 +396,8 @@ test "serve rejects a request when the policy denies it" {
     var conn = relay.Connection(*FakeStream).init(gpa, io, &stream);
     defer conn.deinit();
 
-    const bunker = nip46.Bunker.initSingleKey(h.signer_ctx, h.signer_kp, denyAll());
-    try serve(gpa, io, &conn, bunker, h.signer_kp, "wss://relay.test");
+    var bunker = nip46.Bunker.initSingleKey(h.signer_ctx, h.signer_kp, denyAll());
+    try serve(gpa, io, &conn, &bunker, h.signer_kp, "wss://relay.test");
 
     const reply_event_json = try findPublishedEvent(gpa, written.items);
     defer gpa.free(reply_event_json);
@@ -451,8 +455,9 @@ test "serve answers a NIP-42 challenge and keeps serving past auth-required" {
     var conn = relay.Connection(*FakeStream).init(gpa, io, &stream);
     defer conn.deinit();
 
-    const bunker = nip46.Bunker.initSingleKey(h.signer_ctx, h.signer_kp, nip46.approveAll());
-    try serve(gpa, io, &conn, bunker, h.signer_kp, "wss://relay.test");
+    var bunker = nip46.Bunker.initSingleKey(h.signer_ctx, h.signer_kp, nip46.approveAll());
+    bunker.authorize(h.client_kp.public_key);
+    try serve(gpa, io, &conn, &bunker, h.signer_kp, "wss://relay.test");
 
     // Walk the client frames once: it must have written a kind:22242 AUTH reply
     // to the challenge, AND (not aborting on auth-required) a sealed response to
