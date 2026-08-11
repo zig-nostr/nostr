@@ -8,6 +8,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-08-11
+
+### Changed
+
+- A query no longer re-checks the constraints the index it chose has already
+  enforced. Reaching an event through its author's index proves the author
+  matches; reading it because its id was named proves the id does.
+  `Filter.matches` compares against a list one entry at a time, so those checks
+  were a scan of the whole list, per candidate: a feed over a two-thousand-name
+  follow list re-scanned every name for every note it returned, and a client
+  refreshing a feed by naming the ids it already holds paid it squared. Time
+  bounds are still checked, because they cost nothing and they are a check on
+  the index agreeing with the record it points at.
+
+### Added
+
+- `QueryResult.list_checks`: candidates read, times the combined length of the
+  id and author lists still to be checked against each one. Zero for every
+  filter an index can answer, the way `examined` is one for every filter served
+  from an index that suits it. A stopwatch cannot tell a quadratic scan from a
+  busy machine; this can.
+- The benchmark measures the feed shape at the size a follow list actually is.
+  `BENCH_AUTHORS` sizes the store's author spread and the wide feed's follow
+  set together, `BENCH_FEED_LIMIT` sets how far the reader has scrolled, and
+  `BENCH_IDS` sizes the by-id shape. The three original shapes and their
+  defaults are unchanged, so their numbers stay comparable release to release.
+
 ## [0.6.0] - 2026-08-11
 
 ### Security
