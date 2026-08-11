@@ -71,12 +71,20 @@ pub fn serve(
     // lets us recognize the OK for our own auth event.
     var auth_event_id: ?[32]u8 = null;
 
+    // Replay defence, per connection. The `since` above is the relay's to
+    // enforce and a hostile one simply would not, so freshness is checked here
+    // as well.
+    var seen: SeenRequests = .{};
+
     while (true) {
         var msg = (try conn.receive()) orelse break;
         defer msg.deinit();
         switch (msg.value) {
-            .event => |e| handleRequest(gpa, io, conn, bunker, remote, e.event) catch |err| {
-                std.debug.print("signer: dropped a request: {s}\n", .{@errorName(err)});
+            .event => |e| {
+                if (!worthAnswering(io, &seen, e.event)) continue;
+                handleRequest(gpa, io, conn, bunker, remote, e.event) catch |err| {
+                    std.debug.print("signer: dropped a request: {s}\n", .{@errorName(err)});
+                };
             },
             .eose => {},
             .auth => |a| {
@@ -143,6 +151,62 @@ fn authenticate(
 
 /// Decrypts one kind:24133 request event addressed to us, runs it through the
 /// bunker, and publishes the sealed reply back to the event's author.
+/// How far an incoming request's `created_at` may sit from now before the
+/// signer refuses it, in seconds.
+///
+/// NIP-46 requests are interactive: a person is waiting on the other end. Two
+/// minutes is generous for clock skew and still small enough that a captured
+/// request stops working long before anybody could use it.
+pub const max_request_age_s = 120;
+
+/// Ids of requests already answered, so the same sealed event cannot be sent
+/// twice.
+///
+/// kind:24133 is public on the relay, so anyone can subscribe to
+/// `{"kinds":[24133],"#p":[<bunker pubkey>]}` and capture a client's sealed
+/// request verbatim. They cannot read it, but they can re-publish it, and
+/// without this the signer would decrypt and carry it out again. Ephemeral
+/// events are not stored, so no relay deduplicates them on the signer's behalf.
+///
+/// A ring: the oldest is dropped when it is full. The freshness window is what
+/// makes that safe, since an id old enough to be evicted is also old enough to
+/// be refused outright.
+const SeenRequests = struct {
+    /// Two minutes of interactive signing does not come close to this.
+    const capacity = 256;
+
+    ids: [capacity][32]u8 = undefined,
+    len: usize = 0,
+    next: usize = 0,
+
+    /// True if `id` was already handled. Records it otherwise.
+    fn seenOrRecord(self: *SeenRequests, id: [32]u8) bool {
+        for (self.ids[0..self.len]) |known| {
+            if (std.mem.eql(u8, &known, &id)) return true;
+        }
+        self.ids[self.next] = id;
+        self.next = (self.next + 1) % capacity;
+        if (self.len < capacity) self.len += 1;
+        return false;
+    }
+};
+
+/// Whether this request should be carried out at all: recent, and not one we
+/// have already answered.
+///
+/// Deliberately silent. A rejected replay is exactly what an attacker can send
+/// as often as they like, so logging each one would hand them the daemon's
+/// console.
+fn worthAnswering(io: std.Io, seen: *SeenRequests, request_event: Event) bool {
+    const now = std.Io.Timestamp.now(io, .real).toSeconds();
+    const age = if (now > request_event.created_at)
+        now - request_event.created_at
+    else
+        request_event.created_at - now;
+    if (age > max_request_age_s) return false;
+    return !seen.seenOrRecord(request_event.id);
+}
+
 fn handleRequest(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -166,7 +230,17 @@ fn handleRequest(
 
     // Audit line: the request, the client, and the authorization outcome.
     const outcome = if (response.value.err.len == 0) "ok" else response.value.err;
-    std.debug.print("signer: {s} '{s}' from {s}…\n", .{ outcome, parsed.value.method, client_hex[0..16] });
+    // The method NAME, never the method string. What arrived is arbitrary bytes
+    // from a stranger's JSON, and this goes to a terminal: escape sequences in
+    // it can clear the screen, rewrite the title, or forge extra plausible
+    // "signer: ok 'sign_event' from …" lines. This log is the only place a
+    // mis-approval is visible afterwards, so it is not somewhere to print
+    // whatever the attacker sent.
+    const method_label = if (nip46.Method.fromString(parsed.value.method)) |m|
+        m.name()
+    else
+        "<unsupported>";
+    std.debug.print("signer: {s} '{s}' from {s}…\n", .{ outcome, method_label, client_hex[0..16] });
 
     const response_json = try response.value.toJson(gpa);
     defer gpa.free(response_json);
@@ -264,7 +338,7 @@ const Harness = struct {
         // Client seals the request to the signer's pubkey.
         const req_json = try request.toJson(gpa);
         defer gpa.free(req_json);
-        var sealed_req = try nip46.seal(gpa, io, self.client_ctx, self.client_kp, self.signer_kp.public_key, req_json, 1_700_000_000);
+        var sealed_req = try nip46.seal(gpa, io, self.client_ctx, self.client_kp, self.signer_kp.public_key, req_json, std.Io.Timestamp.now(io, .real).toSeconds());
         defer sealed_req.deinit();
         const req_event_json = try event.toJson(gpa, sealed_req.event);
         defer gpa.free(req_event_json);
@@ -380,7 +454,7 @@ test "serve rejects a request when the policy denies it" {
 
     const req_json = try (nip46.Request{ .id = "deny-1", .method = "sign_event", .params = &params }).toJson(gpa);
     defer gpa.free(req_json);
-    var sealed_req = try nip46.seal(gpa, io, h.client_ctx, h.client_kp, h.signer_kp.public_key, req_json, 1_700_000_000);
+    var sealed_req = try nip46.seal(gpa, io, h.client_ctx, h.client_kp, h.signer_kp.public_key, req_json, std.Io.Timestamp.now(io, .real).toSeconds());
     defer sealed_req.deinit();
     const req_event_json = try event.toJson(gpa, sealed_req.event);
     defer gpa.free(req_event_json);
@@ -434,7 +508,7 @@ test "serve answers a NIP-42 challenge and keeps serving past auth-required" {
     const params = [_][]const u8{template};
     const req_json = try (nip46.Request{ .id = "auth-1", .method = "sign_event", .params = &params }).toJson(gpa);
     defer gpa.free(req_json);
-    var sealed_req = try nip46.seal(gpa, io, h.client_ctx, h.client_kp, h.signer_kp.public_key, req_json, 1_700_000_000);
+    var sealed_req = try nip46.seal(gpa, io, h.client_ctx, h.client_kp, h.signer_kp.public_key, req_json, std.Io.Timestamp.now(io, .real).toSeconds());
     defer sealed_req.deinit();
     const req_event_json = try event.toJson(gpa, sealed_req.event);
     defer gpa.free(req_event_json);
@@ -487,4 +561,46 @@ test "serve answers a NIP-42 challenge and keeps serving past auth-required" {
     defer parsed.deinit();
     try testing.expectEqualStrings("auth-1", parsed.value.id);
     try testing.expectEqualStrings("", parsed.value.err);
+}
+
+test "a replayed request is not answered twice, and a stale one is not answered at all" {
+    // kind:24133 is public, so anyone can capture a client's sealed request off
+    // the relay. They cannot read it, but re-publishing it used to make the
+    // signer carry it out again: ephemeral events are not stored, so no relay
+    // deduplicates them, and the signer kept no record.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var seen: SeenRequests = .{};
+    const now = std.Io.Timestamp.now(io, .real).toSeconds();
+
+    const fresh = Event{ .id = [_]u8{0xab} ** 32, .pubkey = [_]u8{1} ** 32, .created_at = now, .kind = nip46.kind, .tags = &.{}, .content = "", .sig = [_]u8{0} ** 64 };
+    try testing.expect(worthAnswering(io, &seen, fresh));
+    // The same sealed event, sent again.
+    try testing.expect(!worthAnswering(io, &seen, fresh));
+
+    // Captured earlier in the session and held: refused on age alone, so it
+    // does not matter whether the id is still in the ring.
+    var stale = fresh;
+    stale.id = [_]u8{0xcd} ** 32;
+    stale.created_at = now - (max_request_age_s + 1);
+    try testing.expect(!worthAnswering(io, &seen, stale));
+
+    // A clock running ahead is refused the same way, in the other direction.
+    var future = fresh;
+    future.id = [_]u8{0xef} ** 32;
+    future.created_at = now + (max_request_age_s + 1);
+    try testing.expect(!worthAnswering(io, &seen, future));
+
+    // Eviction cannot resurrect a request: the ring holds far more than the
+    // freshness window admits, and anything evicted is already too old.
+    for (0..SeenRequests.capacity) |i| {
+        var filler = fresh;
+        filler.id = [_]u8{0} ** 32;
+        filler.id[0] = @intCast(i % 256);
+        filler.id[1] = @intCast(i / 256);
+        _ = worthAnswering(io, &seen, filler);
+    }
+    try testing.expectEqual(SeenRequests.capacity, seen.len);
 }
