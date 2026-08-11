@@ -6,16 +6,27 @@
 //!
 //! It fills a fresh store with `num_events` events spread across a fixed number
 //! of authors, each of whom has a profile buried under everything they have
-//! posted since, times the ingest, then measures three warm query shapes: a
-//! multi-author home feed (`feed_authors` authors, kind 1, 500 notes), one
+//! posted since, times the ingest, then measures five warm query shapes: a
+//! multi-author home feed (`feed_authors` authors, kind 1, 500 notes), the same
+//! feed scoped to a whole follow list rather than a handful of authors, a
+//! refresh of that feed by naming the ids that arrived since the last one, one
 //! author's timeline (500 events, any kind), and one author's profile (kind 0,
 //! one event). It reports the best latency of each, plus how many index entries
-//! the profile fetch read to return its one event.
+//! each read to produce its answer.
 //!
 //! The feed shape is the hottest path of a client and the acceptance metric for
 //! the local-first cache. The profile shape is the one a store of a single kind
 //! cannot measure at all, because there is nothing of the wrong kind to read
 //! past, which is why this fills a mixed store.
+//!
+//! The wide-feed and by-id shapes are the two halves of one decision. A merged
+//! query opens a cursor per author and picks the newest across every live
+//! stream once per returned event, so its cost is set by how many people the
+//! reader follows, not by how many notes come back. A client that re-runs it to
+//! pick up what just arrived pays that in full for a handful of new notes;
+//! naming the ids instead is a direct read each. Twenty authors, the shape this
+//! measured for its first year, is not a follow list, and it made the query
+//! look free at a size nobody has.
 //!
 //! Results print to stderr; the temporary database is removed on exit.
 
@@ -26,9 +37,21 @@ const Store = nostr.store.Store;
 const Event = nostr.event.Event;
 const Filter = nostr.filter.Filter;
 
-const num_authors: u64 = 100;
+/// How many authors the store is spread across. Also the size of the wide-feed
+/// follow set, so that shape reads a store where every author it names has
+/// posted. Overridable with `BENCH_AUTHORS`; the default is what the first
+/// three shapes have always been measured against, so their numbers stay
+/// comparable across releases.
+var num_authors: u64 = 100;
 const feed_authors: usize = 20;
 const feed_limit: u32 = 500;
+/// A screenful, which is what a client re-queries for on a tick, as opposed to
+/// the 500-note backfill the shapes above measure. Overridable with
+/// `BENCH_FEED_LIMIT`, because this is the number a reader raises by scrolling
+/// and the merge pays the whole author set again for every extra note.
+var wide_feed_limit: u32 = 60;
+/// How many notes a client picks up in one tick's worth of arrivals.
+const arrivals: usize = 8;
 const query_reps: usize = 50;
 const db_path = "zig-nostr-bench.mdb";
 
@@ -71,6 +94,17 @@ pub fn main() !void {
     var n: u64 = 20_000;
     if (std.c.getenv("BENCH_N")) |s| {
         n = std.fmt.parseInt(u64, std.mem.span(s), 10) catch n;
+    }
+    if (std.c.getenv("BENCH_AUTHORS")) |s| {
+        num_authors = std.fmt.parseInt(u64, std.mem.span(s), 10) catch num_authors;
+    }
+    // Every author needs their profile plus at least one note for the shapes
+    // below to mean anything, and `makeEvent` gives the first `num_authors`
+    // events to the profiles.
+    if (num_authors == 0) num_authors = 1;
+    if (n < num_authors * 2) n = num_authors * 2;
+    if (std.c.getenv("BENCH_FEED_LIMIT")) |s| {
+        wide_feed_limit = std.fmt.parseInt(u32, std.mem.span(s), 10) catch wide_feed_limit;
     }
 
     // Start from a clean database file (and its lock sidecar).
@@ -121,9 +155,43 @@ pub fn main() !void {
         .limit = 1,
     };
 
+    // The whole follow list, one screenful deep: what a client re-runs to pick
+    // up what arrived a moment ago. Every author named here has posted, so no
+    // stream in the merge dies early and the pick pays for all of them.
+    const follow_pubkeys = try gpa.alloc([32]u8, num_authors);
+    defer gpa.free(follow_pubkeys);
+    for (follow_pubkeys, 0..) |*pk, i| pk.* = authorPubkey(i);
+    const wide_feed = Filter{
+        .authors = follow_pubkeys,
+        .kinds = &[_]u16{1},
+        .limit = wide_feed_limit,
+    };
+
     const feed_best = try bestQuery(gpa, io, &store, feed);
+    const wide_best = try bestQuery(gpa, io, &store, wide_feed);
     const timeline_best = try bestQuery(gpa, io, &store, timeline);
     const profile_best = try bestQuery(gpa, io, &store, profile);
+
+    // The other way to answer the same question: name the ids that arrived and
+    // read each directly. Taken from the top of the wide feed, so these are ids
+    // the store really holds and the shape is a fair comparison.
+    var arrival_ids: [arrivals][32]u8 = undefined;
+    var arrivals_len: usize = 0;
+    {
+        var head = try store.query(gpa, wide_feed);
+        defer head.deinit();
+        for (head.events) |ev| {
+            if (arrivals_len >= arrival_ids.len) break;
+            arrival_ids[arrivals_len] = ev.id;
+            arrivals_len += 1;
+        }
+    }
+    const by_id = Filter{
+        .ids = arrival_ids[0..arrivals_len],
+        .authors = follow_pubkeys,
+        .kinds = &[_]u16{1},
+    };
+    const by_id_best = try bestQuery(gpa, io, &store, by_id);
 
     std.debug.print(
         \\zig-nostr store benchmark
@@ -131,6 +199,8 @@ pub fn main() !void {
         \\  authors            : {d}
         \\  ingest             : {d:.0} events/s ({d:.2} ms total)
         \\  warm feed query    : {d} notes in {d:.1} us (best of {d}; {d} authors, kind 1)
+        \\  wide feed query    : {d} notes in {d:.1} us (best of {d}; {d} authors, kind 1, {d} entries examined)
+        \\  same feed by id    : {d} notes in {d:.1} us (best of {d}; {d} ids named, {d} entries examined)
         \\  warm timeline query: {d} events in {d:.1} us (best of {d}; 1 author, any kind)
         \\  warm profile query : {d} event in {d:.1} us (best of {d}; 1 author, kind 0, {d} entries examined)
         \\
@@ -143,6 +213,16 @@ pub fn main() !void {
         @as(f64, @floatFromInt(feed_best.ns)) / 1e3,
         query_reps,
         feed_authors,
+        wide_best.notes,
+        @as(f64, @floatFromInt(wide_best.ns)) / 1e3,
+        query_reps,
+        num_authors,
+        wide_best.examined,
+        by_id_best.notes,
+        @as(f64, @floatFromInt(by_id_best.ns)) / 1e3,
+        query_reps,
+        arrivals_len,
+        by_id_best.examined,
         timeline_best.notes,
         @as(f64, @floatFromInt(timeline_best.ns)) / 1e3,
         query_reps,
