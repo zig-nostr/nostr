@@ -73,7 +73,7 @@ Methodology and the full write-up are on the
 Add the library to your `build.zig.zon`:
 
 ```sh
-zig fetch --save https://github.com/zig-nostr/nostr/archive/refs/tags/v0.5.0.tar.gz
+zig fetch --save https://github.com/zig-nostr/nostr/archive/refs/tags/v0.7.0.tar.gz
 ```
 
 Wire the module in `build.zig`:
