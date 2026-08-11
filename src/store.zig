@@ -434,7 +434,11 @@ pub const Store = struct {
             var candidates: std.ArrayList([32]u8) = .empty;
             defer candidates.deinit(gpa);
             for (ids) |id| try addCandidate(gpa, &candidates, &seen, id);
-            return self.collectResults(txn, gpa, candidates.items, filter, filter.limit);
+            // Everything else in the filter still has to be checked; the id
+            // list does not, because the candidate set IS the id list.
+            var rest = filter;
+            rest.ids = null;
+            return self.collectResults(txn, gpa, candidates.items, rest, filter.limit);
         }
 
         return self.queryMerged(txn, gpa, filter);
@@ -482,7 +486,19 @@ pub const Store = struct {
             break :blk kinds;
         };
 
+        // What the chosen index has already decided, so the per-candidate check
+        // below does not decide it again. `Filter.matches` compares a pubkey or
+        // an id against the whole list it was given, one at a time, which is
+        // fine for a filter naming three authors and quadratic for one naming
+        // two thousand: a home feed over a real follow list re-scanned the
+        // entire list for every note it returned, having reached that note
+        // through that author's own index.
+        var residual = filter;
+        residual.limit = null;
+
         if (author_kind) |kinds| {
+            residual.authors = null;
+            residual.kinds = null;
             for (filter.authors.?) |a| {
                 for (kinds) |kd| {
                     var prefix: [34]u8 = undefined;
@@ -493,11 +509,13 @@ pub const Store = struct {
                 }
             }
         } else if (filter.authors) |authors| {
+            residual.authors = null;
             for (authors) |a| {
                 const s = try streams.addOne(sa);
                 try revStreamInit(s, txn, self.idx_author_dbi, sa, &a, until_key, since_key);
             }
         } else if (filter.kinds) |kinds| {
+            residual.kinds = null;
             for (kinds) |kd| {
                 var kb: [2]u8 = undefined;
                 std.mem.writeInt(u16, &kb, kd, .big);
@@ -532,6 +550,8 @@ pub const Store = struct {
         defer seen.deinit(gpa);
 
         var examined: usize = 0;
+        var list_checks: usize = 0;
+        const width = listWidth(residual);
         const limit: usize = if (filter.limit) |l| l else std.math.maxInt(usize);
         while (matched.items.len < limit) {
             // Pop the globally newest candidate: largest (time, id) suffix
@@ -558,14 +578,23 @@ pub const Store = struct {
             if (rc == c.MDB_NOTFOUND) continue;
             try check(rc);
             const ev = try decodeEvent(aa, valBytes(v));
-            if (!filter.matches(ev)) continue;
+            // `residual`, not `filter`: whatever the index above guaranteed is
+            // already true of this event. The time bounds stay in, cheap and a
+            // check on the index agreeing with the record it points at.
+            list_checks += width;
+            if (!residual.matches(ev)) continue;
             try matched.append(gpa, ev);
         }
 
         // The merge yields (created_at desc, id desc) — the same order the
         // sort-based path produced — so results are returned as popped.
         const events = try aa.dupe(Event, matched.items);
-        return QueryResult{ .arena = arena, .events = events, .examined = examined };
+        return QueryResult{
+            .arena = arena,
+            .events = events,
+            .examined = examined,
+            .list_checks = list_checks,
+        };
     }
 
     /// Returns the direct-message conversation between pubkeys `a` and `b`
@@ -608,6 +637,8 @@ pub const Store = struct {
 
         var matched: std.ArrayList(Event) = .empty;
         defer matched.deinit(gpa);
+        const width = if (filter) |f| listWidth(f) else 0;
+        var list_checks: usize = 0;
         for (candidate_ids) |id| {
             var k = val(&id);
             var v: c.MDB_val = undefined;
@@ -616,6 +647,7 @@ pub const Store = struct {
             try check(rc);
             const ev = try decodeEvent(aa, valBytes(v));
             if (filter) |f| {
+                list_checks += width;
                 if (!f.matches(ev)) continue;
             }
             try matched.append(gpa, ev);
@@ -626,7 +658,21 @@ pub const Store = struct {
         const count = if (limit) |l| @min(@as(usize, l), matched.items.len) else matched.items.len;
         const events = try aa.dupe(Event, matched.items[0..count]);
         // An explicit id list is its own candidate set: every id named is read.
-        return QueryResult{ .arena = arena, .events = events, .examined = candidate_ids.len };
+        return QueryResult{
+            .arena = arena,
+            .events = events,
+            .examined = candidate_ids.len,
+            .list_checks = list_checks,
+        };
+    }
+
+    /// How many id and author entries `f` still has to be compared against, per
+    /// candidate. See `QueryResult.list_checks`.
+    fn listWidth(f: Filter) usize {
+        var n: usize = 0;
+        if (f.ids) |ids| n += ids.len;
+        if (f.authors) |authors| n += authors.len;
+        return n;
     }
 
     // -- Local-first reconciliation -----------------------------------------
@@ -959,6 +1005,17 @@ pub const QueryResult = struct {
     /// does not match. A wall-clock assertion cannot tell those apart on a busy
     /// machine; this can.
     examined: usize = 0,
+    /// Candidates read, times the combined length of the id and author lists
+    /// still to be checked against each one. `Filter.matches` compares those
+    /// lists entry by entry, so this is the size of the quadratic term in a
+    /// query naming many of either.
+    ///
+    /// It should be zero for every filter an index can answer: reaching an
+    /// event through its author's own index already proves the author matches,
+    /// and reading it because its id was named already proves the id does. A
+    /// non-zero value on a feed-shaped query means the query is re-deciding
+    /// something the index decided, once per author, once per note returned.
+    list_checks: usize = 0,
 
     pub fn deinit(self: *QueryResult) void {
         const gpa = self.arena.child_allocator;
@@ -2263,6 +2320,160 @@ test "store: a profile is found without reading the notes written since" {
     // One entry: the profile itself. Anything near `notes` means the query
     // walked the timeline to get here.
     try std.testing.expectEqual(@as(usize, 1), r.examined);
+}
+
+test "store: a feed does not re-scan the follow list it was answered from" {
+    // The home feed of somebody who follows a lot of people. Every note comes
+    // back through its own author's index, so the author constraint is already
+    // decided by the time the record is read; checking it again means walking
+    // the whole follow list, per note, for an answer that cannot be no.
+    //
+    // Asserted on list entries rather than elapsed time, for the same reason
+    // `examined` is: a stopwatch cannot tell a quadratic scan from a busy
+    // machine, and this can.
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var store = try openTempStore(&tmp, "wide-feed.mdb", &buf);
+    defer store.deinit();
+
+    const follows = 300;
+    var authors: [follows][32]u8 = undefined;
+    for (&authors, 0..) |*a, i| {
+        a.* = [_]u8{0} ** 32;
+        std.mem.writeInt(u64, a[0..8], i, .big);
+        // One note each, so no stream in the merge dies before the pick.
+        var id = [_]u8{0} ** 32;
+        std.mem.writeInt(u64, id[0..8], 1_000 + i, .big);
+        _ = try store.putEvent(gpa, Event{
+            .id = id,
+            .pubkey = a.*,
+            .created_at = @intCast(i),
+            .kind = 1,
+            .tags = &.{},
+            .content = "",
+            .sig = [_]u8{0} ** 64,
+        });
+    }
+
+    var r = try store.query(gpa, .{ .authors = &authors, .kinds = &[_]u16{1}, .limit = 20 });
+    defer r.deinit();
+    try std.testing.expectEqual(@as(usize, 20), r.events.len);
+    try std.testing.expectEqual(@as(usize, 20), r.examined);
+    // Zero, not "small": the composite index proves both the author and the
+    // kind. Twenty notes times three hundred follows is the number this used
+    // to be, and it grows with both.
+    try std.testing.expectEqual(@as(usize, 0), r.list_checks);
+}
+
+test "store: naming ids does not re-scan the ids" {
+    // The other half of the same rule, and the one a client refreshing a feed
+    // it already holds depends on: reading an event because its id was named
+    // already proves the id matches.
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var store = try openTempStore(&tmp, "by-id.mdb", &buf);
+    defer store.deinit();
+
+    const a = [_]u8{0xAA} ** 32;
+    const named = 200;
+    var ids: [named][32]u8 = undefined;
+    for (&ids, 0..) |*id, i| {
+        id.* = [_]u8{0} ** 32;
+        std.mem.writeInt(u64, id[0..8], 500 + i, .big);
+        _ = try store.putEvent(gpa, Event{
+            .id = id.*,
+            .pubkey = a,
+            .created_at = @intCast(i),
+            .kind = 1,
+            .tags = &.{},
+            .content = "",
+            .sig = [_]u8{0} ** 64,
+        });
+    }
+
+    var r = try store.query(gpa, .{ .ids = &ids, .kinds = &[_]u16{1} });
+    defer r.deinit();
+    try std.testing.expectEqual(@as(usize, named), r.events.len);
+    try std.testing.expectEqual(@as(usize, 0), r.list_checks);
+}
+
+test "store: a constraint no index proved is still enforced" {
+    // The control for the two above. Dropping a constraint is only sound when
+    // the index really did decide it, so this drives a shape where it did not:
+    // the author index picks the candidates, and the tag is the only thing that
+    // can reject one. If the residual were emptied wholesale, the note without
+    // the tag comes back too.
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var store = try openTempStore(&tmp, "residual.mdb", &buf);
+    defer store.deinit();
+
+    const mine = [_]u8{0x11} ** 32;
+    const tagged = [_]Tag{&.{ "e", "beef" }};
+    _ = try store.putEvent(gpa, qEvent(1, mine, 1, 100, &tagged));
+    _ = try store.putEvent(gpa, qEvent(2, mine, 1, 200, &[_]Tag{}));
+    _ = try store.putEvent(gpa, qEvent(3, mine, 7, 300, &tagged));
+
+    {
+        var r = try store.query(gpa, .{
+            .authors = &[_][32]u8{mine},
+            .tags = &[_]filter_mod.TagFilter{.{ .letter = 'e', .values = &[_][]const u8{"beef"} }},
+        });
+        defer r.deinit();
+        try std.testing.expectEqual(@as(usize, 2), r.events.len);
+        try std.testing.expectEqual(@as(u8, 3), r.events[0].id[0]);
+        try std.testing.expectEqual(@as(u8, 1), r.events[1].id[0]);
+        // Three candidates off the author index; the untagged one was rejected
+        // by a check the index could not make. No id or author list was walked
+        // to do it, which is what this counts.
+        try std.testing.expectEqual(@as(usize, 3), r.examined);
+        try std.testing.expectEqual(@as(usize, 0), r.list_checks);
+    }
+
+    // And a kind the author index cannot prove, for the same reason.
+    {
+        var r = try store.query(gpa, .{ .authors = &[_][32]u8{mine}, .kinds = &[_]u16{7} });
+        defer r.deinit();
+        try std.testing.expectEqual(@as(usize, 1), r.events.len);
+        try std.testing.expectEqual(@as(u8, 3), r.events[0].id[0]);
+        try std.testing.expectEqual(@as(usize, 0), r.list_checks);
+    }
+}
+
+test "store: an id named by the wrong author is still rejected" {
+    // Naming an id skips the id comparison, not the rest of the filter. A
+    // client asking "these ids, from these authors" is asking a real question
+    // and the second half has to hold.
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var store = try openTempStore(&tmp, "id-author.mdb", &buf);
+    defer store.deinit();
+
+    const mine = [_]u8{0x11} ** 32;
+    const stranger = [_]u8{0x22} ** 32;
+    _ = try store.putEvent(gpa, qEvent(1, mine, 1, 100, &[_]Tag{}));
+    _ = try store.putEvent(gpa, qEvent(2, stranger, 1, 200, &[_]Tag{}));
+    _ = try store.putEvent(gpa, qEvent(3, mine, 7, 300, &[_]Tag{}));
+
+    var r = try store.query(gpa, .{
+        .ids = &[_][32]u8{ [_]u8{1} ** 32, [_]u8{2} ** 32, [_]u8{3} ** 32 },
+        .authors = &[_][32]u8{mine},
+        .kinds = &[_]u16{1},
+    });
+    defer r.deinit();
+    try std.testing.expectEqual(@as(usize, 1), r.events.len);
+    try std.testing.expectEqual(@as(u8, 1), r.events[0].id[0]);
+    // Three candidates, each checked against the one-name author list. The id
+    // list is not in the count.
+    try std.testing.expectEqual(@as(usize, 3), r.list_checks);
 }
 
 test "store: a database written before the author+kind index still reads" {
