@@ -239,6 +239,21 @@ pub fn Connection(comptime Stream: type) type {
                     continue;
                 }
                 // Need more bytes before a full frame is available.
+                //
+                // Bound the RAW buffer too, not only the assembled message. The
+                // cap above is inside the branch where a frame already decoded,
+                // and `decodeFrame` returns null for any frame whose declared
+                // payload has not fully arrived. So a peer that sends a header
+                // declaring a multi-gigabyte payload and then dribbles filler
+                // never completes a frame, never reaches that check, and grows
+                // `recv` by 4 KiB per read until the allocator gives up. The
+                // process holding the key is the one that dies.
+                //
+                // One frame's worth is all this ever legitimately holds: a
+                // completed frame is consumed immediately, and a fragmented
+                // message accumulates in `msg`, which the cap above guards.
+                if (self.recv.items.len > max_message_len + websocket.max_frame_header_len)
+                    return ConnectionError.MessageTooLarge;
                 if (!try self.fill()) return null; // EOF
             }
         }
@@ -1015,4 +1030,37 @@ test "live dialer is semantically analyzed" {
     _ = &Relay.authenticate;
     _ = &Relay.receive;
     _ = &Relay.deinit;
+}
+
+test "a frame that declares a huge payload cannot grow the receive buffer" {
+    // The 1 MiB cap sat inside the branch where a frame had already decoded.
+    // `decodeFrame` returns null while a declared payload is still arriving, so
+    // a peer could announce a multi-gigabyte frame, dribble filler, and never
+    // reach that check. `recv` grew 4 KiB at a time until the allocator gave
+    // up, in the process that holds the key.
+    const allocator = std.testing.allocator;
+
+    var script: std.ArrayList(u8) = .empty;
+    defer script.deinit(allocator);
+    // FIN + text, 64-bit length, declaring 4 GiB.
+    try script.append(allocator, 0x81);
+    try script.append(allocator, 127);
+    var len_be: [8]u8 = undefined;
+    std.mem.writeInt(u64, &len_be, 4 << 30, .big);
+    try script.appendSlice(allocator, &len_be);
+    // Filler that never comes close to the promise: a little over the cap is
+    // enough to prove the buffer stops growing rather than following along.
+    try script.appendSlice(allocator, &[_]u8{'x'} ** 4096);
+    const filler_rounds = (max_message_len / 4096) + 8;
+    for (0..filler_rounds) |_| try script.appendSlice(allocator, &[_]u8{'x'} ** 4096);
+
+    var written: std.ArrayList(u8) = .empty;
+    defer written.deinit(allocator);
+    var stream = FakeStream{ .to_read = script.items, .written = &written, .allocator = allocator };
+    var conn = TestConn.init(allocator, std.testing.io, &stream);
+    defer conn.deinit();
+
+    try std.testing.expectError(ConnectionError.MessageTooLarge, conn.receive());
+    // And it gave up near the cap rather than swallowing the whole script.
+    try std.testing.expect(conn.recv.items.len <= max_message_len + websocket.max_frame_header_len + 4096);
 }

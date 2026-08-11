@@ -64,6 +64,11 @@ pub fn appendClientFrame(
 // Frame decoding.
 // ---------------------------------------------------------------------------
 
+/// The largest a frame header can be: 2 fixed bytes, an 8-byte extended
+/// length, and a 4-byte mask key. Callers bounding their receive buffer need
+/// room for one header on top of the payload they are willing to accept.
+pub const max_frame_header_len = 2 + 8 + 4;
+
 pub const DecodeError = error{
     /// The 64-bit length has its reserved most-significant bit set, which
     /// RFC 6455 forbids.
