@@ -122,6 +122,25 @@ pub fn Connection(comptime Stream: type) type {
         recv: std.ArrayList(u8),
         /// Payload of the in-progress (possibly fragmented) message.
         msg: std.ArrayList(u8),
+        /// Serializes whole frames onto the stream.
+        ///
+        /// A relay connection has two users on two threads the moment anything
+        /// keeps it alive: the one blocked reading it, and whoever sends the
+        /// keepalive. Over TLS, half a record from one and half from the other
+        /// is not an interleaved message, it is a session that cannot be
+        /// decrypted again, so the lock covers building the frame AND flushing
+        /// it all the way to the socket rather than just the append.
+        ///
+        /// Uncontended it is one atomic compare-exchange, which is what it
+        /// costs on the single-threaded path.
+        write_lock: std.Io.Mutex,
+        /// Milliseconds on the awake clock at the last inbound byte, pongs
+        /// included. Zero before the first one.
+        ///
+        /// Atomic because the whole point of it is to be read by a thread that
+        /// is NOT the one blocked on the socket. A thread waiting on a dead peer
+        /// cannot notice anything, least of all that it is waiting.
+        last_rx_ms: std.atomic.Value(i64),
 
         pub fn init(allocator: std.mem.Allocator, io: std.Io, stream: Stream) Self {
             return .{
@@ -130,6 +149,8 @@ pub fn Connection(comptime Stream: type) type {
                 .allocator = allocator,
                 .recv = .empty,
                 .msg = .empty,
+                .write_lock = .init,
+                .last_rx_ms = .init(0),
             };
         }
 
@@ -194,7 +215,30 @@ pub fn Connection(comptime Stream: type) type {
 
         /// Sends a websocket close control frame.
         pub fn close(self: *Self) !void {
-            try self.sendFrame(.close, &.{});
+            try self.sendFrame(self.io, .close, &.{});
+        }
+
+        /// Sends a websocket ping. Safe to call from a thread other than the one
+        /// blocked in `receive`, which is the only way it is useful: `io` is that
+        /// caller's own.
+        ///
+        /// Answering the relay's pings is not a substitute for sending our own,
+        /// and this is the part that is easy to get backwards. A relay's idle
+        /// timer counts what it RECEIVES from us, and a pong we send in reply to
+        /// its ping does not reset it: Amethyst measured exactly that against a
+        /// live relay, an idle connection whose own ping was answered and which
+        /// was closed anyway two minutes later.
+        pub fn ping(self: *Self, io: std.Io) !void {
+            try self.sendFrame(io, .ping, &.{});
+        }
+
+        /// Milliseconds since the last inbound byte, or null before the first
+        /// one has arrived. `io` is the calling thread's.
+        pub fn idleMs(self: *const Self, io: std.Io) ?i64 {
+            const last = self.last_rx_ms.load(.monotonic);
+            if (last == 0) return null;
+            const now = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+            return if (now > last) now - last else 0;
         }
 
         /// Reads the next relay message, transparently answering pings, skipping
@@ -223,7 +267,7 @@ pub fn Connection(comptime Stream: type) type {
                             const n = @min(frame.payload.len, echo.len);
                             @memcpy(echo[0..n], frame.payload[0..n]);
                             self.consume(frame.frame_len);
-                            try self.sendFrame(.pong, echo[0..n]);
+                            try self.sendFrame(self.io, .pong, echo[0..n]);
                         },
                         .pong => self.consume(frame.frame_len),
                         .close => {
@@ -259,16 +303,22 @@ pub fn Connection(comptime Stream: type) type {
         }
 
         fn sendText(self: *Self, text: []const u8) !void {
-            try self.sendFrame(.text, text);
+            try self.sendFrame(self.io, .text, text);
         }
 
-        fn sendFrame(self: *Self, opcode: websocket.Opcode, payload: []const u8) !void {
+        fn sendFrame(self: *Self, io: std.Io, opcode: websocket.Opcode, payload: []const u8) !void {
             var mask: [4]u8 = undefined;
-            self.io.randomSecure(&mask) catch return ConnectionError.RandomFailed;
+            io.randomSecure(&mask) catch return ConnectionError.RandomFailed;
 
             var frame: std.ArrayList(u8) = .empty;
             defer frame.deinit(self.allocator);
             try websocket.appendClientFrame(&frame, self.allocator, opcode, payload, mask);
+
+            // Uncancelable: a half-written frame is a broken stream, and the
+            // only thing to do after being cancelled here would be to finish
+            // anyway.
+            self.write_lock.lockUncancelable(io);
+            defer self.write_lock.unlock(io);
             try self.stream.writeAll(frame.items);
         }
 
@@ -277,6 +327,9 @@ pub fn Connection(comptime Stream: type) type {
             var tmp: [4096]u8 = undefined;
             const n = try self.stream.read(&tmp);
             if (n == 0) return false;
+            // Every inbound byte, not every message: a pong carries no message
+            // and is exactly the evidence a keepalive is looking for.
+            self.last_rx_ms.store(std.Io.Timestamp.now(self.io, .awake).toMilliseconds(), .monotonic);
             try self.recv.appendSlice(self.allocator, tmp[0..n]);
             return true;
         }
@@ -410,6 +463,34 @@ pub const Relay = struct {
     }
     pub fn receive(self: *Relay) !?message.ParsedRelayMessage {
         return self.conn.receive();
+    }
+
+    /// Sends a keepalive ping. See `Connection.ping`; `io` is the calling
+    /// thread's, because the caller is not the thread inside `receive`.
+    pub fn ping(self: *Relay, io: std.Io) !void {
+        return self.conn.ping(io);
+    }
+
+    /// Milliseconds since this connection last had a byte from the relay, or
+    /// null before the first one.
+    pub fn idleMs(self: *const Relay, io: std.Io) ?i64 {
+        return self.conn.idleMs(io);
+    }
+
+    /// Half-closes the socket, so a `receive` blocked on another thread returns
+    /// instead of waiting on a peer that is never going to answer.
+    ///
+    /// Deliberately NOT `deinit`. The reader still owns this `Relay` and has to
+    /// unwind through its own error path; freeing the transport from a second
+    /// thread would pull the buffers out from under a blocked read.
+    ///
+    /// Deliberately not a socket receive timeout either. `SO_RCVTIMEO` makes the
+    /// read return EAGAIN, and this io model treats EAGAIN as a programmer bug
+    /// and panics, so a stalled relay would become a crash. That was tried, in
+    /// the signer, and it passed every test before failing on the first real
+    /// wedged connection.
+    pub fn shutdown(self: *Relay, io: std.Io) void {
+        self.transport.tcp.shutdown(io, .both) catch {};
     }
 
     pub fn deinit(self: *Relay) void {
@@ -1063,4 +1144,99 @@ test "a frame that declares a huge payload cannot grow the receive buffer" {
     try std.testing.expectError(ConnectionError.MessageTooLarge, conn.receive());
     // And it gave up near the cap rather than swallowing the whole script.
     try std.testing.expect(conn.recv.items.len <= max_message_len + websocket.max_frame_header_len + 4096);
+}
+
+/// Builds an unmasked server control frame (as a relay would send).
+fn serverControl(allocator: std.mem.Allocator, opcode: u8, payload: []const u8) ![]u8 {
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(allocator);
+    try list.append(allocator, 0x80 | opcode);
+    std.debug.assert(payload.len <= 125);
+    try list.append(allocator, @intCast(payload.len));
+    try list.appendSlice(allocator, payload);
+    return list.toOwnedSlice(allocator);
+}
+
+test "a pong is not a message, and is still proof the relay is there" {
+    // The keepalive rests entirely on this. A relay with nothing to say answers
+    // a ping with a pong, `receive` correctly returns no message for it, and
+    // something still has to notice that bytes arrived. If the clock only moved
+    // on a parsed message, a healthy but quiet relay would be cut off.
+    const allocator = std.testing.allocator;
+    var written: std.ArrayList(u8) = .empty;
+    defer written.deinit(allocator);
+
+    const pong = try serverControl(allocator, 0xa, &.{});
+    defer allocator.free(pong);
+    const notice = try serverText(allocator, "[\"NOTICE\",\"hi\"]");
+    defer allocator.free(notice);
+    const script = try std.mem.concat(allocator, u8, &.{ pong, notice });
+    defer allocator.free(script);
+
+    var server = FakeStream{ .to_read = script, .written = &written, .allocator = allocator };
+    var conn = TestConn.init(allocator, std.testing.io, &server);
+    defer conn.deinit();
+
+    try std.testing.expectEqual(@as(?i64, null), conn.idleMs(std.testing.io));
+
+    var m = (try conn.receive()).?;
+    defer m.deinit();
+    try std.testing.expectEqualStrings("hi", m.value.notice.message);
+
+    // Both frames arrived in one read, so the only claim available is that the
+    // clock started. That it started at all is the property: it is zero, meaning
+    // "never heard from", until a byte lands.
+    try std.testing.expect(conn.idleMs(std.testing.io) != null);
+    try std.testing.expect(conn.last_rx_ms.load(.monotonic) > 0);
+}
+
+test "an idle clock that has never ticked is not an idle connection" {
+    // Zero is the sentinel for "no byte has ever arrived", and reporting that as
+    // an infinite idle time would have a keepalive kill every connection in the
+    // window between the handshake and the relay's first word.
+    const allocator = std.testing.allocator;
+    var written: std.ArrayList(u8) = .empty;
+    defer written.deinit(allocator);
+    var server = FakeStream{ .to_read = "", .written = &written, .allocator = allocator };
+    var conn = TestConn.init(allocator, std.testing.io, &server);
+    defer conn.deinit();
+    try std.testing.expectEqual(@as(?i64, null), conn.idleMs(std.testing.io));
+}
+
+test "ping writes a masked, empty ping frame" {
+    const allocator = std.testing.allocator;
+    var written: std.ArrayList(u8) = .empty;
+    defer written.deinit(allocator);
+    var server = FakeStream{ .to_read = "", .written = &written, .allocator = allocator };
+    var conn = TestConn.init(allocator, std.testing.io, &server);
+    defer conn.deinit();
+
+    try conn.ping(std.testing.io);
+
+    // FIN set, opcode 0x9, and the mask bit set: RFC 6455 requires every frame
+    // a CLIENT sends to be masked, and relays behind a strict proxy drop the
+    // connection over an unmasked one.
+    try std.testing.expectEqual(@as(usize, 6), written.items.len);
+    try std.testing.expectEqual(@as(u8, 0x89), written.items[0]);
+    try std.testing.expectEqual(@as(u8, 0x80), written.items[1]);
+}
+
+test "answering a ping does not count as hearing from the relay" {
+    // The trap, stated as a test. A relay's idle timer counts what it RECEIVES,
+    // so the pong we send when it pings us does nothing to keep the connection
+    // open on its side, and the pong it sends when WE ping is the only evidence
+    // there is. What this asserts is the client half: our own pong is a write,
+    // and a write must never be mistaken for inbound traffic.
+    const allocator = std.testing.allocator;
+    var written: std.ArrayList(u8) = .empty;
+    defer written.deinit(allocator);
+
+    var server = FakeStream{ .to_read = "", .written = &written, .allocator = allocator };
+    var conn = TestConn.init(allocator, std.testing.io, &server);
+    defer conn.deinit();
+
+    // A pong on the wire, with nothing ever read.
+    try conn.sendFrame(std.testing.io, .pong, &.{});
+    try std.testing.expect(written.items.len > 0);
+    try std.testing.expectEqual(@as(?i64, null), conn.idleMs(std.testing.io));
 }

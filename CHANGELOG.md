@@ -8,6 +8,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-08-11
+
+### Added
+
+- A relay connection can be kept alive, and can be told it is dead.
+  `Relay.ping` sends a websocket ping, `Relay.idleMs` reports how long it has
+  been since the last inbound byte (pongs included, because a pong is the
+  evidence and it is not a message), and `Relay.shutdown` half-closes the
+  socket so a `receive` blocked on another thread returns.
+
+  Answering the relay's pings is not a substitute for sending our own: a
+  relay's idle timer counts what it RECEIVES, so a pong sent in reply to its
+  ping does not reset it. Amethyst measured that against a live relay.
+
+  `shutdown` and not a socket receive timeout, deliberately. `SO_RCVTIMEO`
+  makes the read return EAGAIN, and this io model treats EAGAIN as a
+  programmer bug and panics, so a stalled relay would become a crash. That was
+  tried in the signer and it passed every test before failing on the first
+  real wedged connection.
+
+### Changed
+
+- Writes on a connection are serialized. A connection that is being kept alive
+  has two users on two threads, and over TLS half a record from each is not an
+  interleaved message, it is a session that cannot be decrypted again. The lock
+  covers building a frame and flushing it to the socket; uncontended it is one
+  atomic compare-exchange.
+
 ## [0.7.0] - 2026-08-11
 
 ### Changed
