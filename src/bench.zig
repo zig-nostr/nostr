@@ -50,8 +50,11 @@ const feed_limit: u32 = 500;
 /// `BENCH_FEED_LIMIT`, because this is the number a reader raises by scrolling
 /// and the merge pays the whole author set again for every extra note.
 var wide_feed_limit: u32 = 60;
-/// How many notes a client picks up in one tick's worth of arrivals.
-const arrivals: usize = 8;
+/// How many ids the by-id shape names. Eight is one tick's worth of arrivals;
+/// a client refreshing a feed it already holds names the whole screenful it is
+/// holding as well, so `BENCH_IDS` raises it to that.
+var arrivals: usize = 8;
+const max_arrivals = 8192;
 const query_reps: usize = 50;
 const db_path = "zig-nostr-bench.mdb";
 
@@ -105,6 +108,9 @@ pub fn main() !void {
     if (n < num_authors * 2) n = num_authors * 2;
     if (std.c.getenv("BENCH_FEED_LIMIT")) |s| {
         wide_feed_limit = std.fmt.parseInt(u32, std.mem.span(s), 10) catch wide_feed_limit;
+    }
+    if (std.c.getenv("BENCH_IDS")) |s| {
+        arrivals = @min(std.fmt.parseInt(usize, std.mem.span(s), 10) catch arrivals, max_arrivals);
     }
 
     // Start from a clean database file (and its lock sidecar).
@@ -175,10 +181,15 @@ pub fn main() !void {
     // The other way to answer the same question: name the ids that arrived and
     // read each directly. Taken from the top of the wide feed, so these are ids
     // the store really holds and the shape is a fair comparison.
-    var arrival_ids: [arrivals][32]u8 = undefined;
+    const arrival_ids = try gpa.alloc([32]u8, arrivals);
+    defer gpa.free(arrival_ids);
     var arrivals_len: usize = 0;
     {
-        var head = try store.query(gpa, wide_feed);
+        // Deep enough to name as many ids as were asked for, whatever the wide
+        // feed's own depth is.
+        var head_filter = wide_feed;
+        head_filter.limit = @intCast(@max(wide_feed_limit, arrivals));
+        var head = try store.query(gpa, head_filter);
         defer head.deinit();
         for (head.events) |ev| {
             if (arrivals_len >= arrival_ids.len) break;
