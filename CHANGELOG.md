@@ -8,6 +8,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-11
+
+### Security
+
+- **Behaviour change.** The signer refuses a request that is old or repeated.
+  kind:24133 is public on the relay, so anyone can copy a client's sealed
+  request and re-publish it; ephemeral events are not stored, so no relay
+  deduplicates them, and the signer kept no record of what it had answered.
+  Requests must now be within `signer.max_request_age_s` (120s) of now, and
+  each event id is answered once per connection. The old freshness control was
+  the subscription's `since`, which is the relay's to enforce.
+- The websocket receive buffer is bounded, not only the assembled message. The
+  1 MiB cap was checked only after a frame decoded, and a frame whose payload
+  has not arrived does not decode, so a peer could declare a huge payload,
+  send filler, and grow the buffer until allocation failed.
+- The signer's audit line prints the recognised method name rather than the
+  method string from the request, which is arbitrary bytes going to a terminal
+  and could carry escape sequences that forge plausible log lines.
+
+### Added
+
+- `websocket.max_frame_header_len`, for callers bounding a receive buffer.
+
 ## [0.5.0] - 2026-08-11
 
 ### Changed
