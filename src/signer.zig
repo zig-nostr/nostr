@@ -199,10 +199,18 @@ const SeenRequests = struct {
 /// console.
 fn worthAnswering(io: std.Io, seen: *SeenRequests, request_event: Event) bool {
     const now = std.Io.Timestamp.now(io, .real).toSeconds();
+    // SATURATING, because `created_at` is a number a stranger chose. A request
+    // stamped `minInt(i64)` makes the true difference larger than an i64 holds,
+    // and a plain subtraction wraps it to a NEGATIVE age, which is not greater
+    // than the limit, so the staleness check waves the request through: the one
+    // input that should obviously be refused is the one that gets past. In a
+    // build with overflow checks on it takes the daemon down instead. Saturating
+    // gives the answer both were reaching for, that a timestamp that far away is
+    // as stale as anything can be.
     const age = if (now > request_event.created_at)
-        now - request_event.created_at
+        now -| request_event.created_at
     else
-        request_event.created_at - now;
+        request_event.created_at -| now;
     if (age > max_request_age_s) return false;
     return !seen.seenOrRecord(request_event.id);
 }
@@ -586,6 +594,18 @@ test "a replayed request is not answered twice, and a stale one is not answered 
     stale.id = [_]u8{0xcd} ** 32;
     stale.created_at = now - (max_request_age_s + 1);
     try testing.expect(!worthAnswering(io, &seen, stale));
+
+    // And a timestamp chosen to break the arithmetic rather than to look
+    // plausible. Both ends of i64: the difference from `now` does not fit in an
+    // i64, so a plain subtraction wraps to a negative age and the request is
+    // waved through as fresh. That is the input most obviously worth refusing.
+    var absurd = fresh;
+    absurd.id = [_]u8{0x11} ** 32;
+    absurd.created_at = std.math.minInt(i64);
+    try testing.expect(!worthAnswering(io, &seen, absurd));
+    absurd.id = [_]u8{0x22} ** 32;
+    absurd.created_at = std.math.maxInt(i64);
+    try testing.expect(!worthAnswering(io, &seen, absurd));
 
     // A clock running ahead is refused the same way, in the other direction.
     var future = fresh;

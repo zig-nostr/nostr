@@ -33,7 +33,21 @@ pub const Error = error{
     UnknownWord,
     InvalidChecksum,
     InvalidEntropyLength,
+    PassphraseTooLong,
 } || std.mem.Allocator.Error;
+
+/// The only way `mnemonicToSeed` can fail. Narrower than `Error` on purpose, so
+/// a caller does not have to handle a word-list failure that cannot happen here.
+pub const SeedError = error{PassphraseTooLong};
+
+/// The longest passphrase `mnemonicToSeed` will derive from.
+///
+/// BIP-39 sets no limit. PBKDF2 wants the whole salt as one slice and this
+/// function takes no allocator, so the salt lives on the stack and the stack
+/// needs a size. Anything longer is refused rather than truncated: a truncated
+/// passphrase derives a DIFFERENT key, silently, and the person would find out
+/// when their funds were not where they left them.
+pub const max_passphrase_len = 256;
 
 fn wordIndex(word: []const u8) ?u11 {
     // The wordlist is sorted, so a binary search is correct and avoids a
@@ -140,15 +154,52 @@ pub fn mnemonicToEntropy(allocator: std.mem.Allocator, mnemonic: []const u8) Err
 /// via PBKDF2-HMAC-SHA512 (2048 rounds), independent of whether the
 /// mnemonic's checksum is valid — this matches BIP-39's own seed-derivation
 /// algorithm, which does not re-validate the checksum.
-pub fn mnemonicToSeed(mnemonic: []const u8, passphrase: []const u8) [64]u8 {
-    var salt: [8 + 256]u8 = undefined;
+/// Refuses a passphrase longer than `max_passphrase_len`. It used to ASSERT
+/// that instead, which is a different thing: `std.debug.assert` states an
+/// invariant the caller is trusted to uphold, and it is compiled out of
+/// ReleaseFast along with the slice bounds check behind it. A passphrase is not
+/// an invariant, it is input. Measured on the shipped build before this: a
+/// 300-byte passphrase returned a seed and wrote 44 bytes past a stack buffer
+/// on the way, with no crash and no error; 4096 bytes took the process down
+/// with SIGBUS.
+pub fn mnemonicToSeed(mnemonic: []const u8, passphrase: []const u8) SeedError![64]u8 {
+    if (passphrase.len > max_passphrase_len) return error.PassphraseTooLong;
+
+    var salt: [8 + max_passphrase_len]u8 = undefined;
     @memcpy(salt[0..8], "mnemonic");
-    std.debug.assert(passphrase.len <= 256);
-    @memcpy(salt[8 .. 8 + passphrase.len], passphrase);
+    @memcpy(salt[8..][0..passphrase.len], passphrase);
 
     var seed: [64]u8 = undefined;
     std.crypto.pwhash.pbkdf2(&seed, mnemonic, salt[0 .. 8 + passphrase.len], 2048, std.crypto.auth.hmac.sha2.HmacSha512) catch unreachable;
     return seed;
+}
+
+test "a passphrase longer than the salt is refused, not written past it" {
+    // It used to be an ASSERT, which says "the caller guarantees this" and is
+    // compiled out of ReleaseFast along with the slice bounds check behind it.
+    // A passphrase is input, not an invariant. On the shipped build a 300-byte
+    // passphrase returned a seed and wrote 44 bytes past a 264-byte stack
+    // buffer on the way out; 4096 bytes took the process down with SIGBUS.
+    //
+    // This test is the boundary, both sides of it. It passes in Debug either
+    // way, because Debug is where the assert fired; the case it pins is the
+    // build that ships.
+    var pass: [max_passphrase_len + 64]u8 = undefined;
+    @memset(&pass, 'A');
+    const mnemonic = "abandon abandon abandon";
+
+    // Exactly the limit still works, and the salt is exactly full.
+    _ = try mnemonicToSeed(mnemonic, pass[0..max_passphrase_len]);
+    // One byte over is where the overflow used to start.
+    try std.testing.expectError(error.PassphraseTooLong, mnemonicToSeed(mnemonic, pass[0 .. max_passphrase_len + 1]));
+    try std.testing.expectError(error.PassphraseTooLong, mnemonicToSeed(mnemonic, &pass));
+
+    // And refusing is not the same as truncating: a passphrase that fits still
+    // has to change the seed, or "refuse" would be indistinguishable from
+    // silently dropping the tail, which is the failure this replaces.
+    const with = try mnemonicToSeed(mnemonic, pass[0..max_passphrase_len]);
+    const without = try mnemonicToSeed(mnemonic, pass[0 .. max_passphrase_len - 1]);
+    try std.testing.expect(!std.mem.eql(u8, &with, &without));
 }
 
 test "wordlist is sorted and has 2048 entries" {
