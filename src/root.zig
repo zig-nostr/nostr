@@ -39,4 +39,9 @@ test "module compiles and version is set" {
 
 test {
     std.testing.refAllDecls(@This());
+    // Test-only, so referenced rather than exported: the fuzz targets are not
+    // part of the library's surface, they are the parsers being driven with
+    // input nobody wrote by hand. `zig build test` runs each against its corpus
+    // and a few generated inputs; `zig build test --fuzz` runs them properly.
+    _ = @import("fuzz.zig");
 }

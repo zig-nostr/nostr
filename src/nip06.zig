@@ -68,8 +68,8 @@ pub fn keyFromMnemonic(
     mnemonic: []const u8,
     passphrase: []const u8,
     account: u32,
-) keys.Error!keys.SecretKey {
-    const seed = bip39.mnemonicToSeed(mnemonic, passphrase);
+) (keys.Error || bip39.SeedError)!keys.SecretKey {
+    const seed = try bip39.mnemonicToSeed(mnemonic, passphrase);
     return derivePrivateKey(signer, seed, account);
 }
 
