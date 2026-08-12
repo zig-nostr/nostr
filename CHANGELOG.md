@@ -8,6 +8,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-08-12
+
+### Security
+
+- `bip39.mnemonicToSeed` wrote a passphrase longer than 256 bytes past the end
+  of a 264-byte stack array. The bound was a `std.debug.assert`, which states an
+  invariant the caller is trusted to uphold and is compiled out of ReleaseFast
+  along with the slice bounds check behind it. A passphrase is input, not an
+  invariant. Measured on a ReleaseFast build: 300 bytes returned a seed and
+  corrupted 44 bytes of stack silently, and 4096 bytes ended the process with
+  SIGBUS. It now returns `error.PassphraseTooLong` rather than truncating,
+  because a truncated passphrase derives a different key without saying so.
+- `signer.worthAnswering` computed a NIP-46 request's age with a plain
+  subtraction on a `created_at` chosen by the sender. A request stamped
+  `minInt(i64)` made the difference wider than an `i64`, which wrapped to a
+  negative age, which is not greater than the limit, so the staleness check
+  accepted the one timestamp most obviously worth refusing. Now saturating.
+
+### Added
+
+- `src/fuzz.zig`: eight fuzz targets over the input the library does not get to
+  assume anything about. A websocket frame, a relay message, a relay message
+  inside a plausible envelope, an event and the id computation and filter
+  matching that read one, a NIP-44 payload, a bech32 string, fixed-width hex,
+  and a signature check over arbitrary bytes. They are ordinary tests, so
+  `zig build test` runs them against their corpora with no new job or tool;
+  `zig build test --fuzz` runs them as a fuzzing loop.
+
+### Changed
+
+- **Breaking.** `bip39.mnemonicToSeed` returns `SeedError![64]u8` rather than
+  `[64]u8`, and `nip06.keyFromMnemonic` widens its error set by that one error.
+  `bip39.max_passphrase_len` is public.
+
 ## [0.8.0] - 2026-08-11
 
 ### Added
