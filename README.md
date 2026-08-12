@@ -16,7 +16,7 @@ it like [Notary](https://github.com/zig-nostr/notary), a remote signer that keep
 your key off every client. Full docs, benchmarks, and the ecosystem overview
 live at [zignostr.com](https://zignostr.com).
 
-> **Status: early (`v0.5.0`).** The library core, transport, local-first store
+> **Status: early (`v0.8.0`).** The library core, transport, local-first store
 > and signer protocol have shipped and are covered by tests. Two native apps run
 > on it today. APIs may still change before 1.0.
 
@@ -30,6 +30,10 @@ live at [zignostr.com](https://zignostr.com).
   the store grows.
 - **🧭 Outbox model**: NIP-65 relay lists with read/write routing and zero
   hardcoded relays; events go where they belong.
+- **🔌 Live transport**: RFC 6455 WebSocket over TCP/TLS with NIP-01
+  subscriptions, and a keepalive that separates a connection which has died from
+  one that is merely quiet. A socket that stops answering is noticed rather than
+  believed.
 - **🔒 Encrypted payloads**: NIP-44 v2 authenticated encryption
   (ChaCha20 + HMAC-SHA256), verified against the official vectors.
 - **🛡️ Remote signing**: the NIP-46 "bunker" protocol plus NIP-42 relay auth,
