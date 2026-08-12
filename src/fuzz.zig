@@ -43,16 +43,18 @@ const websocket = @import("websocket.zig");
 // -- The bytes under the bytes ------------------------------------------------
 
 test "fuzz: a websocket frame" {
-    try testing.fuzz({}, fuzzFrame, .{ .corpus = &.{
-        // A tiny unmasked text frame, "hi".
-        &.{ 0x81, 0x02, 'h', 'i' },
-        // 16-bit length prefix claiming more than it carries.
-        &.{ 0x81, 0x7e, 0xff, 0xff, 'x' },
-        // 64-bit length prefix, absurd.
-        &.{ 0x81, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff },
-        // Masked, which a server should never send but the decoder accepts.
-        &.{ 0x81, 0x82, 0x01, 0x02, 0x03, 0x04, 'h', 'i' },
-    } });
+    try testing.fuzz({}, fuzzFrame, .{
+        .corpus = &.{
+            // A tiny unmasked text frame, "hi".
+            &.{ 0x81, 0x02, 'h', 'i' },
+            // 16-bit length prefix claiming more than it carries.
+            &.{ 0x81, 0x7e, 0xff, 0xff, 'x' },
+            // 64-bit length prefix, absurd.
+            &.{ 0x81, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff },
+            // Masked, which a server should never send but the decoder accepts.
+            &.{ 0x81, 0x82, 0x01, 0x02, 0x03, 0x04, 'h', 'i' },
+        },
+    });
 }
 
 /// The length arithmetic every other parser stands on.
