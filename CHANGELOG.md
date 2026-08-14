@@ -8,6 +8,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-08-15
+
+Both entries here are the same bug in two places, and neither is reachable by a
+signer serving a single relay. Together they are what a signer needs before it
+can listen on more than one.
+
+A bunker URL names every relay the signer listens on, and a client publishes its
+request to all of them: NDK builds a relay set from the whole URI and publishes
+to the set. So one intent arrives as the same event id on every relay thread,
+and which relay gets there first is nobody's choice.
+
+### Fixed
+
+- `signer.serve` kept its own record of the requests it had answered, so a
+  signer on several relays kept one record per relay and each thread answered
+  its own copy of the same request: two approval prompts for one question, and
+  two signatures published for one intent. The record is now the caller's and
+  shared across relays, and its lock covers the check and the record together,
+  because a lock around only the write lets two threads both be told an id is
+  new.
+- The clients that had completed `connect` were held per `Bunker`, and a signer
+  on several relays runs a thread per relay with its own bunker (each needs its
+  own secp256k1 context). A client that connected over one relay and whose next
+  request arrived on another was told "not connected". Fixing only the record
+  above made that deterministic rather than intermittent.
+
+### Added
+
+- `nip46.AuthorizedClients`, the connect state as a thing of its own that
+  several bunkers share, with `clear` for ending every session at once. That is
+  what signing out of a signer has to do: a client still holding an
+  authorization granted against a key that is no longer loaded is a session that
+  outlived its account.
+
+### Changed
+
+- **Breaking.** `signer.serve` takes a `*signer.SeenRequests` as its last
+  argument, and `nip46.Bunker.initSingleKey` takes a `*nip46.AuthorizedClients`.
+  Create one of each and pass the same ones to every relay. A signer on a single
+  relay behaves exactly as before.
+
 ## [0.9.0] - 2026-08-12
 
 ### Security
