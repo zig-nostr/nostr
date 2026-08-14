@@ -408,6 +408,86 @@ fn secretEql(want: []const u8, got: []const u8) bool {
 /// `connect` again, which is a round trip rather than a lockout.
 pub const max_authorized_clients = 16;
 
+/// Who has completed `connect`, as a thing of its own that several threads can
+/// share.
+///
+/// It is separate from `Bunker`, and the caller's, because of how a signer on
+/// more than one relay is built. Each relay runs its own thread with its own
+/// `Bunker`, since each needs its own secp256k1 context, and the connect state
+/// has to be the SAME across all of them. Otherwise a client that connected
+/// over one relay and whose next request happens to arrive on another is told
+/// "not connected": everything needed to reach the signer is in the token, so
+/// a client publishes to every relay in it and which one gets there first is
+/// nobody's choice.
+///
+/// Locked, because those threads reach it at the same time. Contention is
+/// near-zero: connects are human-paced and the critical section is a scan of at
+/// most sixteen keys.
+pub const AuthorizedClients = struct {
+    lock: std.atomic.Value(bool) = .init(false),
+    ids: [max_authorized_clients][32]u8 = undefined,
+    len: usize = 0,
+
+    fn acquire(self: *AuthorizedClients) void {
+        while (self.lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {}
+    }
+
+    fn release(self: *AuthorizedClients) void {
+        self.lock.store(false, .release);
+    }
+
+    pub fn isAuthorized(self: *AuthorizedClients, client: [32]u8) bool {
+        self.acquire();
+        defer self.release();
+        for (self.ids[0..self.len]) |known| {
+            if (std.mem.eql(u8, &known, &client)) return true;
+        }
+        return false;
+    }
+
+    /// Records `client` as connected. Idempotent; drops the oldest when full.
+    pub fn authorize(self: *AuthorizedClients, client: [32]u8) void {
+        self.acquire();
+        defer self.release();
+        for (self.ids[0..self.len]) |known| {
+            if (std.mem.eql(u8, &known, &client)) return;
+        }
+        if (self.len == self.ids.len) {
+            std.mem.copyForwards([32]u8, self.ids[0 .. self.ids.len - 1], self.ids[1..]);
+            self.len -= 1;
+        }
+        self.ids[self.len] = client;
+        self.len += 1;
+    }
+
+    /// Forgets `client`, so its next request has to connect again.
+    pub fn revoke(self: *AuthorizedClients, client: [32]u8) void {
+        self.acquire();
+        defer self.release();
+        for (self.ids[0..self.len], 0..) |known, i| {
+            if (!std.mem.eql(u8, &known, &client)) continue;
+            std.mem.copyForwards([32]u8, self.ids[i .. self.len - 1], self.ids[i + 1 .. self.len]);
+            self.len -= 1;
+            return;
+        }
+    }
+
+    /// Forgets everybody. What signing out of a signer has to do: a session that
+    /// outlives the key it was granted against is a client still holding an
+    /// authorization for an account that is no longer here.
+    pub fn clear(self: *AuthorizedClients) void {
+        self.acquire();
+        defer self.release();
+        self.len = 0;
+    }
+
+    pub fn count(self: *AuthorizedClients) usize {
+        self.acquire();
+        defer self.release();
+        return self.len;
+    }
+};
+
 pub const Bunker = struct {
     signer: keys.Signer,
     /// The user key used to sign events and perform NIP-44 operations.
@@ -418,7 +498,8 @@ pub const Bunker = struct {
     /// Optional connect secret the client must echo in `connect` params.
     secret: ?[]const u8 = null,
     policy: Policy,
-    /// Clients that have completed `connect`, oldest first.
+    /// Clients that have completed `connect`. Borrowed, not owned: see
+    /// `AuthorizedClients` for why it is shared rather than held here.
     ///
     /// Without this the connect secret protected nothing. It was checked inside
     /// the `connect` branch and nowhere else, and nothing recorded who had
@@ -428,49 +509,31 @@ pub const Bunker = struct {
     /// out, in the single-key setup it IS the user's own pubkey, and the relays
     /// are in the same token. Everything needed to reach this signer is public
     /// by design, so who is asking has to be established here.
-    authorized: [max_authorized_clients][32]u8 = undefined,
-    authorized_len: usize = 0,
+    clients: *AuthorizedClients,
 
     /// A single-key bunker where the communication and user keys are the same.
-    pub fn initSingleKey(signer: keys.Signer, keypair: keys.KeyPair, policy: Policy) Bunker {
-        return .{ .signer = signer, .user = keypair, .remote = keypair, .policy = policy };
+    pub fn initSingleKey(
+        signer: keys.Signer,
+        keypair: keys.KeyPair,
+        policy: Policy,
+        clients: *AuthorizedClients,
+    ) Bunker {
+        return .{ .signer = signer, .user = keypair, .remote = keypair, .policy = policy, .clients = clients };
     }
 
     /// Whether `client` has completed a `connect` with this bunker.
     pub fn isAuthorized(self: *const Bunker, client: [32]u8) bool {
-        for (self.authorized[0..self.authorized_len]) |known| {
-            if (std.mem.eql(u8, &known, &client)) return true;
-        }
-        return false;
+        return self.clients.isAuthorized(client);
     }
 
     /// Records `client` as connected. Idempotent; drops the oldest when full.
     pub fn authorize(self: *Bunker, client: [32]u8) void {
-        if (self.isAuthorized(client)) return;
-        if (self.authorized_len == self.authorized.len) {
-            std.mem.copyForwards(
-                [32]u8,
-                self.authorized[0 .. self.authorized.len - 1],
-                self.authorized[1..],
-            );
-            self.authorized_len -= 1;
-        }
-        self.authorized[self.authorized_len] = client;
-        self.authorized_len += 1;
+        self.clients.authorize(client);
     }
 
     /// Forgets `client`, so its next request has to connect again.
     pub fn revoke(self: *Bunker, client: [32]u8) void {
-        for (self.authorized[0..self.authorized_len], 0..) |known, i| {
-            if (!std.mem.eql(u8, &known, &client)) continue;
-            std.mem.copyForwards(
-                [32]u8,
-                self.authorized[i .. self.authorized_len - 1],
-                self.authorized[i + 1 .. self.authorized_len],
-            );
-            self.authorized_len -= 1;
-            return;
-        }
+        self.clients.revoke(client);
     }
 
     /// Whether a method may be answered for a client that has not connected.
@@ -969,7 +1032,8 @@ test "a client that never connected gets nothing signed" {
     const gpa = testing.allocator;
     var p = try TestParties.init();
     defer p.deinit();
-    var bunker = Bunker.initSingleKey(p.signer, p.user, approveAll());
+    var bunker_clients: AuthorizedClients = .{};
+    var bunker = Bunker.initSingleKey(p.signer, p.user, approveAll(), &bunker_clients);
     bunker.secret = "hunter2";
 
     const template = "{\"kind\":1,\"content\":\"not yours to sign\",\"tags\":[],\"created_at\":1700000000}";
@@ -1035,7 +1099,8 @@ test "a bunker remembers several clients and forgets the oldest" {
     var signer_ctx = keys.Signer.init();
     defer signer_ctx.deinit();
     const kp = try signer_ctx.keyPairFromSecretKey([_]u8{0x77} ** 32);
-    var bunker = Bunker.initSingleKey(signer_ctx, kp, approveAll());
+    var bunker_clients: AuthorizedClients = .{};
+    var bunker = Bunker.initSingleKey(signer_ctx, kp, approveAll(), &bunker_clients);
 
     // A person runs a handful of clients at once, so one must not evict another.
     var first: [32]u8 = undefined;
@@ -1061,9 +1126,9 @@ test "a bunker remembers several clients and forgets the oldest" {
 
     // Connecting twice is not two entries, or sixteen reconnects would evict
     // every other client the user has.
-    const before = bunker.authorized_len;
+    const before = bunker.clients.count();
     bunker.authorize(newcomer);
-    try testing.expectEqual(before, bunker.authorized_len);
+    try testing.expectEqual(before, bunker.clients.count());
 
     bunker.revoke(newcomer);
     try testing.expect(!bunker.isAuthorized(newcomer));
@@ -1074,7 +1139,8 @@ test "NIP-46 bunker signs an event end to end" {
     const gpa = testing.allocator;
     var p = try TestParties.init();
     defer p.deinit();
-    var bunker = Bunker.initSingleKey(p.signer, p.user, approveAll());
+    var bunker_clients: AuthorizedClients = .{};
+    var bunker = Bunker.initSingleKey(p.signer, p.user, approveAll(), &bunker_clients);
     try connectFirst(gpa, &p, &bunker);
 
     const template = "{\"kind\":1,\"content\":\"hello remote\",\"tags\":[],\"created_at\":1700000000}";
@@ -1100,7 +1166,8 @@ test "NIP-46 bunker answers get_public_key and ping" {
     const gpa = testing.allocator;
     var p = try TestParties.init();
     defer p.deinit();
-    var bunker = Bunker.initSingleKey(p.signer, p.user, approveAll());
+    var bunker_clients: AuthorizedClients = .{};
+    var bunker = Bunker.initSingleKey(p.signer, p.user, approveAll(), &bunker_clients);
 
     {
         const req = Request{ .id = "gp", .method = "get_public_key", .params = &.{} };
@@ -1122,7 +1189,8 @@ test "NIP-46 bunker nip44 encrypt then decrypt round trips" {
     const gpa = testing.allocator;
     var p = try TestParties.init();
     defer p.deinit();
-    var bunker = Bunker.initSingleKey(p.signer, p.user, approveAll());
+    var bunker_clients: AuthorizedClients = .{};
+    var bunker = Bunker.initSingleKey(p.signer, p.user, approveAll(), &bunker_clients);
     try connectFirst(gpa, &p, &bunker);
 
     // A third party the user is messaging.
@@ -1154,7 +1222,8 @@ test "NIP-46 bunker rejects denied and unknown requests" {
             return .reject;
         }
     }.f;
-    var bunker = Bunker.initSingleKey(p.signer, p.user, .{ .decideFn = &reject });
+    var bunker_clients: AuthorizedClients = .{};
+    var bunker = Bunker.initSingleKey(p.signer, p.user, .{ .decideFn = &reject }, &bunker_clients);
 
     const req = Request{ .id = "z", .method = "get_public_key", .params = &.{} };
     var resp = try exchange(gpa, &p, &bunker, req);
@@ -1163,7 +1232,8 @@ test "NIP-46 bunker rejects denied and unknown requests" {
     try testing.expectEqualStrings("", resp.value.result);
 
     // Unknown methods are rejected even under an approve-all policy.
-    var open_bunker = Bunker.initSingleKey(p.signer, p.user, approveAll());
+    var open_bunker_clients: AuthorizedClients = .{};
+    var open_bunker = Bunker.initSingleKey(p.signer, p.user, approveAll(), &open_bunker_clients);
     const unknown = Request{ .id = "u", .method = "nip04_encrypt", .params = &.{} };
     var uresp = try exchange(gpa, &p, &open_bunker, unknown);
     defer uresp.deinit();
@@ -1175,7 +1245,9 @@ test "NIP-46 connect validates an optional secret" {
     var p = try TestParties.init();
     defer p.deinit();
 
-    var bunker = Bunker.initSingleKey(p.signer, p.user, approveAll());
+    var bunker_clients: AuthorizedClients = .{};
+
+    var bunker = Bunker.initSingleKey(p.signer, p.user, approveAll(), &bunker_clients);
     bunker.secret = "hunter2";
 
     const remote_hex = try hex.encode(gpa, &p.user.public_key);
@@ -1343,4 +1415,90 @@ test "PolicyConfig rejects an unknown method" {
     const p = cfg.policy();
     const bogus = Request{ .id = "1", .method = "delete_everything", .params = &.{} };
     try testing.expectEqual(Decision.reject, p.decide(&bogus, [_]u8{0} ** 32));
+}
+
+test "a client that connected on one relay is known on the others" {
+    // What a signer on more than one relay is. Each relay runs its own thread
+    // with its own Bunker, because each needs its own secp256k1 context, and
+    // they share one record of who has connected.
+    //
+    // Without the sharing, a client that connects over one relay and whose next
+    // request happens to arrive on another is told "not connected". Which relay
+    // gets there first is nobody's choice: everything needed to reach the signer
+    // is in the token, so a client publishes to every relay in it.
+    var p = try TestParties.init();
+    defer p.deinit();
+
+    var shared: AuthorizedClients = .{};
+    var relay_a = Bunker.initSingleKey(p.signer, p.user, approveAll(), &shared);
+    var relay_b = Bunker.initSingleKey(p.signer, p.user, approveAll(), &shared);
+
+    const client = [_]u8{0x31} ** 32;
+    try testing.expect(!relay_a.isAuthorized(client));
+    try testing.expect(!relay_b.isAuthorized(client));
+
+    // Connects over A.
+    relay_a.authorize(client);
+    try testing.expect(relay_a.isAuthorized(client));
+    // And is known on B, which is the whole point.
+    try testing.expect(relay_b.isAuthorized(client));
+
+    // Signing out on one relay signs out on all of them, for the same reason:
+    // a session that survives on another relay is a revocation that did not
+    // revoke anything.
+    relay_b.revoke(client);
+    try testing.expect(!relay_a.isAuthorized(client));
+    try testing.expect(!relay_b.isAuthorized(client));
+}
+
+test "clearing the set ends every session, on every relay" {
+    // What signing out of the signer itself has to do. A client still holding an
+    // authorization granted against a key that is no longer loaded is a session
+    // outliving the account it belonged to.
+    var shared: AuthorizedClients = .{};
+    for (0..4) |i| {
+        var id = [_]u8{0} ** 32;
+        id[0] = @intCast(i);
+        shared.authorize(id);
+    }
+    try testing.expectEqual(@as(usize, 4), shared.count());
+
+    shared.clear();
+    try testing.expectEqual(@as(usize, 0), shared.count());
+    for (0..4) |i| {
+        var id = [_]u8{0} ** 32;
+        id[0] = @intCast(i);
+        try testing.expect(!shared.isAuthorized(id));
+    }
+}
+
+test "two relay threads authorizing at once do not lose a client" {
+    // The set is reached from every relay thread. `authorize` scans for a
+    // duplicate and then appends, and without the lock covering both, two
+    // threads can pass the scan and write the same slot, or write past it.
+    const rounds = 200;
+    const racers = 4;
+
+    for (0..rounds) |round| {
+        var shared: AuthorizedClients = .{};
+        var gate = std.atomic.Value(bool).init(false);
+
+        const Racer = struct {
+            fn run(set: *AuthorizedClients, key: [32]u8, g: *std.atomic.Value(bool)) void {
+                while (!g.load(.acquire)) {}
+                set.authorize(key);
+            }
+        };
+
+        var id = [_]u8{0} ** 32;
+        id[0] = @intCast(round % 256);
+        var threads: [racers]std.Thread = undefined;
+        for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Racer.run, .{ &shared, id, &gate });
+        gate.store(true, .release);
+        for (threads) |t| t.join();
+
+        // One client connected, however many threads said so.
+        try testing.expectEqual(@as(usize, 1), shared.count());
+        try testing.expect(shared.isAuthorized(id));
+    }
 }
