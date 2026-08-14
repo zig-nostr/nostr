@@ -394,7 +394,9 @@ const Harness = struct {
         var conn = relay.Connection(*FakeStream).init(gpa, io, &stream);
         defer conn.deinit();
 
-        var bunker = nip46.Bunker.initSingleKey(self.signer_ctx, self.signer_kp, nip46.approveAll());
+        var bunker_clients: nip46.AuthorizedClients = .{};
+
+        var bunker = nip46.Bunker.initSingleKey(self.signer_ctx, self.signer_kp, nip46.approveAll(), &bunker_clients);
         // This client has already connected. The connect handshake itself is
         // covered in nip46.zig; what this loop is being tested for is the
         // serve path, and a bunker now refuses a client it has never seen.
@@ -509,7 +511,9 @@ test "serve rejects a request when the policy denies it" {
     var conn = relay.Connection(*FakeStream).init(gpa, io, &stream);
     defer conn.deinit();
 
-    var bunker = nip46.Bunker.initSingleKey(h.signer_ctx, h.signer_kp, denyAll());
+    var bunker_clients: nip46.AuthorizedClients = .{};
+
+    var bunker = nip46.Bunker.initSingleKey(h.signer_ctx, h.signer_kp, denyAll(), &bunker_clients);
     var seen: SeenRequests = .{};
     try serve(gpa, io, &conn, &bunker, h.signer_kp, "wss://relay.test", &seen);
 
@@ -569,7 +573,9 @@ test "serve answers a NIP-42 challenge and keeps serving past auth-required" {
     var conn = relay.Connection(*FakeStream).init(gpa, io, &stream);
     defer conn.deinit();
 
-    var bunker = nip46.Bunker.initSingleKey(h.signer_ctx, h.signer_kp, nip46.approveAll());
+    var bunker_clients: nip46.AuthorizedClients = .{};
+
+    var bunker = nip46.Bunker.initSingleKey(h.signer_ctx, h.signer_kp, nip46.approveAll(), &bunker_clients);
     bunker.authorize(h.client_kp.public_key);
     var seen: SeenRequests = .{};
     try serve(gpa, io, &conn, &bunker, h.signer_kp, "wss://relay.test", &seen);
