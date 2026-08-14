@@ -51,6 +51,7 @@ pub fn serve(
     bunker: *nip46.Bunker,
     remote: keys.KeyPair,
     relay_url: []const u8,
+    seen: *SeenRequests,
 ) !void {
     const my_pubkey_hex = try hex.encode(gpa, &remote.public_key);
     defer gpa.free(my_pubkey_hex);
@@ -71,17 +72,17 @@ pub fn serve(
     // lets us recognize the OK for our own auth event.
     var auth_event_id: ?[32]u8 = null;
 
-    // Replay defence, per connection. The `since` above is the relay's to
-    // enforce and a hostile one simply would not, so freshness is checked here
-    // as well.
-    var seen: SeenRequests = .{};
+    // Replay defence lives in `seen`, which is the CALLER'S and is shared across
+    // every relay this signer serves. See `SeenRequests`. The `since` above is
+    // the relay's to enforce and a hostile one simply would not, so freshness is
+    // checked here as well.
 
     while (true) {
         var msg = (try conn.receive()) orelse break;
         defer msg.deinit();
         switch (msg.value) {
             .event => |e| {
-                if (!worthAnswering(io, &seen, e.event)) continue;
+                if (!worthAnswering(io, seen, e.event)) continue;
                 handleRequest(gpa, io, conn, bunker, remote, e.event) catch |err| {
                     std.debug.print("signer: dropped a request: {s}\n", .{@errorName(err)});
                 };
@@ -159,28 +160,57 @@ fn authenticate(
 /// request stops working long before anybody could use it.
 pub const max_request_age_s = 120;
 
-/// Ids of requests already answered, so the same sealed event cannot be sent
-/// twice.
+/// Ids of requests already answered, so the same sealed event cannot be carried
+/// out twice. ONE of these covers every relay a signer serves.
 ///
-/// kind:24133 is public on the relay, so anyone can subscribe to
+/// Two different things arrive here, and they look identical on the wire.
+///
+/// A REPLAY. kind:24133 is public on the relay, so anyone can subscribe to
 /// `{"kinds":[24133],"#p":[<bunker pubkey>]}` and capture a client's sealed
 /// request verbatim. They cannot read it, but they can re-publish it, and
 /// without this the signer would decrypt and carry it out again. Ephemeral
 /// events are not stored, so no relay deduplicates them on the signer's behalf.
 ///
+/// And the ORDINARY CASE on more than one relay. A bunker URL carries every
+/// relay the signer listens on, and a client publishes its request to all of
+/// them: NDK builds a relay set from the whole URI and calls
+/// `event.publish(relaySet)`. So one intent arrives as the same event id on
+/// every relay thread. When this record belonged to one connection, each thread
+/// answered its own copy, which is two approval prompts for one question and two
+/// signatures for one intent. That is why it is the caller's to own and to share,
+/// and why it takes a lock.
+///
+/// The lock is a spin, because contention is near zero: requests are
+/// human-paced, and the critical section is a scan of at most 256 ids.
+///
 /// A ring: the oldest is dropped when it is full. The freshness window is what
 /// makes that safe, since an id old enough to be evicted is also old enough to
 /// be refused outright.
-const SeenRequests = struct {
+pub const SeenRequests = struct {
     /// Two minutes of interactive signing does not come close to this.
     const capacity = 256;
 
+    lock: std.atomic.Value(bool) = .init(false),
     ids: [capacity][32]u8 = undefined,
     len: usize = 0,
     next: usize = 0,
 
+    fn acquire(self: *SeenRequests) void {
+        while (self.lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {}
+    }
+
+    fn release(self: *SeenRequests) void {
+        self.lock.store(false, .release);
+    }
+
     /// True if `id` was already handled. Records it otherwise.
-    fn seenOrRecord(self: *SeenRequests, id: [32]u8) bool {
+    ///
+    /// The check and the record are one critical section on purpose. Two relay
+    /// threads asking about the same id at the same moment must not both be told
+    /// no, which is exactly what a lock around only the write would allow.
+    pub fn seenOrRecord(self: *SeenRequests, id: [32]u8) bool {
+        self.acquire();
+        defer self.release();
         for (self.ids[0..self.len]) |known| {
             if (std.mem.eql(u8, &known, &id)) return true;
         }
@@ -369,7 +399,8 @@ const Harness = struct {
         // covered in nip46.zig; what this loop is being tested for is the
         // serve path, and a bunker now refuses a client it has never seen.
         bunker.authorize(self.client_kp.public_key);
-        try serve(gpa, io, &conn, &bunker, self.signer_kp, "wss://relay.test");
+        var seen: SeenRequests = .{};
+        try serve(gpa, io, &conn, &bunker, self.signer_kp, "wss://relay.test", &seen);
 
         // The loop wrote a REQ then an EVENT; find the published EVENT frame and
         // decrypt its content with the client key.
@@ -479,7 +510,8 @@ test "serve rejects a request when the policy denies it" {
     defer conn.deinit();
 
     var bunker = nip46.Bunker.initSingleKey(h.signer_ctx, h.signer_kp, denyAll());
-    try serve(gpa, io, &conn, &bunker, h.signer_kp, "wss://relay.test");
+    var seen: SeenRequests = .{};
+    try serve(gpa, io, &conn, &bunker, h.signer_kp, "wss://relay.test", &seen);
 
     const reply_event_json = try findPublishedEvent(gpa, written.items);
     defer gpa.free(reply_event_json);
@@ -539,7 +571,8 @@ test "serve answers a NIP-42 challenge and keeps serving past auth-required" {
 
     var bunker = nip46.Bunker.initSingleKey(h.signer_ctx, h.signer_kp, nip46.approveAll());
     bunker.authorize(h.client_kp.public_key);
-    try serve(gpa, io, &conn, &bunker, h.signer_kp, "wss://relay.test");
+    var seen: SeenRequests = .{};
+    try serve(gpa, io, &conn, &bunker, h.signer_kp, "wss://relay.test", &seen);
 
     // Walk the client frames once: it must have written a kind:22242 AUTH reply
     // to the challenge, AND (not aborting on auth-required) a sealed response to
@@ -623,4 +656,72 @@ test "a replayed request is not answered twice, and a stale one is not answered 
         _ = worthAnswering(io, &seen, filler);
     }
     try testing.expectEqual(SeenRequests.capacity, seen.len);
+}
+
+test "one request on two relays is answered once, not once per relay" {
+    // The ordinary case on more than one relay, not an attack. A bunker URL
+    // names every relay the signer listens on, and a client publishes its
+    // request to all of them: NDK builds a relay set from the whole URI and
+    // calls `event.publish(relaySet)`. So one intent arrives as the SAME event
+    // id on every relay thread.
+    //
+    // The record used to belong to `serve`, which meant one per connection. Each
+    // thread then answered its own copy: two approval prompts for one question,
+    // and two signatures published for one intent.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var shared: SeenRequests = .{};
+    const now = std.Io.Timestamp.now(io, .real).toSeconds();
+    const request = Event{ .id = [_]u8{0x5a} ** 32, .pubkey = [_]u8{2} ** 32, .created_at = now, .kind = nip46.kind, .tags = &.{}, .content = "", .sig = [_]u8{0} ** 64 };
+
+    // Relay A delivers it; relay B delivers the same bytes a moment later.
+    try testing.expect(worthAnswering(io, &shared, request));
+    try testing.expect(!worthAnswering(io, &shared, request));
+    // And a third, because a client may name more than two.
+    try testing.expect(!worthAnswering(io, &shared, request));
+
+    // A DIFFERENT request is still answered: the record rejects a repeat, not a
+    // relay.
+    var other = request;
+    other.id = [_]u8{0x5b} ** 32;
+    try testing.expect(worthAnswering(io, &shared, other));
+}
+
+test "two threads asking about one id at the same moment: exactly one is told no" {
+    // The check and the record are one critical section. With a lock around only
+    // the WRITE, both threads scan an empty ring, both are told the id is new,
+    // and the duplicate this record exists to stop goes through.
+    //
+    // Spawning threads and hoping they collide does not test that: the first
+    // finishes before the last is spawned and the window is never open. So every
+    // thread waits on a gate and they are released together, over many rounds
+    // with a fresh id each time. One round that lets two through fails it.
+    const rounds = 300;
+    const racers = 4;
+
+    var shared: SeenRequests = .{};
+
+    const Racer = struct {
+        fn run(record: *SeenRequests, key: [32]u8, gate: *std.atomic.Value(bool), claimed: *std.atomic.Value(u32)) void {
+            while (!gate.load(.acquire)) {}
+            if (!record.seenOrRecord(key)) _ = claimed.fetchAdd(1, .monotonic);
+        }
+    };
+
+    for (0..rounds) |round| {
+        var id = [_]u8{0} ** 32;
+        id[0] = @intCast(round % 256);
+        id[1] = @intCast(round / 256);
+
+        var gate = std.atomic.Value(bool).init(false);
+        var claimed = std.atomic.Value(u32).init(0);
+        var threads: [racers]std.Thread = undefined;
+        for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Racer.run, .{ &shared, id, &gate, &claimed });
+        gate.store(true, .release);
+        for (threads) |t| t.join();
+
+        try testing.expectEqual(@as(u32, 1), claimed.load(.monotonic));
+    }
 }
