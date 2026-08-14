@@ -8,6 +8,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-08-15
+
+### Fixed
+
+- `signer.serve` kept its own record of the requests it had answered, so a
+  signer listening on more than one relay kept one record per relay. A bunker
+  URL names every relay the signer listens on and a client publishes its request
+  to all of them (NDK builds a relay set from the whole URI and publishes to the
+  set), so one intent arrives as the same event id on every relay thread. Each
+  thread answered its own copy: two approval prompts for one question, and two
+  signatures published for one intent. The record is now the caller's, shared
+  across relays, and takes a lock whose critical section covers the check and
+  the record together, because a lock around only the write lets two threads
+  both be told an id is new.
+
+### Changed
+
+- **Breaking.** `signer.serve` takes a `*signer.SeenRequests` as its last
+  argument. Create one and pass the same one to every relay. A signer on a
+  single relay behaves exactly as before.
+
 ## [0.9.0] - 2026-08-12
 
 ### Security
