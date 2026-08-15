@@ -8,6 +8,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-08-16
+
+### Added
+
+- `nip46.Permissions`, `nip46.Permission` and `nip46.Remember`: what each
+  connected client has been allowed or refused, and for how long.
+
+  It sits beside `AuthorizedClients` because connecting and being allowed to act
+  are different questions and the library owns both. It is here rather than in a
+  signer because both signers need exactly this, and a second copy of a security
+  decision is a copy that drifts.
+
+  Keyed the way Amber keys it, `(client, method, event kind)`, with a duration on
+  every answer: once, an hour, a day, always. Per kind because signing a note and
+  signing a contact list are different risks; a bad kind:3 write empties
+  somebody's follow list, and "you allowed signing once" must not cover that.
+
+  Two rules that are easy to get backwards, which is most of why this is one
+  implementation and not two:
+
+  - A LAPSED answer leaves the question open rather than becoming a denial. An
+    hour running out means ask again, not that the answer turned into no.
+  - `once` is not written down at all. The answer covered that request, and the
+    next one is a fresh question.
+
+  `forget` drops one client's answers, which is what revoking has to do:
+  otherwise a client that reconnects acts on permissions granted to the session
+  that was ended. `clear` drops all of them, for signing out.
+
 ## [0.11.0] - 2026-08-15
 
 ### Added
