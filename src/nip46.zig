@@ -423,6 +423,151 @@ pub const max_authorized_clients = 16;
 /// Locked, because those threads reach it at the same time. Contention is
 /// near-zero: connects are human-paced and the critical section is a scan of at
 /// most sixteen keys.
+/// How long a reader's answer lasts.
+///
+/// Amber's `RememberType`, trimmed to four. Its eight steps are the right idea
+/// at a granularity nobody uses; what matters is that "not now", "for a while"
+/// and "stop asking" are each one press away, because a prompt offering only yes
+/// and no is one people learn to hit yes on.
+pub const Remember = enum(u8) {
+    once,
+    hour,
+    day,
+    always,
+
+    pub fn millis(self: Remember) i64 {
+        return switch (self) {
+            // `once` is never stored, so it has no duration to ask for. It was
+            // a zero that made an already-expired record, which meant two
+            // mechanisms held one property and neither could be tested:
+            // removing either left the other quietly covering for it.
+            .once => unreachable,
+            .hour => 60 * 60 * 1000,
+            .day => 24 * 60 * 60 * 1000,
+            // Never lapses, so there is no moment to compute.
+            .always => 0,
+        };
+    }
+};
+
+/// One answer the reader gave, keyed the way Amber keys it: the client, the
+/// method, and for a signature the event KIND.
+///
+/// Per kind because signing a note and signing a contact list are different
+/// risks. A bad kind:3 write empties somebody's follow list, and "you allowed
+/// signing once" must not have covered that.
+pub const Permission = struct {
+    used: bool = false,
+    client: [32]u8 = [_]u8{0} ** 32,
+    method: Method = .sign_event,
+    /// The event kind for `sign_event`, or -1 for methods that carry none. An
+    /// unreadable template also lands here, so it asks separately rather than
+    /// riding on a permission granted for something else.
+    kind: i32 = -1,
+    allow: bool = false,
+    /// When it lapses. Zero means never, which is what `always` stores.
+    until_ms: i64 = 0,
+
+    fn matches(self: *const Permission, client: [32]u8, method: Method, event_kind: i32) bool {
+        return self.used and self.method == method and self.kind == event_kind and
+            std.mem.eql(u8, &self.client, &client);
+    }
+
+    fn live(self: *const Permission, now_ms: i64) bool {
+        return self.until_ms == 0 or now_ms < self.until_ms;
+    }
+};
+
+/// What each connected client has been allowed or refused, and for how long.
+///
+/// Lives here rather than in a signer because both signers need exactly this and
+/// a second copy of a security decision is a copy that drifts. It sits beside
+/// `AuthorizedClients` for the same reason: connecting and being allowed to act
+/// are different questions, and the library owns both.
+///
+/// Two rules that are easy to get backwards, and both are the reason this is one
+/// implementation rather than two:
+///
+///   - A LAPSED answer leaves the question open rather than becoming a denial.
+///     An hour running out means ask me again, not the answer turned into no.
+///   - `once` is not written down. The answer covered that request and the next
+///     one is a fresh question, which is the whole meaning of once.
+///
+/// A caller that times a prompt out should not record anything: silence from
+/// somebody who walked away is not a decision, and storing it as a denial locks
+/// a client out over an absence.
+pub const Permissions = struct {
+    pub const capacity = 64;
+
+    lock: std.atomic.Value(bool) = .init(false),
+    entries: [capacity]Permission = [_]Permission{.{}} ** capacity,
+
+    fn acquire(self: *Permissions) void {
+        while (self.lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {}
+    }
+
+    fn release(self: *Permissions) void {
+        self.lock.store(false, .release);
+    }
+
+    /// Whether this client may do this without anybody being asked. Null when
+    /// nothing is remembered, which is the caller's cue to ask.
+    pub fn remembered(self: *Permissions, client: [32]u8, method: Method, event_kind: i32, now_ms: i64) ?bool {
+        self.acquire();
+        defer self.release();
+        for (&self.entries) |*perm| {
+            if (!perm.matches(client, method, event_kind)) continue;
+            if (!perm.live(now_ms)) {
+                perm.* = .{};
+                continue;
+            }
+            return perm.allow;
+        }
+        return null;
+    }
+
+    /// Writes an answer down for as long as the reader asked.
+    pub fn remember(self: *Permissions, client: [32]u8, method: Method, event_kind: i32, allow: bool, how_long: Remember, now_ms: i64) void {
+        if (how_long == .once) return;
+        const until: i64 = if (how_long == .always) 0 else now_ms + how_long.millis();
+        self.acquire();
+        defer self.release();
+        // Replaced, not added beside: two records for one question is a coin
+        // toss over which is read, and the reader's latest word is the one that
+        // counts.
+        for (&self.entries) |*perm| {
+            if (!perm.matches(client, method, event_kind)) continue;
+            perm.allow = allow;
+            perm.until_ms = until;
+            return;
+        }
+        for (&self.entries) |*perm| {
+            if (perm.used) continue;
+            perm.* = .{ .used = true, .client = client, .method = method, .kind = event_kind, .allow = allow, .until_ms = until };
+            return;
+        }
+    }
+
+    /// Drops everything remembered about one client. What revoking a client has
+    /// to do: leaving its answers behind would let a client that reconnects
+    /// later act on permissions granted to the session that was ended.
+    pub fn forget(self: *Permissions, client: [32]u8) void {
+        self.acquire();
+        defer self.release();
+        for (&self.entries) |*perm| {
+            if (perm.used and std.mem.eql(u8, &perm.client, &client)) perm.* = .{};
+        }
+    }
+
+    /// Drops everything. For signing out, where no answer given by the previous
+    /// account may survive into the next one.
+    pub fn clear(self: *Permissions) void {
+        self.acquire();
+        defer self.release();
+        self.entries = [_]Permission{.{}} ** capacity;
+    }
+};
+
 pub const AuthorizedClients = struct {
     lock: std.atomic.Value(bool) = .init(false),
     ids: [max_authorized_clients][32]u8 = undefined,
@@ -1623,4 +1768,81 @@ test "a nostrconnect secret with JSON in it survives the round trip" {
     defer response.deinit();
     // One field, holding the whole thing, rather than a smuggled second key.
     try std.testing.expectEqualStrings(parsed.value.secret, response.value.result);
+}
+
+test "a remembered answer covers only the question it answered" {
+    var p = Permissions{};
+    const client = [_]u8{0x81} ** 32;
+    const now: i64 = 1_000_000;
+
+    try std.testing.expect(p.remembered(client, .sign_event, 1, now) == null);
+    p.remember(client, .sign_event, 1, true, .always, now);
+    try std.testing.expectEqual(true, p.remembered(client, .sign_event, 1, now).?);
+
+    // A different KIND is a different question: signing a note and signing a
+    // contact list are different risks, and a bad kind:3 empties a follow list.
+    try std.testing.expect(p.remembered(client, .sign_event, 3, now) == null);
+    // A different method, and a different client, likewise.
+    try std.testing.expect(p.remembered(client, .nip44_decrypt, -1, now) == null);
+    try std.testing.expect(p.remembered([_]u8{0x82} ** 32, .sign_event, 1, now) == null);
+}
+
+test "a denial is remembered, and both kinds of answer lapse into an open question" {
+    var p = Permissions{};
+    const client = [_]u8{0x83} ** 32;
+    const now: i64 = 1_000_000;
+
+    // "No, and stop asking for an hour" is a real answer.
+    p.remember(client, .nip44_decrypt, -1, false, .hour, now);
+    try std.testing.expectEqual(false, p.remembered(client, .nip44_decrypt, -1, now).?);
+    try std.testing.expectEqual(false, p.remembered(client, .nip44_decrypt, -1, now + 59 * 60 * 1000).?);
+
+    // Lapsed is NULL, not a denial: the hour running out means ask me again.
+    try std.testing.expect(p.remembered(client, .nip44_decrypt, -1, now + 61 * 60 * 1000) == null);
+
+    p.remember(client, .sign_event, 1, true, .day, now);
+    try std.testing.expectEqual(true, p.remembered(client, .sign_event, 1, now + 23 * 60 * 60 * 1000).?);
+    try std.testing.expect(p.remembered(client, .sign_event, 1, now + 25 * 60 * 60 * 1000) == null);
+}
+
+test "once is not written down" {
+    var p = Permissions{};
+    const client = [_]u8{0x84} ** 32;
+    p.remember(client, .sign_event, 1, true, .once, 1_000_000);
+    try std.testing.expect(p.remembered(client, .sign_event, 1, 1_000_000) == null);
+}
+
+test "the reader's latest word replaces the earlier one" {
+    var p = Permissions{};
+    const client = [_]u8{0x85} ** 32;
+    const now: i64 = 1_000_000;
+    p.remember(client, .sign_event, 1, true, .always, now);
+    p.remember(client, .sign_event, 1, false, .always, now);
+    try std.testing.expectEqual(false, p.remembered(client, .sign_event, 1, now).?);
+
+    var records: usize = 0;
+    for (p.entries) |perm| {
+        if (perm.used) records += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), records);
+}
+
+test "forgetting a client takes its answers with it" {
+    var p = Permissions{};
+    const gone = [_]u8{0x86} ** 32;
+    const kept = [_]u8{0x87} ** 32;
+    const now: i64 = 1_000_000;
+    p.remember(gone, .sign_event, 1, true, .always, now);
+    p.remember(kept, .sign_event, 1, true, .always, now);
+
+    // What revoking has to do. Leaving them behind would let a client that
+    // reconnects act on permissions granted to the session that was ended.
+    p.forget(gone);
+    try std.testing.expect(p.remembered(gone, .sign_event, 1, now) == null);
+    try std.testing.expectEqual(true, p.remembered(kept, .sign_event, 1, now).?);
+
+    // And signing out drops everything, so no answer survives into the next
+    // account.
+    p.clear();
+    try std.testing.expect(p.remembered(kept, .sign_event, 1, now) == null);
 }
