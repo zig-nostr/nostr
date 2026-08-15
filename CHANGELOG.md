@@ -8,6 +8,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-08-15
+
+### Added
+
+- `nip46.acceptNostrConnect`, which builds the event that answers a
+  `nostrconnect://` invitation: the client-initiated half of NIP-46, where the
+  client advertises itself and waits to be adopted rather than the user pasting
+  a bunker token.
+
+  The part that is not guessable from the flow, and that implementations get
+  right only by being told: the URI's `secret` is NOT the connect method's
+  secret, and the reply carries it as the RESULT, in place of `"ack"`. It is how
+  the client knows the signer that answered is the one it invited. nsec.app says
+  so in a comment where it fabricates the request; nostr-tools' client is the
+  other half, adopting the first kind:24133 addressed to it whose decrypted
+  `result` equals the secret it published, and taking that event's author as its
+  signer. A reply of `"ack"` is ignored and the connection simply never
+  completes, with nothing to see on either side.
+
+  Authorizing the client is the caller's, deliberately: this builds an event and
+  does not decide whether it is published.
+
 ## [0.10.0] - 2026-08-15
 
 Both entries here are the same bug in two places, and neither is reachable by a

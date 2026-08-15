@@ -648,6 +648,44 @@ fn errorResponse(arena: *std.heap.ArenaAllocator, id: []const u8, message: []con
     return .{ .arena = arena, .value = .{ .id = id, .result = "", .err = message } };
 }
 
+/// Builds the event that accepts a `nostrconnect://` invitation: the signer's
+/// answer to a client that advertised itself and is waiting to be adopted.
+///
+/// The part that is not guessable from the flow, and that every implementation
+/// gets right only by being told: **the URI's `secret` is not the connect
+/// method's secret, and the reply carries it as the RESULT, in place of
+/// `"ack"`.** It is how the client knows the signer that answered is the one it
+/// invited, and it is the whole security of this direction. nsec.app says so in
+/// a comment where it fabricates the request ("this is not nip46 connect
+/// method's 'secret' so we can't pass it using method params, instead we will
+/// reply with this 'secret' instead of 'ack'"), and nostr-tools' client is the
+/// other half: it subscribes for kind:24133 addressed to itself and adopts the
+/// first event whose decrypted `result` equals the secret it published, taking
+/// that event's author as the signer.
+///
+/// So the client is not waiting on an id it chose, and `request_id` is only for
+/// its logs. The signer's own pubkey reaches the client as the event's author,
+/// which is why this must be sealed by the key the signer will keep answering
+/// with, not a throwaway.
+///
+/// Authorizing the client is the CALLER's job, and deliberately not done here:
+/// this builds an event, and whether it is ever published is the caller's
+/// decision. Publishing without authorizing leaves a client that believes it is
+/// connected and is refused on its first real request.
+pub fn acceptNostrConnect(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    signer: keys.Signer,
+    remote: keys.KeyPair,
+    uri: NostrConnectUri,
+    request_id: []const u8,
+    created_at: i64,
+) Error!SealedEvent {
+    const body = try (Response{ .id = request_id, .result = uri.secret }).toJson(gpa);
+    defer gpa.free(body);
+    return seal(gpa, io, signer, remote, uri.client_pubkey, body, created_at);
+}
+
 // ---------------------------------------------------------------------------
 // Connection URIs (bunker:// and nostrconnect://)
 // ---------------------------------------------------------------------------
@@ -1501,4 +1539,88 @@ test "two relay threads authorizing at once do not lose a client" {
         try testing.expectEqual(@as(usize, 1), shared.count());
         try testing.expect(shared.isAuthorized(id));
     }
+}
+
+test "accepting a nostrconnect invitation replies with the secret, not ack" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var signer = keys.Signer.init();
+    defer signer.deinit();
+    const remote = try signer.keyPairFromSecretKey([_]u8{0x21} ** 32);
+    const client = try signer.keyPairFromSecretKey([_]u8{0x22} ** 32);
+
+    var client_hex: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&client_hex, "{x}", .{client.public_key});
+    const uri_text = try std.fmt.allocPrint(
+        gpa,
+        "nostrconnect://{s}?relay=wss%3A%2F%2Fr.example&secret=hunter2&name=Coracle",
+        .{client_hex},
+    );
+    defer gpa.free(uri_text);
+
+    var parsed = try parseNostrConnectUri(gpa, uri_text);
+    defer parsed.deinit();
+
+    var sealed = try acceptNostrConnect(gpa, io, signer, remote, parsed.value, "req-1", 1_800_000_000);
+    defer sealed.deinit();
+
+    // Addressed to the client, and authored by the key the signer keeps
+    // answering with: that author is how the client learns who its signer is.
+    try std.testing.expectEqualSlices(u8, &remote.public_key, &sealed.event.pubkey);
+    try std.testing.expectEqual(@as(u16, kind), sealed.event.kind);
+
+    // The client decrypts with its own key and checks the RESULT against the
+    // secret it published. "ack" here would be silently ignored by every
+    // client, and the connection would simply never complete.
+    const plain = try nip44.decrypt(gpa, signer, client.secret_key, remote.public_key, sealed.event.content);
+    defer gpa.free(plain);
+    const response = try std.json.parseFromSlice(struct {
+        id: []const u8,
+        result: []const u8,
+    }, gpa, plain, .{ .ignore_unknown_fields = true });
+    defer response.deinit();
+    try std.testing.expectEqualStrings("hunter2", response.value.result);
+    try std.testing.expect(!std.mem.eql(u8, "ack", response.value.result));
+}
+
+test "a nostrconnect secret with JSON in it survives the round trip" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var signer = keys.Signer.init();
+    defer signer.deinit();
+    const remote = try signer.keyPairFromSecretKey([_]u8{0x23} ** 32);
+    const client = try signer.keyPairFromSecretKey([_]u8{0x24} ** 32);
+
+    // The secret is a stranger's string copied out of a URI, so it reaches the
+    // response builder unvetted. Escaping it is why this belongs in the library
+    // rather than being a format string at each call site.
+    var client_hex: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&client_hex, "{x}", .{client.public_key});
+    const uri_text = try std.fmt.allocPrint(
+        gpa,
+        "nostrconnect://{s}?relay=wss%3A%2F%2Fr.example&secret=a%22b%5C%22%2C%22result%22%3A%22ack",
+        .{client_hex},
+    );
+    defer gpa.free(uri_text);
+
+    var parsed = try parseNostrConnectUri(gpa, uri_text);
+    defer parsed.deinit();
+    var sealed = try acceptNostrConnect(gpa, io, signer, remote, parsed.value, "req-2", 1_800_000_000);
+    defer sealed.deinit();
+
+    const plain = try nip44.decrypt(gpa, signer, client.secret_key, remote.public_key, sealed.event.content);
+    defer gpa.free(plain);
+    const response = try std.json.parseFromSlice(struct {
+        id: []const u8,
+        result: []const u8,
+    }, gpa, plain, .{ .ignore_unknown_fields = true });
+    defer response.deinit();
+    // One field, holding the whole thing, rather than a smuggled second key.
+    try std.testing.expectEqualStrings(parsed.value.secret, response.value.result);
 }
