@@ -98,6 +98,13 @@ pub fn main() !void {
     defer arena.deinit();
     const allocator = arena.allocator();
 
+    // Time comes from the Io implementation in Zig 0.16, the same way sockets
+    // and threads do. Threaded takes a threadsafe allocator, which the arena
+    // above is not.
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
     // A Signer wraps the libsecp256k1 context; deinit it when done.
     var signer = nostr.keys.Signer.init();
     defer signer.deinit();
@@ -107,9 +114,10 @@ pub fn main() !void {
     const keypair = try signer.keyPairFromSecretKey(secret);
 
     // Build and sign a kind:1 text note.
+    const created_at = std.Io.Timestamp.now(io, .real).toSeconds();
     const note = try nostr.event.create(
         allocator, signer, keypair,
-        std.time.timestamp(), 1, &.{}, "hello from zig-nostr", null,
+        created_at, 1, &.{}, "hello from zig-nostr", null,
     );
 
     // Verify: recompute the canonical id, then check the Schnorr signature.
@@ -180,10 +188,12 @@ comes next lands inside them rather than as new apps.
 In spec terms, the library still owes NIP-17 private direct messages, with the
 NIP-59 gift wrap that carries them, and a `search` field on `Filter` for NIP-50.
 Most of what remains is app work on protocol the library already exports:
-reactions, reposts and zap receipts behind notifications, NIP-51 bookmarks and
-mutes, Blossom uploads so a picture can be posted, NIP-57 zaps paid through a
-NIP-47 wallet, and NIP-29 groups. The [NIP support
-page](https://zignostr.com/nips) maps each one to the milestone that lands it.
+Blossom uploads so a picture can be posted, NIP-57 zaps that can be sent rather
+than only verified, NIP-51 bookmarks, and NIP-29 groups. Reactions,
+notifications and the NIP-51 mute list are in Plaza already, and a repost can
+be sent, though one written by somebody you follow does not yet reach your
+feed. The [NIP support page](https://zignostr.com/nips) maps each one to the
+milestone that lands it.
 
 There are no dates. The [roadmap](https://zignostr.com/roadmap) is an order, and
 it also names what is deliberately not being built (set-reconciliation sync,
