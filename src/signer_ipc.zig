@@ -18,6 +18,11 @@
 //!     is the point: a DM catch-up is thousands of decrypts, and one loopback
 //!     round-trip per item would drown in connection overhead.
 //!
+//! Every request that uses the key names the app making it, in
+//! `header_client`. A keyholder files each app's answers separately, so one
+//! app can be allowed to sign notes while another is refused, and either can be
+//! withdrawn on its own.
+//!
 //! Failures ride `Failure` with a non-2xx status. Parsing mirrors `nip46`:
 //! an owned arena per parse, unknown fields ignored (forward compatibility).
 
@@ -31,6 +36,63 @@ pub const path_nip44_encrypt = "/nip44/encrypt";
 pub const path_nip44_decrypt = "/nip44/decrypt";
 
 pub const Error = error{MalformedBody} || std.mem.Allocator.Error;
+
+/// The header a local client names itself in, on every request that uses the
+/// key.
+///
+/// Self-declared, and that is not a flaw to be papered over: any process
+/// running as this user can read the daemon's bearer token, so any of them can
+/// claim any name. What the name buys is not proof of who is asking, it is the
+/// ability to answer separately. Without it every local app is one client, and
+/// "the messenger may read my messages, my feed reader may not" cannot be
+/// expressed at all, let alone withdrawn from one app without withdrawing it
+/// from all of them.
+///
+/// A keyholder that shows the name to a person must say where it came from.
+/// "Plaza is asking" claims an identity nobody checked; "an app calling itself
+/// Plaza" is the true sentence and is just as usable.
+pub const header_client = "X-Signer-Client";
+
+/// The longest client name a keyholder need accept, and the bytes allowed in
+/// one.
+///
+/// Printable ASCII only, because this string is shown to a person who is
+/// deciding whether to allow a signature. A name free to carry control
+/// characters can blank a line, redraw a terminal, or pad itself with spaces
+/// until the part a reader would recognise has scrolled off the row.
+pub const client_name_max = 32;
+
+pub fn clientNameOk(name: []const u8) bool {
+    if (name.len == 0 or name.len > client_name_max) return false;
+    for (name) |c| if (c < 0x21 or c > 0x7e) return false;
+    return true;
+}
+
+/// The 32 bytes a keyholder files a local client's answers under.
+///
+/// Hashed rather than used raw so it drops straight into a permission store
+/// keyed by a nostr pubkey, and domain-separated so a name can never collide
+/// with a real 32-byte key: a client that called itself by some pubkey's hex
+/// must not inherit what that pubkey was allowed over a relay.
+pub fn clientId(name: []const u8) [32]u8 {
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    h.update("nostr-signer-ipc/local-client/");
+    h.update(name);
+    var out: [32]u8 = undefined;
+    h.final(&out);
+    return out;
+}
+
+/// The `error` strings in a `Failure`, where a client has to tell the cases
+/// apart to know what to do next.
+///
+/// Constants rather than prose because they are read by a program: retry after
+/// a person answers, stop and say who to ask, or stop for good. A client that
+/// matched on a sentence would break the first time one was reworded.
+pub const reason_awaiting_approval = "awaiting approval";
+pub const reason_refused = "refused";
+pub const reason_locked = "the key is locked";
+pub const reason_unnamed = "name yourself";
 
 /// The daemon's lifecycle state as the wire spells it.
 ///
@@ -319,4 +381,38 @@ test "batched cipher items keep their order" {
     try testing.expectEqual(@as(usize, 40), back.value.items.len);
     try testing.expectEqualStrings("item0", back.value.items[0]);
     try testing.expectEqualStrings("item39", back.value.items[39]);
+}
+
+test "a client name has to be short, printable, and there at all" {
+    try testing.expect(clientNameOk("plaza"));
+    try testing.expect(clientNameOk("my-messenger.v2"));
+
+    // Nothing to show a person, nothing to file an answer under.
+    try testing.expect(!clientNameOk(""));
+
+    // Long enough to hide the recognisable part off the end of a row.
+    try testing.expect(!clientNameOk("x" ** (client_name_max + 1)));
+    try testing.expect(clientNameOk("x" ** client_name_max));
+
+    // A name that can move the cursor is a name that can rewrite the question
+    // being asked. Space is out for the same reason: it pads.
+    try testing.expect(!clientNameOk("pla\nza"));
+    try testing.expect(!clientNameOk("plaza\r"));
+    try testing.expect(!clientNameOk("plaza\x1b[2K"));
+    try testing.expect(!clientNameOk("my messenger"));
+    try testing.expect(!clientNameOk("caf\xc3\xa9"));
+}
+
+test "a client name cannot inherit what a pubkey was allowed" {
+    // The hazard the domain separation exists for: an app that names itself
+    // with some relay client's hex must not be filed under that client.
+    const hex = "a" ** 64;
+    var raw: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&raw, hex);
+    try testing.expect(!std.mem.eql(u8, &clientId(hex), &raw));
+
+    // Same name, same id, every time: an answer given once is found again.
+    try testing.expectEqualSlices(u8, &clientId("plaza"), &clientId("plaza"));
+    // Different names are different clients.
+    try testing.expect(!std.mem.eql(u8, &clientId("plaza"), &clientId("plazb")));
 }
