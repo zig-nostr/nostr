@@ -6,7 +6,9 @@
 //!
 //! The endpoints, by path constant:
 //!   - `path_pubkey` (GET): the daemon's state and, once ready, whose key it
-//!     holds. Clients poll this to detect a completed ceremony.
+//!     holds. Clients poll this to detect a completed ceremony. A daemon that
+//!     encrypts its key at rest also reports `state_locked` here, meaning it
+//!     holds a key it cannot use yet.
 //!   - `path_setup` (POST): create a fresh key, or import one (nsec or
 //!     ncryptsec). One-shot: a daemon that already holds a key refuses.
 //!   - `path_sign` (POST): sign one event. The body carries the unsigned
@@ -31,11 +33,28 @@ pub const path_nip44_decrypt = "/nip44/decrypt";
 pub const Error = error{MalformedBody} || std.mem.Allocator.Error;
 
 /// The daemon's lifecycle state as the wire spells it.
+///
+/// Three, not two, because a keyholder that encrypts its key at rest has a
+/// state between "no key" and "signing": it holds one and cannot use it yet.
+/// A daemon whose key sits in an OS keystore the login already opened never
+/// reaches `state_locked` and may ignore it; one that asks for a passphrase
+/// reports it every time it starts.
+///
+/// Saying so is the point. The alternative is reporting `state_uninitialized`
+/// while locked, which invites a client to offer to CREATE a key over the top
+/// of one that already exists, and that is how somebody loses an identity.
+/// A client that does not recognise a state must treat it as "cannot sign",
+/// never as "no key yet".
 pub const state_uninitialized = "uninitialized";
+pub const state_locked = "locked";
 pub const state_ready = "ready";
 
 /// GET /pubkey response: which state the daemon is in, and whose key it
 /// holds once ready (64 lowercase hex chars; empty while uninitialized).
+///
+/// A LOCKED daemon may report the pubkey it holds, because whose key it is is
+/// not a secret and a client that knows it can say who is about to sign. It
+/// still must not be treated as signable.
 pub const Pubkey = struct {
     state: []const u8,
     pubkey: []const u8 = "",
@@ -184,6 +203,36 @@ pub fn parse(comptime T: type, gpa: std.mem.Allocator, body: []const u8) Error!P
 // ------------------------------------------------------------------- tests
 
 const testing = std.testing;
+
+test "a locked keyholder is a state of its own, and says whose key it holds" {
+    // The state between "no key" and "signing", which a daemon that encrypts
+    // its key at rest is in every time it starts. It exists on the wire so a
+    // client is never told "uninitialized" about a machine that already holds
+    // an identity: that is the reading that invites a client to offer to make
+    // a NEW key over the top of one somebody already has.
+    const gpa = testing.allocator;
+
+    try testing.expect(!std.mem.eql(u8, state_locked, state_uninitialized));
+    try testing.expect(!std.mem.eql(u8, state_locked, state_ready));
+
+    // Locked still carries the pubkey. Whose key it is was never the secret,
+    // and a client that knows it can name the account it is about to unlock
+    // instead of showing a passphrase box for nobody in particular.
+    const locked = Pubkey{ .state = state_locked, .pubkey = "cd" ** 32 };
+    const locked_json = try locked.toJson(gpa);
+    defer gpa.free(locked_json);
+    var back = try parse(Pubkey, gpa, locked_json);
+    defer back.deinit();
+    try testing.expectEqualStrings(state_locked, back.value.state);
+    try testing.expectEqualStrings("cd" ** 32, back.value.pubkey);
+
+    // And an unknown state parses rather than failing, so a client meeting a
+    // newer daemon degrades to "cannot sign" instead of refusing to talk.
+    var future = try parse(Pubkey, gpa, "{\"state\":\"rekeying\",\"pubkey\":\"\"}");
+    defer future.deinit();
+    try testing.expectEqualStrings("rekeying", future.value.state);
+    try testing.expect(!std.mem.eql(u8, future.value.state, state_ready));
+}
 
 test "every wire type round-trips through its JSON" {
     const gpa = testing.allocator;
