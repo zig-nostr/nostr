@@ -8,6 +8,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.2] - 2026-08-28
+
+### Added
+
+- `signer_ipc.header_client`, `clientId`, `clientNameOk`: a request that uses
+  the key now names the app making it.
+
+  Without a name, every app on a machine is one client to a keyholder, because
+  they all present the same local credential. That makes a whole class of
+  answer inexpressible: "the messenger may read my messages, my feed reader may
+  not" cannot be said when there is only one client to say it about, and
+  withdrawing permission from one app withdraws it from all of them.
+
+  The name is filed under a domain-separated hash, so it drops straight into a
+  permission store keyed by a nostr pubkey and cannot collide with one. An app
+  that names itself with some relay client's hex must not inherit what that
+  pubkey was allowed over a relay.
+
+  It is self-declared, and the documentation says so rather than papering over
+  it. Any process running as the same user can read the local credential, so
+  any of them can claim any name. What it buys is the ability to answer
+  separately, not proof of who is asking, and a keyholder that shows the name
+  to a person has to phrase it that way: "an app calling itself Plaza" is the
+  true sentence and is just as usable as the false one.
+
+  Names are bounded and printable-ASCII only. The string goes on the row where
+  somebody decides whether to allow a signature, and a name free to carry
+  control characters can blank the line, redraw a terminal, or pad itself until
+  the part a reader would recognise has scrolled off.
+
+- `signer_ipc.reason_awaiting_approval`, `reason_refused`, `reason_locked`,
+  `reason_unnamed`: the `Failure` strings a client has to tell apart to know
+  what to do next, as constants rather than prose. They are matched by a
+  program, which would break the first time one was reworded.
+
+
 ## [0.12.1] - 2026-08-28
 
 ### Added
