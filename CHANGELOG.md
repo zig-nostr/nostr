@@ -8,6 +8,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-08-28
+
+### Added
+
+- `signer_ipc.state_locked`: the state a keyholder is in when it holds a key it
+  cannot use yet.
+
+  The protocol could spell two states, no key and signing. A daemon that
+  encrypts its key at rest has a third, and it is the one such a daemon reports
+  every time it starts, before anybody has typed the passphrase. Without a word
+  for it the daemon has to pick a lie, and the cheap-looking lie is the
+  expensive one: reporting `state_uninitialized` while locked tells a client
+  there is no key here, and a client that believes that offers to make one over
+  the top of an identity somebody already has. A nostr key cannot be replaced.
+
+  Additive, and safe for clients built against the two-state version: the rule
+  written beside the constants is that an unrecognised state means "cannot
+  sign", never "no key yet", which is what those clients already do by checking
+  for `state_ready` rather than against `state_uninitialized`.
+
+  A locked daemon still reports its pubkey. Whose key it is was never the
+  secret, and a client that knows it can name the account it is asking to
+  unlock instead of showing a passphrase box for nobody in particular.
+
 ## [0.12.0] - 2026-08-16
 
 ### Added
