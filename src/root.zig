@@ -2,7 +2,9 @@
 
 const std = @import("std");
 
-pub const version = "0.12.0";
+/// Kept in step with `build.zig.zon` by hand, and it had drifted three
+/// releases behind, so anything reading it was told the wrong number.
+pub const version = "0.13.0";
 
 pub const bech32 = @import("bech32.zig");
 pub const nip19 = @import("nip19.zig");
