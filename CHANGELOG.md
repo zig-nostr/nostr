@@ -8,6 +8,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-08-28
+
+### Removed
+
+- `signer_ipc.header_client`, `clientId`, `clientNameOk`, `client_name_max` and
+  `reason_unnamed`. **Breaking**, and the reason is worth more than the API.
+
+  They existed so a keyholder serving several local apps could tell them apart.
+  A name in a header is a name the CALLER chose, and NIP-46 had already settled
+  that question for its own case in the same words: client metadata is
+  "client-supplied and unauthenticated", a display hint, and a signer "MUST NOT
+  use it for authorization decisions". A self-declared name buys separable
+  grants and an honest prompt; it never buys authorization.
+
+  What settled it here is that the shape it was serving was wrong. A keyholder
+  that any local app can reach has to answer "which app is this", and on the
+  desktop nobody has. File permissions separate users, not apps. macOS Keychain
+  access control and Touch ID both need a real code-signing identity. The Secure
+  Enclave cannot hold a secp256k1 key at all. So the protocol stops pretending
+  to carry an identity it cannot check.
+
+  Who may reach a keyholder is now each product's own business, which is where
+  it belongs: a credential, a pipe inherited from a parent, an operating system
+  that names its callers. This module goes back to owning only what the bytes
+  mean.
+
+### Fixed
+
+- `version` said `0.12.0` while the package said `0.12.2`. It is kept in step by
+  hand and had drifted three releases, so anything that read it was told the
+  wrong number.
+
+
 ## [0.12.2] - 2026-08-28
 
 ### Added
