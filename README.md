@@ -77,7 +77,7 @@ Methodology and the full write-up are on the
 Add the library to your `build.zig.zon`:
 
 ```sh
-zig fetch --save https://github.com/zig-nostr/nostr/archive/refs/tags/v0.12.0.tar.gz
+zig fetch --save https://github.com/zig-nostr/nostr/archive/refs/tags/v0.14.1.tar.gz
 ```
 
 Wire the module in `build.zig`:
@@ -169,12 +169,13 @@ do.
 The library is proven by native apps built on it, the ecosystem forming around
 one core:
 
-- **[Notary](https://github.com/zig-nostr/notary)**: *shipped.* A native macOS
-  remote signer (NIP-46 bunker): your key lives in a local daemon, every signing
+- **[Notary](https://github.com/zig-nostr/notary)**: *shipped.* A native remote
+  signer (NIP-46 bunker): your key lives in a local daemon, every signing
   request waits for your approval, and the `nsec` never enters a client.
+  Downloadable for macOS (Apple Silicon) and Linux (x86_64 and aarch64).
 - **[Plaza](https://github.com/zig-nostr/plaza)**: *shipped.* The flagship: a
   fast, local-first client where you read without an account, post in four
-  clicks, and the feed renders from disk. A downloadable macOS app.
+  clicks, and the feed renders from disk. Downloadable for the same two.
 
 Private messages, zaps and groups land inside Plaza rather than as separate apps.
 A messenger you have to switch to is one you stop using.
