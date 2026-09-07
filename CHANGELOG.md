@@ -8,6 +8,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-09-07
+
+### Added
+
+- `relay.Relay.receiveTimeout` (and `Connection.receiveTimeout`): read the next
+  relay message, or give up when a deadline passes.
+
+  A reader blocked in `receive` cannot notice that anything changed behind it.
+  Plaza's ingest threads check pause, the slot's URL and the follow generation
+  at the top of their loop, and the loop only advances when the relay says
+  something, so a relay the reader repointed or removed kept its socket and kept
+  feeding the store until it happened to speak. The only lever over that thread
+  was `shutdown`, which is a teardown: over TLS it leaves the session poisoned,
+  so it cannot pause one subscription on a socket still serving others.
+
+  A deadline that fires returns `error.Timeout`, never `null`, because `null`
+  already means the relay is gone and every existing caller reads it that way.
+  It consumes nothing, so calling again resumes on the same connection rather
+  than resynchronising: the wait is a `MSG_PEEK` readiness check, not a read, so
+  a frame half-arrived and a TLS record half-decrypted are both exactly as they
+  were. A test drives a real socket pair, times a deadline out on a quiet
+  connection, and then reads a message sent after it off the same socket.
+
+  It is deliberately not `SO_RCVTIMEO`. That makes the read return `EAGAIN`, and
+  this io model treats `EAGAIN` as a programmer bug and panics in Debug. It was
+  tried once in a daemon built on this library: it compiled, passed every test,
+  and panicked on the first wedged connection, turning a stall into a crash.
+
+- `liveness`: when a relay connection has gone quiet, and what to do about it.
+  `action(idle_ms, since_ping_ms)` returns `.leave_it`, `.ping` or `.give_up`,
+  with the three intervals it enforces. Pure, so the policy is asserted without
+  a socket, a thread or a clock.
+
+  The numbers were already load-bearing in two products and written down in
+  neither. They come from Amethyst's survey of 122 relays: idle timeouts cluster
+  around 60, 120, 240, 300 and 600 seconds, and a ping only holds a connection
+  open when its interval is at most about half the shortest tier. Ninety seconds
+  is three missed answers. The table of connections and the thread that ticks
+  stay with the product, because what "give up" means differs between a client
+  and a signer.
+
+### Changed
+
+- **Breaking**, for anyone implementing the `Stream` a `Connection` is generic
+  over: `read` takes a deadline. It was `fn read(self, buffer: []u8) !usize` and
+  is now `fn read(self, buffer: []u8, deadline: ?std.Io.Clock.Timestamp)
+  !usize`. A null deadline waits forever, which is what every caller did before,
+  so an existing stream adapts by accepting and ignoring the argument. Users of
+  `relay.dial` and `relay.Relay` are unaffected.
+
 ## [0.13.1] - 2026-09-07
 
 ### Changed

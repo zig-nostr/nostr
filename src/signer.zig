@@ -308,7 +308,8 @@ const FakeStream = struct {
 
     // `pub` because the generic `Connection` calls these across the module
     // boundary.
-    pub fn read(self: *FakeStream, buffer: []u8) error{}!usize {
+    pub fn read(self: *FakeStream, buffer: []u8, deadline: ?std.Io.Clock.Timestamp) error{}!usize {
+        _ = deadline;
         const remaining = self.to_read[self.read_pos..];
         const n = @min(buffer.len, remaining.len);
         @memcpy(buffer[0..n], remaining[0..n]);
