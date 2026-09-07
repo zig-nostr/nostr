@@ -4,17 +4,27 @@
     // Generated at project creation; never regenerate for this repo.
     .fingerprint = 0x208aa38fcd8fcc08,
     .minimum_zig_version = "0.16.0",
+    // TARBALLS, not `git+https`. Zig's git client gives up under load with
+    // "unable to discover remote git server capabilities: ProtocolError", which
+    // is not rare: it failed three CI jobs across two runner architectures in
+    // one afternoon and killed a release build outright. The plain HTTPS
+    // tarball path does not speak the git protocol at all.
+    //
+    // Every commit is the same one it was, pinned by full SHA, and every hash
+    // below is UNCHANGED: `zig fetch` returns the identical content hash for
+    // the tarball and for the git checkout, which is the proof that this
+    // changes how the bytes arrive and not which bytes arrive.
     .dependencies = .{
         .secp256k1 = .{
-            .url = "git+https://github.com/bitcoin-core/secp256k1#1a53f4961f337b4d166c25fce72ef0dc88806618",
+            .url = "https://github.com/bitcoin-core/secp256k1/archive/1a53f4961f337b4d166c25fce72ef0dc88806618.tar.gz",
             .hash = "N-V-__8AAO1SWwCbwhTAU7t6L3XQtTy6TzE8CiOGHjENn_rl",
         },
         .lmdb = .{
-            .url = "git+https://github.com/LMDB/lmdb#ce201088de95d26fc0da36ba805bf2ddc2ba74ff",
+            .url = "https://github.com/LMDB/lmdb/archive/ce201088de95d26fc0da36ba805bf2ddc2ba74ff.tar.gz",
             .hash = "N-V-__8AAHEsCACb_b9D1HnCysDKIhKFOrITbxYh9JRh9ix5",
         },
         .zg = .{
-            .url = "git+https://codeberg.org/atman/zg?ref=v0.16.2#ce364b17d60b28fda1af24c6575b93c47afe043e",
+            .url = "https://codeberg.org/atman/zg/archive/ce364b17d60b28fda1af24c6575b93c47afe043e.tar.gz",
             .hash = "zg-0.16.2-oGqU3HqftgI6rwFS90ypwfjgToH8Pz829OKuFURlm773",
         },
     },
