@@ -16,7 +16,7 @@ it like [Notary](https://github.com/zig-nostr/notary), a remote signer that keep
 your key off every client. Full docs, benchmarks, and the ecosystem overview
 live at [zignostr.com](https://zignostr.com).
 
-> **Status: early (`v0.13.1`).** The library core, transport, local-first store
+> **Status: early (`v0.14.0`).** The library core, transport, local-first store
 > and signer protocol have shipped and are covered by tests. Two native apps run
 > on it today. APIs may still change before 1.0.
 
@@ -131,7 +131,7 @@ pub fn main() !void {
 
 The `nostr` module re-exports focused namespaces: `keys`, `event`,
 `nip19`/`bech32`, `nip06`/`bip39`, `nip49`, `nip44`, `nip46`, `nip42`,
-`relay`/`websocket`/`message`/`filter`, `nip65`, and `store`. See the
+`relay`/`websocket`/`message`/`filter`, `nip65`, `liveness`, and `store`. See the
 [getting-started guide](https://zignostr.com/getting-started) for more.
 
 ## NIP support

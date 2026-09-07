@@ -4,7 +4,7 @@ const std = @import("std");
 
 /// Kept in step with `build.zig.zon` by hand, and it had drifted three
 /// releases behind, so anything reading it was told the wrong number.
-pub const version = "0.13.0";
+pub const version = "0.14.0";
 
 pub const bech32 = @import("bech32.zig");
 pub const nip19 = @import("nip19.zig");
@@ -22,6 +22,10 @@ pub const message = @import("message.zig");
 pub const websocket = @import("websocket.zig");
 pub const relay = @import("relay.zig");
 pub const nip65 = @import("nip65.zig");
+// When a relay connection has gone quiet and what to do about it. Policy
+// only: the table of connections and the thread that ticks stay with the
+// product, because what "give up" means differs between a client and a signer.
+pub const liveness = @import("liveness.zig");
 pub const store = @import("store.zig");
 // Signer support (experimental, pre-1.0): the at-rest key file and the
 // NIP-46 signer-side serving loop, so a signer is a thin shell over the

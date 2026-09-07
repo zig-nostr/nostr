@@ -106,7 +106,9 @@ pub const ConnectionError = error{
 };
 
 /// A websocket connection to a relay over `Stream`. `Stream` must provide:
-///   * `fn read(self, buffer: []u8) !usize` — 0 means the peer closed.
+///   * `fn read(self, buffer: []u8, deadline: ?std.Io.Clock.Timestamp) !usize`
+///     — 0 means the peer closed. A null deadline waits forever, which is what
+///     every caller did before `receiveTimeout` existed.
 ///   * `fn writeAll(self, bytes: []const u8) !void`
 ///
 /// The connection owns two growable buffers (raw receive bytes and the
@@ -175,7 +177,7 @@ pub fn Connection(comptime Stream: type) type {
             // Read until the blank line terminating the response head.
             while (std.mem.indexOf(u8, self.recv.items, "\r\n\r\n") == null) {
                 if (self.recv.items.len > 16 * 1024) return ConnectionError.HandshakeFailed;
-                if (!try self.fill()) return ConnectionError.HandshakeFailed;
+                if (!try self.fill(null)) return ConnectionError.HandshakeFailed;
             }
             const idx = std.mem.indexOf(u8, self.recv.items, "\r\n\r\n").?;
             const head_len = idx + 4;
@@ -245,7 +247,42 @@ pub fn Connection(comptime Stream: type) type {
         /// pongs, and reassembling fragmented frames. Returns `null` when the
         /// relay closes the connection (a close frame or EOF). The caller owns
         /// the returned message and must `deinit` it.
+        ///
+        /// Waits forever. `receiveTimeout` is the one with a deadline.
         pub fn receive(self: *Self) !?message.ParsedRelayMessage {
+            return self.receiveUntil(null);
+        }
+
+        /// Like `receive`, but gives up when `timeout` passes.
+        ///
+        /// Returns `error.Timeout` when the deadline arrives with no complete
+        /// message. NOT `null`: `null` still means the relay is gone, which is
+        /// what every existing caller already reads it as, and a timeout that
+        /// arrived as null would silently turn a quiet second into a
+        /// disconnect at a dozen call sites.
+        ///
+        /// Safe to call again. The wait consumes nothing: it is a readiness
+        /// check on the socket, not a read, so `recv`, `msg`, the TLS record
+        /// state and the kernel buffer are exactly as they were. That is the
+        /// whole reason it is shaped this way rather than as a read timeout,
+        /// which cannot be done here at all (see `Relay.shutdown`).
+        ///
+        /// Best effort. A deadline can only be noticed between reads, so a peer
+        /// dribbling a frame one byte at a time is bounded by the frame, not by
+        /// the deadline.
+        ///
+        /// Note that `receive`'s inferred error set gains `error.Timeout` even
+        /// though `.none` can never produce one, because Zig infers statically.
+        pub fn receiveTimeout(self: *Self, timeout: std.Io.Timeout) !?message.ParsedRelayMessage {
+            // Normalized ONCE, to an absolute instant. This is mandatory rather
+            // than stylistic: a TLS read legitimately returns zero bytes many
+            // times per message while a record arrives, so a per-read duration
+            // would restart on each partial record and bound nothing.
+            const deadline = timeout.toTimestamp(self.io);
+            return self.receiveUntil(deadline);
+        }
+
+        fn receiveUntil(self: *Self, deadline: ?std.Io.Clock.Timestamp) !?message.ParsedRelayMessage {
             while (true) {
                 if (try websocket.decodeFrame(self.recv.items)) |frame| {
                     switch (frame.opcode) {
@@ -298,7 +335,7 @@ pub fn Connection(comptime Stream: type) type {
                 // message accumulates in `msg`, which the cap above guards.
                 if (self.recv.items.len > max_message_len + websocket.max_frame_header_len)
                     return ConnectionError.MessageTooLarge;
-                if (!try self.fill()) return null; // EOF
+                if (!try self.fill(deadline)) return null; // EOF
             }
         }
 
@@ -323,9 +360,9 @@ pub fn Connection(comptime Stream: type) type {
         }
 
         /// Reads more bytes into `recv`. Returns false on EOF.
-        fn fill(self: *Self) !bool {
+        fn fill(self: *Self, deadline: ?std.Io.Clock.Timestamp) !bool {
             var tmp: [4096]u8 = undefined;
-            const n = try self.stream.read(&tmp);
+            const n = try self.stream.read(&tmp, deadline);
             if (n == 0) return false;
             // Every inbound byte, not every message: a pong carries no message
             // and is exactly the evidence a keepalive is looking for.
@@ -358,13 +395,23 @@ const posix = std.posix;
 pub const IoStream = struct {
     reader: *std.Io.Reader,
     writer: *std.Io.Writer,
+    /// For the deadline in `Connection.receiveTimeout`. Null in the hermetic
+    /// tests, which point `reader` at a fixed buffer and never block, so a
+    /// deadline there is simply ignored.
+    io: ?std.Io = null,
+    socket: ?std.Io.net.Socket = null,
+    /// The RAW transport reader under TLS, whose buffer must also be consulted
+    /// before waiting. Null for plain `ws://`, where `reader` already is it.
+    transport_reader: ?*std.Io.Reader = null,
     /// For TLS, `writer` is the TLS session writer, whose flush only drains
     /// ciphertext into the *underlying* transport writer's buffer — that
     /// transport writer must then be flushed too for the bytes to reach the
     /// socket. Null for plain `ws://`, where `writer` already is the transport.
     transport_writer: ?*std.Io.Writer = null,
 
-    pub fn read(self: IoStream, buffer: []u8) std.Io.Reader.ShortError!usize {
+    pub const ReadError = std.Io.Reader.ShortError || error{Timeout};
+
+    pub fn read(self: IoStream, buffer: []u8, deadline: ?std.Io.Clock.Timestamp) ReadError!usize {
         // Return whatever is already buffered, else exactly ONE underlying
         // read's worth — like a POSIX `read`, never blocking for more once some
         // bytes are available.
@@ -388,6 +435,48 @@ pub const IoStream = struct {
         // record lands, on both `ws://` and `wss://`.
         const r = self.reader;
         while (r.bufferedLen() == 0) {
+            // The deadline, as a READINESS check rather than a read timeout.
+            //
+            // A read timeout cannot be done here at all: `SO_RCVTIMEO` makes the
+            // read return EAGAIN, and this io model treats EAGAIN as a
+            // programmer bug and panics in Debug (and returns a meaningless
+            // `error.Unexpected` in ReleaseFast). See `Relay.shutdown`.
+            //
+            // So peek instead. `MSG_PEEK` consumes nothing, which is what makes
+            // this safe: a deadline that fires leaves the socket, the kernel
+            // buffer, `recv`, `msg` and the TLS record state exactly as they
+            // were, so calling again resumes rather than resyncs. Neither of the
+            // hazards a read timeout would raise, a half-consumed frame or a
+            // half-consumed TLS record, can arise from a wait that reads nothing.
+            //
+            // Gated on BOTH buffers being empty, and that is load-bearing. The
+            // raw fd says nothing about bytes already decrypted into the TLS
+            // reader or already sitting in the transport reader, so peeking
+            // without this check can time out with a complete message in hand.
+            // That is the same class of bug the comment above records.
+            if (deadline) |d| {
+                if (self.io) |io| if (self.socket) |sock| {
+                    const raw_empty = if (self.transport_reader) |tr| tr.bufferedLen() == 0 else true;
+                    if (raw_empty) {
+                        var msgs: [1]std.Io.net.IncomingMessage = .{.init};
+                        var one: [1]u8 = undefined;
+                        const maybe_err, _ = sock.receiveManyTimeout(io, &msgs, &one, .{ .peek = true }, .{ .deadline = d });
+                        // Its own error, never `ReadFailed`. A caller has to be
+                        // able to tell "nothing yet, ask again" from "this
+                        // socket is finished", and they are the same value if
+                        // this collapses them.
+                        //
+                        // Only Timeout is acted on. Every other outcome falls
+                        // through to the real read below, which is the one
+                        // allowed to decide the socket is finished: a readiness
+                        // probe has no business ending a connection.
+                        if (maybe_err) |err| switch (err) {
+                            error.Timeout => return error.Timeout,
+                            else => {},
+                        };
+                    }
+                };
+            }
             r.fillMore() catch |err| switch (err) {
                 error.EndOfStream => return 0,
                 error.ReadFailed => return error.ReadFailed,
@@ -463,6 +552,19 @@ pub const Relay = struct {
     }
     pub fn receive(self: *Relay) !?message.ParsedRelayMessage {
         return self.conn.receive();
+    }
+
+    /// `receive` with a deadline. See `Connection.receiveTimeout`: returns
+    /// `error.Timeout` rather than null, and consumes nothing when it does, so
+    /// the caller can do its housekeeping and ask again on the same socket.
+    ///
+    /// This is what a reader needs in order to notice that the pool changed
+    /// under it. Without it the only lever over a blocked reader is
+    /// `shutdown`, which is a teardown: over TLS it leaves the session
+    /// poisoned with `TlsConnectionTruncated`, so it cannot be used to pause
+    /// one subscription on a socket that is still serving others.
+    pub fn receiveTimeout(self: *Relay, timeout: std.Io.Timeout) !?message.ParsedRelayMessage {
+        return self.conn.receiveTimeout(timeout);
     }
 
     /// Sends a keepalive ping. See `Connection.ping`; `io` is the calling
@@ -606,10 +708,21 @@ pub fn dial(gpa: std.mem.Allocator, io: std.Io, url: []const u8) !*Relay {
             .reader = &ts.client.reader,
             .writer = &ts.client.writer,
             .transport_writer = &transport.tcp_writer.interface,
+            // The deadline's readiness probe needs the raw socket, and needs to
+            // consult the RAW reader as well as the TLS one: bytes already
+            // decrypted, or already sitting in the transport buffer, are a
+            // message in hand that the fd knows nothing about.
+            .io = io,
+            .socket = transport.tcp.socket,
+            .transport_reader = &transport.tcp_reader.interface,
         };
     } else .{
         .reader = &transport.tcp_reader.interface,
         .writer = &transport.tcp_writer.interface,
+        .io = io,
+        .socket = transport.tcp.socket,
+        // No TLS layer, so `reader` already IS the transport reader and the
+        // loop's own `bufferedLen` check covers it.
     };
 
     const relay = try gpa.create(Relay);
@@ -639,7 +752,9 @@ const FakeStream = struct {
     written: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
 
-    fn read(self: *FakeStream, buffer: []u8) error{}!usize {
+    fn read(self: *FakeStream, buffer: []u8, deadline: ?std.Io.Clock.Timestamp) error{}!usize {
+        // Never blocks, so a deadline is meaningless here.
+        _ = deadline;
         const remaining = self.to_read[self.read_pos..];
         const n = @min(buffer.len, remaining.len);
         @memcpy(buffer[0..n], remaining[0..n]);
@@ -695,7 +810,8 @@ const HandshakeStream = struct {
         try self.written.appendSlice(self.allocator, bytes);
     }
 
-    fn read(self: *HandshakeStream, buffer: []u8) !usize {
+    fn read(self: *HandshakeStream, buffer: []u8, deadline: ?std.Io.Clock.Timestamp) !usize {
+        _ = deadline;
         if (!self.built) {
             const req = self.written.items;
             const prefix = "Sec-WebSocket-Key: ";
@@ -1054,7 +1170,7 @@ test "IoStream.read returns one buffered record without pulling the next" {
     const stream: IoStream = .{ .reader = &rec.reader, .writer = &writer };
 
     var out: [4096]u8 = undefined;
-    const n = try stream.read(&out);
+    const n = try stream.read(&out, null);
     try std.testing.expectEqualStrings("first", out[0..n]);
     // Crucially, it did NOT go on to pull "second" to fill the 4 KiB buffer.
     try std.testing.expectEqual(@as(usize, 1), rec.reads);
@@ -1093,7 +1209,7 @@ test "IoStream.read loops past a read that buffers no bytes instead of reporting
     const stream: IoStream = .{ .reader = &sd.reader, .writer = &writer };
 
     var out: [4096]u8 = undefined;
-    const n = try stream.read(&out);
+    const n = try stream.read(&out, null);
     try std.testing.expectEqualStrings("data", out[0..n]);
     try std.testing.expectEqual(@as(usize, 2), sd.calls); // looped past the empty read
 }
@@ -1239,4 +1355,64 @@ test "answering a ping does not count as hearing from the relay" {
     try conn.sendFrame(std.testing.io, .pong, &.{});
     try std.testing.expect(written.items.len > 0);
     try std.testing.expectEqual(@as(?i64, null), conn.idleMs(std.testing.io));
+}
+
+test "a deadline fires on a quiet socket and leaves the connection usable" {
+    // The property the whole shape rests on: a deadline that expires must
+    // consume NOTHING, so the very next call still sees the message that was
+    // half-arrived, or arrives later, on the same connection.
+    //
+    // A read timeout could not promise that. This is a readiness probe, so
+    // there is no state to resynchronise: the test drives a real socket pair
+    // rather than a fixed buffer, because a fixed reader never blocks and would
+    // prove nothing about the gate.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var listen_address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try listen_address.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    // Port 0 asks the kernel to choose; `listen` calls getsockname, so the
+    // socket it hands back carries the port it actually got.
+    var bound = server.socket.address;
+
+    const client = try bound.connect(io, .{ .mode = .stream });
+    defer client.close(io);
+    const served = try server.accept(io);
+    defer served.close(io);
+
+    var c_read_buf: [4096]u8 = undefined;
+    var c_write_buf: [4096]u8 = undefined;
+    var c_reader = client.reader(io, &c_read_buf);
+    var c_writer = client.writer(io, &c_write_buf);
+
+    var conn = LiveConnection.init(allocator, io, .{
+        .reader = &c_reader.interface,
+        .writer = &c_writer.interface,
+        .io = io,
+        .socket = client.socket,
+    });
+    defer conn.deinit();
+
+    // Nothing sent yet, so the deadline is the only way out. Without the gate
+    // this call never returns and the test hangs, which is the failure the
+    // issue describes.
+    const started = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+    try std.testing.expectError(error.Timeout, conn.receiveTimeout(.{ .duration = .{ .raw = .fromMilliseconds(250), .clock = .awake } }));
+    const waited = std.Io.Timestamp.now(io, .awake).toMilliseconds() - started;
+    try std.testing.expect(waited >= 200);
+
+    // And the connection is not merely alive, it is UNDISTURBED: a message sent
+    // after the timeout arrives whole on the same socket.
+    var frame: std.ArrayList(u8) = .empty;
+    defer frame.deinit(allocator);
+    try appendServerText(&frame, allocator, "[\"NOTICE\",\"after the deadline\"]");
+    var srv_write_buf: [4096]u8 = undefined;
+    var srv_writer = served.writer(io, &srv_write_buf);
+    try srv_writer.interface.writeAll(frame.items);
+    try srv_writer.interface.flush();
+
+    var m = (try conn.receiveTimeout(.{ .duration = .{ .raw = .fromMilliseconds(5000), .clock = .awake } })).?;
+    defer m.deinit();
+    try std.testing.expectEqualStrings("after the deadline", m.value.notice.message);
 }
