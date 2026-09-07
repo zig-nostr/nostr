@@ -12,7 +12,7 @@ workflow used for all changes to this repository.
 ## Workflow
 
 1. **Open or claim an issue** describing the change, with acceptance
-   criteria. Every PR links back to an issue — even small fixes.
+   criteria. Every PR links back to an issue, even small fixes.
 2. **Branch from `main`**, named after the change
    (`feat/nip19-encoding`, `fix/event-id-hash`, `chore/ci-macos`).
 3. **Implement** the change with tests. Update `CHANGELOG.md` (Unreleased
@@ -53,5 +53,5 @@ for what's built so far and what's next.
 
 ## Security
 
-Do not open public issues for security vulnerabilities — see
+Do not open public issues for security vulnerabilities; see
 [`SECURITY.md`](SECURITY.md).

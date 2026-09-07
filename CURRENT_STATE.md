@@ -5,16 +5,22 @@ A snapshot for somebody reading this repo. The
 [milestones](https://github.com/zig-nostr/plaza/milestones) are the tracker; this
 file only says where things stand today.
 
+Version numbers are deliberately not repeated here. This file went nine releases
+out of date saying them, and a stale number is worse than no number: it is
+readable, specific and wrong. Each project's own releases page is the answer.
+
 ## The library
 
-`v0.5.0`. Shipped and covered by tests:
+[Latest release](https://github.com/zig-nostr/nostr/releases). Shipped and
+covered by tests:
 
 - **Core**: secp256k1 keys, BIP-340 Schnorr signatures against the official
   vectors, the NIP-01 event model, NIP-19/21 encoding, NIP-06 derivation, NIP-49
   encrypted keys.
 - **Transport**: RFC 6455 WebSocket, a relay connection state machine, a live
   TCP/TLS dialer, NIP-42 authentication, and the NIP-65 outbox model with no
-  hardcoded relays.
+  hardcoded relays. A read can carry a deadline, so a thread serving a quiet
+  relay can still notice that its pool changed.
 - **Store**: a memory-mapped LMDB event store with a bounded, newest-first query
   planner. A 500-note feed query is 0.28 ms at 100,000 stored events, and a
   profile read is 8 microseconds.
@@ -27,22 +33,25 @@ on the roadmap while groups, messages, media and payments are still landing.
 
 ## The apps
 
-- **[Notary](https://github.com/zig-nostr/notary)** `v0.3.0`: a native macOS
-  NIP-46 signer. Your key lives in a local daemon, nothing signs without your
-  approval, and the `nsec` never enters a client.
-- **[Plaza](https://github.com/zig-nostr/plaza)** `v0.2.0`: the flagship client.
-  Read without an account, post in four clicks, with the feed rendered from
-  disk. Reads
-  every account you follow, with no cap on how far you can scroll.
+- **[Notary](https://github.com/zig-nostr/notary)**: a native NIP-46 signer.
+  Your key lives in a local daemon, nothing signs without your approval, and the
+  `nsec` never enters a client.
+- **[Plaza](https://github.com/zig-nostr/plaza)**: the flagship client. Read
+  without an account, post in four clicks, with the feed rendered from disk.
+  Reads every account you follow, with no cap on how far you can scroll.
 
-Both are downloadable. What comes next lands inside them rather than as new apps.
+Both are downloadable for macOS (Apple Silicon) and Linux (x86_64 and aarch64).
+Off macOS there is no platform text layer, so both draw every glyph from faces
+they carry: emoji are drawn in colour, and scripts those faces do not cover are
+not drawn at all. What comes next lands inside these two rather than as new apps.
 
 ## What is next
 
 The ten milestones, in order, are on the
-[roadmap](https://zignostr.com/roadmap). The first is notifications: who acted,
-what they did, and the note it was about, which the current one-line row does not
-say.
+[roadmap](https://zignostr.com/roadmap). The first is everything you do on the
+first day: the four things already built that do not work (reposts by people you
+follow, relay hints, hashtags, bookmarks), then pictures, a full profile, zaps
+you can send, and search.
 
 That page also lists what is deliberately **not** being built, and why. Reading
 the second half is the faster way to understand the first.

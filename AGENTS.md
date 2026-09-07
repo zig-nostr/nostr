@@ -8,17 +8,24 @@ coding agents at the conventions, build system, and structure used here.
 `nostr` is a [Nostr](https://nostr.com) protocol library for Zig: keys and
 encoding, event construction and signing, relay transport, encrypted
 messaging, and a local-first event store. It has no runtime dependency on
-any specific application — it is consumed as a library by other repos in
+any specific application: it is consumed as a library by other repos in
 the `zig-nostr` org (a signer, a DM client, a read-only client).
 
 ## Repository layout
 
 ```
 src/
-  root.zig     — public module entry point (@import("nostr"))
-build.zig      — build graph: module + test step
-build.zig.zon  — package manifest, dependencies
-.zigversion    — pinned Zig compiler version
+  root.zig       # public module entry point (@import("nostr"))
+  keys.zig       # secp256k1 keys and BIP-340 signatures
+  event.zig      # the NIP-01 event model and canonical serialization
+  relay.zig      # the live dialer and the relay connection
+  websocket.zig  # RFC 6455 framing, hand-written
+  store.zig      # the local-first LMDB event store
+  liveness.zig   # when a relay connection has gone quiet
+  ...            # one file per NIP, plus filter/message/json/hex/bech32
+build.zig        # build graph: module + test step
+build.zig.zon    # package manifest, dependencies
+.zigversion      # pinned Zig compiler version
 ```
 
 As modules are added (keys, encoding, events, transport, store, crypto),
@@ -39,14 +46,17 @@ Use the Zig version pinned in `.zigversion`. CI runs on Linux and macOS.
 
 Current:
 
-- `bitcoin-core/secp256k1` — BIP-340 Schnorr signing/verification. Compiled
+- `bitcoin-core/secp256k1`: BIP-340 Schnorr signing/verification. Compiled
   from source and exposed to Zig via translate-c in `build.zig`; wrapped by
   `src/keys.zig`. Pinned by exact commit in `build.zig.zon`.
 
-Planned, added as each milestone needs them:
+- `LMDB/lmdb`: the local event store's backing. Compiled from source and
+  pinned the same way.
+- `atman/zg`: Unicode normalization, for NIP-49 passphrases.
 
-- `karlseguin/websocket.zig` — relay transport.
-- `allyourcodebase/lmdb` — local event store backing.
+The websocket transport is not a dependency. `src/websocket.zig` implements
+RFC 6455 framing directly, because the relay connection needs control over when
+a frame surfaces and no client library exposed that.
 
 Dependencies are pinned in `build.zig.zon`; never vendor or hand-roll crypto
 primitives that have an audited upstream implementation.
@@ -61,13 +71,13 @@ primitives that have an audited upstream implementation.
 - Never push directly to `main`; all changes land via reviewed PRs from
   short-lived branches.
 - Update `CHANGELOG.md` (Unreleased section) and `CURRENT_STATE.md` inside
-  the same PR that introduces the change — not as a follow-up.
+  the same PR that introduces the change, not as a follow-up.
 
 ## Code style
 
 - `zig fmt` is the formatter; CI fails on unformatted code.
 - Prefer explicit error sets over `anyerror`.
-- No hand-rolled cryptography for signing/verification — bind to audited
+- No hand-rolled cryptography for signing/verification: bind to audited
   upstream implementations (see Dependency graph).
 - Validate all externally-sourced data (relay messages, parsed events) at
   the boundary; don't assume well-formed input.
@@ -81,9 +91,9 @@ must pass its official test vectors, before either ships.
 
 ## Orientation
 
-- [`CURRENT_STATE.md`](CURRENT_STATE.md) — what's built, in progress, and
+- [`CURRENT_STATE.md`](CURRENT_STATE.md): what's built, in progress, and
   next, updated on every merge.
-- [`CONTRIBUTING.md`](CONTRIBUTING.md) — full contribution workflow.
+- [`CONTRIBUTING.md`](CONTRIBUTING.md): full contribution workflow.
 - [GitHub milestones](https://github.com/zig-nostr/nostr/milestones) and the
-  [org project board](https://github.com/orgs/zig-nostr/projects) — the
+  [org project board](https://github.com/orgs/zig-nostr/projects): the
   full roadmap.
