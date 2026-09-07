@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-09-07
+
+### Changed
+
+- Dependencies are fetched as HTTPS tarballs rather than over the git protocol.
+  Zig's git client gives up under load with `unable to discover remote git
+  server capabilities: ProtocolError`, which in one afternoon failed three CI
+  jobs across two runner architectures in the apps built on this library and
+  killed a release build outright, leaving a tag with no release behind it.
+
+  Nothing about the dependencies changed. Every commit is the same one, pinned
+  by full SHA, and every content hash is identical: `zig fetch` returns the same
+  hash for the tarball and for the git checkout of all three. That identity is
+  the proof this changes how the bytes arrive and not which bytes arrive.
+
 ## [0.13.0] - 2026-08-28
 
 ### Removed
