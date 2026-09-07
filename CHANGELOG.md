@@ -8,6 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-09-07
+
+### Fixed
+
+- `relay.Relay.deinit` frees the `Relay` itself. It freed the transport, the
+  buffers and the connection and then left the struct `dial` allocated behind,
+  so every dial leaked it. No caller could have covered for that: `dial` hands
+  back a pointer and its own documentation says to free it with `deinit`, so
+  nobody was destroying it separately, and neither app built on this library
+  did. A client that reconnects on a dropped socket leaked one per reconnect,
+  for the life of the process.
+
+  Found by driving `receiveTimeout` against a live `wss://` relay under a
+  leak-checking allocator, which is also the only way to see it: it takes a real
+  dial, and a real dial takes a socket.
+
 ## [0.14.0] - 2026-09-07
 
 ### Added

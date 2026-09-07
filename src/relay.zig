@@ -595,6 +595,13 @@ pub const Relay = struct {
         self.transport.tcp.shutdown(io, .both) catch {};
     }
 
+    /// Frees everything `dial` allocated, INCLUDING this `Relay`. The pointer
+    /// is invalid afterwards.
+    ///
+    /// It did not free the `Relay` itself, so every dial leaked the struct and
+    /// no caller could tell: `dial` hands back a pointer and says "free with
+    /// `deinit`", so nobody was destroying it either. A client that reconnects
+    /// on every dropped socket leaked one per reconnect, forever.
     pub fn deinit(self: *Relay) void {
         self.conn.close() catch {};
         self.conn.deinit();
@@ -603,6 +610,7 @@ pub const Relay = struct {
         const transport = self.transport;
         self.* = undefined;
         gpa.destroy(transport);
+        gpa.destroy(self);
     }
 };
 
