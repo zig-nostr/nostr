@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.2] - 2026-09-21
+
+### Fixed
+
+- Control bytes are escaped as `\u00XX`, in the id serialization and in the wire JSON alike, matching nostr-tools and go-nostr.
+
+  Two faults shared one line. `toJson` escaped content and tag fields with the id escaper, which handles the seven characters NIP-01 names and copies every other byte through untouched. RFC 8259 forbids a raw byte below 0x20 inside a JSON string, so an event whose content carried one was not JSON at all: `fromJson` refused this library's own `toJson` output, and a relay would have rejected the event on the wire.
+
+  The id had the same cause and a wider blast radius. NIP-01 says the seven escapes are the only ones and that all other characters go in verbatim, and this library followed that sentence deliberately. The dominant implementations do not. nostr-tools builds the preimage with `JSON.stringify`, and go-nostr writes the same behaviour by hand in `escapeString`, so both escape every remaining control byte. Following the sentence produced an id nothing else reproduces: a correctly signed event from any JS or Go client read as a bad signature here, and an id computed here was unverifiable everywhere else.
+
+  This changes the id computed for content or tags containing a control byte, and nothing else. Everything from 0x20 up, raw UTF-8 included, is still copied verbatim, so reaching for a general-purpose encoder is still wrong: escaping non-ASCII would change the id.
+
 ## [0.14.1] - 2026-09-07
 
 ### Fixed
