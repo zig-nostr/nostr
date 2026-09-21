@@ -24,12 +24,26 @@ pub const Event = struct {
     sig: [64]u8,
 };
 
-/// Escapes a string per the NIP-01 id-serialization rule: only `\n \" \\ \r
-/// \t \b \f` are escaped; every other byte (including other control
-/// characters and raw UTF-8) is copied verbatim. This is deliberately
-/// stricter than general-purpose JSON escaping, which the spec forbids —
-/// using a generic JSON encoder here would produce a different byte
-/// sequence, and therefore a different id, than other implementations.
+/// Escapes a string for the id serialization and for the wire JSON, which
+/// want the same bytes.
+///
+/// NIP-01 names seven escapes (`\n \" \\ \r \t \b \f`) and says all other
+/// characters must be included verbatim. Read literally that leaves a byte
+/// below 0x20 sitting raw inside a JSON string, and RFC 8259 forbids exactly
+/// that, so the wire form would not be JSON and no relay could parse it.
+///
+/// The sentence also does not describe what the network does. nostr-tools
+/// builds the preimage with `JSON.stringify` and go-nostr writes the same
+/// behaviour by hand in `escapeString`, so both escape every remaining
+/// control byte as `\u00XX`. Following the sentence instead of the
+/// implementations produces an id nothing else reproduces, which turns a
+/// correctly signed event from any JS or Go client into a bad signature here
+/// and makes our own ids unverifiable everywhere else.
+///
+/// So the remaining control bytes are escaped as `\u00XX`. Everything from
+/// 0x20 up, raw UTF-8 included, is still copied verbatim, which is where the
+/// warning against a general-purpose encoder still holds: escaping non-ASCII
+/// would change the id.
 fn appendJsonString(list: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) std.mem.Allocator.Error!void {
     try list.append(allocator, '"');
     for (s) |c| {
@@ -41,7 +55,13 @@ fn appendJsonString(list: *std.ArrayList(u8), allocator: std.mem.Allocator, s: [
             '\t' => try list.appendSlice(allocator, "\\t"),
             0x08 => try list.appendSlice(allocator, "\\b"),
             0x0C => try list.appendSlice(allocator, "\\f"),
-            else => try list.append(allocator, c),
+            else => |b| {
+                if (b < 0x20) {
+                    try list.print(allocator, "\\u{x:0>4}", .{b});
+                } else {
+                    try list.append(allocator, b);
+                }
+            },
         }
     }
     try list.append(allocator, '"');
@@ -280,6 +300,58 @@ test "canonical serialization: empty tags, mixed escapes" {
     const id = try computeId(allocator, pubkey, 0, 0, &tags, content);
     const expected_id = try hexToBytes32("06e17cd2f072210550eba01397803e32f3b035cb01b5400665fa282f09060106");
     try std.testing.expectEqualSlices(u8, &expected_id, &id);
+}
+
+test "control bytes escape the way the rest of the network escapes them" {
+    const allocator = std.testing.allocator;
+    const pubkey = try hexToBytes32("3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d");
+    const tags = [_]Tag{&[_][]const u8{ "e", "a\x02b" }};
+    const content = "a\x01b\x1bc";
+
+    // These bytes are what `JSON.stringify` produces, which is how nostr-tools
+    // builds the preimage and what go-nostr's `escapeString` writes by hand.
+    // Derived from an independent implementation rather than from this code, so
+    // it fails if this file ever drifts back to the spec's literal wording.
+    const serialized = try serializeCanonical(allocator, pubkey, 1700000000, 1, &tags, content);
+    defer allocator.free(serialized);
+    const expected = "[0,\"3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d\",1700000000,1,[[\"e\",\"a\\u0002b\"]],\"a\\u0001b\\u001bc\"]";
+    try std.testing.expectEqualStrings(expected, serialized);
+
+    const id = try computeId(allocator, pubkey, 1700000000, 1, &tags, content);
+    const expected_id = try hexToBytes32("d70263901ff294ef8559ce5626d7c3b216877255385fb23ba00c4b60d583fd00");
+    try std.testing.expectEqualSlices(u8, &expected_id, &id);
+}
+
+test "an event carrying control bytes survives its own wire format" {
+    const allocator = std.testing.allocator;
+    const pubkey = try hexToBytes32("3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d");
+    const tags = [_]Tag{&[_][]const u8{ "e", "a\x02b" }};
+    const content = "a\x01b\x1bc";
+
+    const id = try computeId(allocator, pubkey, 1700000000, 1, &tags, content);
+    const event = Event{
+        .id = id,
+        .pubkey = pubkey,
+        .created_at = 1700000000,
+        .kind = 1,
+        .tags = &tags,
+        .content = content,
+        .sig = [_]u8{0xab} ** 64,
+    };
+
+    const json_text = try toJson(allocator, event);
+    defer allocator.free(json_text);
+
+    // The point of the test: the wire form used to carry the control bytes raw,
+    // which is not JSON, so this parse failed on our own output.
+    try std.testing.expect(std.mem.indexOfScalar(u8, json_text, 0x01) == null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, json_text, 0x1b) == null);
+
+    var parsed = try fromJson(allocator, json_text);
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(content, parsed.value.content);
+    try std.testing.expectEqualStrings("a\x02b", parsed.value.tags[0][1]);
+    try std.testing.expectEqualSlices(u8, &event.id, &parsed.value.id);
 }
 
 test "toJson / fromJson round trip" {
