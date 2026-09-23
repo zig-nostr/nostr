@@ -134,8 +134,12 @@ pub fn parseRelayMessage(gpa: std.mem.Allocator, json_text: []const u8) Error!Pa
     }
     const allocator = arena.allocator();
 
-    const root = std.json.parseFromSliceLeaky(std.json.Value, allocator, json_text, .{}) catch
-        return Error.InvalidMessage;
+    // Out of memory is not a malformed message, and a caller that skips
+    // malformed messages would otherwise drop a good one without a word.
+    const root = std.json.parseFromSliceLeaky(std.json.Value, allocator, json_text, .{}) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => Error.InvalidMessage,
+    };
     const items = switch (root) {
         .array => |a| a.items,
         else => return Error.InvalidMessage,
@@ -146,7 +150,10 @@ pub fn parseRelayMessage(gpa: std.mem.Allocator, json_text: []const u8) Error!Pa
     const value: RelayMessage = if (std.mem.eql(u8, tag, "EVENT")) blk: {
         if (items.len < 3) return Error.InvalidMessage;
         const sub = asString(items[1]) orelse return Error.InvalidMessage;
-        const ev = event_mod.fromValueLeaky(allocator, items[2]) catch return Error.InvalidMessage;
+        const ev = event_mod.fromValueLeaky(allocator, items[2]) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => Error.InvalidMessage,
+        };
         break :blk .{ .event = .{ .subscription_id = sub, .event = ev } };
     } else if (std.mem.eql(u8, tag, "OK")) blk: {
         if (items.len < 4) return Error.InvalidMessage;
@@ -296,6 +303,36 @@ test "parse EVENT message whose event carries a field NIP-01 does not name" {
         },
         else => return error.WrongVariant,
     }
+}
+
+test "parse EVENT refuses an event naming the same field twice" {
+    const allocator = std.testing.allocator;
+    const twice = "[\"EVENT\",\"s\",{\"id\":\"" ++ "00" ** 32 ++ "\",\"pubkey\":\"" ++ "00" ** 32 ++ "\",\"created_at\":0,\"kind\":1,\"tags\":[],\"content\":\"a\",\"content\":\"b\",\"sig\":\"" ++ "00" ** 64 ++ "\"}]";
+    try std.testing.expectError(Error.InvalidMessage, parseRelayMessage(allocator, twice));
+}
+
+fn parseAndFree(allocator: std.mem.Allocator, text: []const u8) !void {
+    var parsed = try parseRelayMessage(allocator, text);
+    parsed.deinit();
+}
+
+test "running out of memory is reported as that, not as a malformed message" {
+    const allocator = std.testing.allocator;
+    // Enough tags that the event's own conversion has to grow the parse arena,
+    // so its allocations reach the failing allocator too and not only the
+    // outer parse's.
+    var ev = sampleEvent();
+    const one: event_mod.Tag = &[_][]const u8{ "p", test_pubkey };
+    const tags = [_]event_mod.Tag{one} ** 256;
+    ev.tags = &tags;
+    const j = try encodeEvent(allocator, ev);
+    defer allocator.free(j);
+    const framed = try std.fmt.allocPrint(allocator, "[\"EVENT\",\"sub1\",{s}]", .{j["[\"EVENT\",".len .. j.len - 1]});
+    defer allocator.free(framed);
+
+    // Fails every allocation in turn, and requires each failure to come back
+    // as OutOfMemory, with nothing leaked.
+    try std.testing.checkAllAllocationFailures(allocator, parseAndFree, .{framed});
 }
 
 test "parse OK message (accepted and rejected)" {
