@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- An event object carrying a key NIP-01 does not name parses, and the extra key is ignored. `fromJson` and the relay message parser refused it with `UnknownField`, so a valid event carrying one was dropped, and on a relay connection it failed the whole `EVENT` message. The id and the signature cover the seven named fields and nothing else, so an extra key cannot change what was signed. A key named twice is still refused, because then it is ambiguous which value the signature covers.
+
 ## [0.14.2] - 2026-09-21
 
 ### Fixed

@@ -203,6 +203,11 @@ pub fn toJson(allocator: std.mem.Allocator, event: Event) std.mem.Allocator.Erro
     return list.toOwnedSlice(allocator);
 }
 
+/// The seven fields NIP-01 names. An event object may carry other keys beside
+/// them (some relays and clients add their own), and they are skipped rather
+/// than refused: the id and the signature cover these seven and nothing else,
+/// so an extra key cannot change what was signed. A key named twice is still
+/// refused, because then it is ambiguous which value the signature covers.
 const WireEvent = struct {
     id: []const u8,
     pubkey: []const u8,
@@ -212,6 +217,8 @@ const WireEvent = struct {
     content: []const u8,
     sig: []const u8,
 };
+
+const wire_options: std.json.ParseOptions = .{ .ignore_unknown_fields = true };
 
 pub const Parsed = struct {
     arena: *std.heap.ArenaAllocator,
@@ -235,7 +242,7 @@ pub fn fromJson(gpa: std.mem.Allocator, json_text: []const u8) !Parsed {
     }
     const allocator = arena.allocator();
 
-    const wire = try std.json.parseFromSliceLeaky(WireEvent, allocator, json_text, .{});
+    const wire = try std.json.parseFromSliceLeaky(WireEvent, allocator, json_text, wire_options);
 
     return Parsed{
         .arena = arena,
@@ -252,7 +259,7 @@ pub fn fromJson(gpa: std.mem.Allocator, json_text: []const u8) !Parsed {
 /// whole message shares one arena, so re-serializing just to call `fromJson`
 /// would be wasteful.
 pub fn fromValueLeaky(allocator: std.mem.Allocator, value: std.json.Value) !Event {
-    const wire = try std.json.parseFromValueLeaky(WireEvent, allocator, value, .{});
+    const wire = try std.json.parseFromValueLeaky(WireEvent, allocator, value, wire_options);
     return fromWire(wire);
 }
 
@@ -391,6 +398,44 @@ test "fromJson rejects malformed hex id" {
     const allocator = std.testing.allocator;
     const bad = "{\"id\":\"zz\",\"pubkey\":\"" ++ "00" ** 32 ++ "\",\"created_at\":0,\"kind\":0,\"tags\":[],\"content\":\"\",\"sig\":\"" ++ "00" ** 64 ++ "\"}";
     try std.testing.expectError(hex.Error.InvalidHex, fromJson(allocator, bad));
+}
+
+test "an event carrying a field NIP-01 does not name still parses and verifies" {
+    const allocator = std.testing.allocator;
+    var signer = try keys.Signer.initRandomized(std.testing.io);
+    defer signer.deinit();
+    const kp = try signer.generateKeyPair(std.testing.io);
+
+    const tags = [_]Tag{&[_][]const u8{ "t", "zig" }};
+    const ev = try create(allocator, signer, kp, 1700000000, 1, &tags, "hello", null);
+    const wire = try toJson(allocator, ev);
+    defer allocator.free(wire);
+
+    // The id and signature cover the seven named fields and nothing else, so
+    // a key beside them, of any shape, changes nothing about the event.
+    const extra = try std.mem.concat(allocator, u8, &.{
+        "{\"relays\":[\"wss://relay.example\"],\"meta\":{\"n\":[1,{\"x\":null}]},",
+        wire[1..],
+    });
+    defer allocator.free(extra);
+
+    var parsed = try fromJson(allocator, extra);
+    defer parsed.deinit();
+    try std.testing.expectEqualSlices(u8, &ev.id, &parsed.value.id);
+    try std.testing.expectEqualStrings("hello", parsed.value.content);
+    try std.testing.expect(try verify(allocator, signer, parsed.value));
+
+    // Written back out, it is the event that was signed, without the extra key.
+    const again = try toJson(allocator, parsed.value);
+    defer allocator.free(again);
+    try std.testing.expectEqualStrings(wire, again);
+}
+
+test "an event naming the same field twice is still refused" {
+    const allocator = std.testing.allocator;
+    // Two contents make it ambiguous which one the signature covers.
+    const twice = "{\"id\":\"" ++ "00" ** 32 ++ "\",\"pubkey\":\"" ++ "00" ** 32 ++ "\",\"created_at\":0,\"kind\":1,\"tags\":[],\"content\":\"a\",\"content\":\"b\",\"sig\":\"" ++ "00" ** 64 ++ "\"}";
+    try std.testing.expectError(error.DuplicateField, fromJson(allocator, twice));
 }
 
 test "create produces a valid, self-consistent, verifiable event" {
