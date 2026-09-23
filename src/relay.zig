@@ -143,6 +143,13 @@ pub fn Connection(comptime Stream: type) type {
         /// is NOT the one blocked on the socket. A thread waiting on a dead peer
         /// cannot notice anything, least of all that it is waiting.
         last_rx_ms: std.atomic.Value(i64),
+        /// Messages that arrived whole but that the parser could not read, so
+        /// `receive` skipped them. A relay can send anything; one message this
+        /// library cannot read costs that message and nothing after it.
+        ///
+        /// Read it on the thread that calls `receive`, which is the only one
+        /// that writes it.
+        unreadable: u64,
 
         pub fn init(allocator: std.mem.Allocator, io: std.Io, stream: Stream) Self {
             return .{
@@ -153,6 +160,7 @@ pub fn Connection(comptime Stream: type) type {
                 .msg = .empty,
                 .write_lock = .init,
                 .last_rx_ms = .init(0),
+                .unreadable = 0,
             };
         }
 
@@ -248,6 +256,10 @@ pub fn Connection(comptime Stream: type) type {
         /// relay closes the connection (a close frame or EOF). The caller owns
         /// the returned message and must `deinit` it.
         ///
+        /// A message the parser cannot read (not JSON, a type it has no case
+        /// for, or the wrong shape) is skipped and counted in `unreadable`,
+        /// and the read carries on to the next one.
+        ///
         /// Waits forever. `receiveTimeout` is the one with a deadline.
         pub fn receive(self: *Self) !?message.ParsedRelayMessage {
             return self.receiveUntil(null);
@@ -293,9 +305,29 @@ pub fn Connection(comptime Stream: type) type {
                             const fin = frame.fin;
                             self.consume(frame.frame_len);
                             if (fin) {
-                                const parsed = try message.parseRelayMessage(self.allocator, self.msg.items);
-                                self.msg.clearRetainingCapacity();
-                                return parsed;
+                                // Cleared on every way out, errors included. A
+                                // message left here would be glued onto the
+                                // front of the next one, and every message after
+                                // it on this connection would fail to parse too.
+                                defer self.msg.clearRetainingCapacity();
+                                return message.parseRelayMessage(self.allocator, self.msg.items) catch |err| switch (err) {
+                                    // Skipped, as the other clients skip it: a
+                                    // type this parser has no case for, or a
+                                    // malformed one, is not a broken connection.
+                                    error.InvalidMessage => {
+                                        self.unreadable += 1;
+                                        // The deadline is otherwise noticed only
+                                        // when the socket runs dry, and a relay
+                                        // streaming messages this cannot read
+                                        // never lets it run dry.
+                                        if (deadline) |d| {
+                                            const now = std.Io.Clock.Timestamp.now(self.io, d.clock);
+                                            if (now.raw.nanoseconds >= d.raw.nanoseconds) return error.Timeout;
+                                        }
+                                        continue;
+                                    },
+                                    error.OutOfMemory => |e| return e,
+                                };
                             }
                         },
                         .ping => {
@@ -552,6 +584,12 @@ pub const Relay = struct {
     }
     pub fn receive(self: *Relay) !?message.ParsedRelayMessage {
         return self.conn.receive();
+    }
+
+    /// How many messages this connection skipped because the parser could not
+    /// read them. See `Connection.unreadable`.
+    pub fn unreadable(self: *const Relay) u64 {
+        return self.conn.unreadable;
     }
 
     /// `receive` with a deadline. See `Connection.receiveTimeout`: returns
@@ -946,6 +984,65 @@ test "receive parses a scripted EVENT then EOSE" {
     try std.testing.expect((try conn.receive()) == null);
 }
 
+test "a message the parser cannot read costs that message and nothing after it" {
+    const allocator = std.testing.allocator;
+    var written: std.ArrayList(u8) = .empty;
+    defer written.deinit(allocator);
+
+    var script: std.ArrayList(u8) = .empty;
+    defer script.deinit(allocator);
+    // Not JSON, then a type this parser has no case for, then an EVENT whose
+    // event is malformed, and only then something readable.
+    try appendServerText(&script, allocator, "not json at all");
+    try appendServerText(&script, allocator, "[\"COUNT\",\"s1\",{\"count\":3}]");
+    try appendServerText(&script, allocator, "[\"EVENT\",\"s1\",{\"id\":\"zz\"}]");
+    try appendServerText(&script, allocator, "[\"NOTICE\",\"still here\"]");
+    try appendServerText(&script, allocator, "[\"EOSE\",\"s1\"]");
+
+    var server = FakeStream{ .to_read = script.items, .written = &written, .allocator = allocator };
+    var conn = newConn(allocator, &server);
+    defer conn.deinit();
+
+    var m1 = (try conn.receive()).?;
+    defer m1.deinit();
+    try std.testing.expectEqualStrings("still here", m1.value.notice.message);
+    try std.testing.expectEqual(@as(u64, 3), conn.unreadable);
+
+    // The skipped bytes are gone, not waiting in front of the next message.
+    var m2 = (try conn.receive()).?;
+    defer m2.deinit();
+    try std.testing.expectEqualStrings("s1", m2.value.eose.subscription_id);
+    try std.testing.expectEqual(@as(u64, 3), conn.unreadable);
+}
+
+test "skipping unreadable messages still stops at the deadline" {
+    const allocator = std.testing.allocator;
+    var written: std.ArrayList(u8) = .empty;
+    defer written.deinit(allocator);
+
+    var script: std.ArrayList(u8) = .empty;
+    defer script.deinit(allocator);
+    try appendServerText(&script, allocator, "[\"COUNT\",\"s1\",{\"count\":1}]");
+    try appendServerText(&script, allocator, "[\"COUNT\",\"s1\",{\"count\":2}]");
+    try appendServerText(&script, allocator, "[\"NOTICE\",\"after\"]");
+
+    var server = FakeStream{ .to_read = script.items, .written = &written, .allocator = allocator };
+    var conn = newConn(allocator, &server);
+    defer conn.deinit();
+
+    // A deadline that has already passed. The socket here never runs dry, so
+    // this is the only place the deadline can be noticed.
+    const now: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(0), .clock = .awake } };
+    try std.testing.expectError(error.Timeout, conn.receiveTimeout(now));
+    try std.testing.expectEqual(@as(u64, 1), conn.unreadable);
+
+    // Nothing the caller would have seen was lost.
+    var m = (try conn.receive()).?;
+    defer m.deinit();
+    try std.testing.expectEqualStrings("after", m.value.notice.message);
+    try std.testing.expectEqual(@as(u64, 2), conn.unreadable);
+}
+
 test "receive answers a ping with a pong and continues" {
     const allocator = std.testing.allocator;
     var written: std.ArrayList(u8) = .empty;
@@ -1234,6 +1331,7 @@ test "live dialer is semantically analyzed" {
     _ = &Relay.unsubscribe;
     _ = &Relay.authenticate;
     _ = &Relay.receive;
+    _ = &Relay.unreadable;
     _ = &Relay.deinit;
 }
 
