@@ -316,14 +316,7 @@ pub fn Connection(comptime Stream: type) type {
                                     // malformed one, is not a broken connection.
                                     error.InvalidMessage => {
                                         self.unreadable += 1;
-                                        // The deadline is otherwise noticed only
-                                        // when the socket runs dry, and a relay
-                                        // streaming messages this cannot read
-                                        // never lets it run dry.
-                                        if (deadline) |d| {
-                                            const now = std.Io.Clock.Timestamp.now(self.io, d.clock);
-                                            if (now.raw.nanoseconds >= d.raw.nanoseconds) return error.Timeout;
-                                        }
+                                        if (self.passed(deadline)) return error.Timeout;
                                         continue;
                                     },
                                     error.OutOfMemory => |e| return e,
@@ -337,8 +330,12 @@ pub fn Connection(comptime Stream: type) type {
                             @memcpy(echo[0..n], frame.payload[0..n]);
                             self.consume(frame.frame_len);
                             try self.sendFrame(self.io, .pong, echo[0..n]);
+                            if (self.passed(deadline)) return error.Timeout;
                         },
-                        .pong => self.consume(frame.frame_len),
+                        .pong => {
+                            self.consume(frame.frame_len);
+                            if (self.passed(deadline)) return error.Timeout;
+                        },
                         .close => {
                             self.consume(frame.frame_len);
                             self.close() catch {};
@@ -369,6 +366,20 @@ pub fn Connection(comptime Stream: type) type {
                     return ConnectionError.MessageTooLarge;
                 if (!try self.fill(deadline)) return null; // EOF
             }
+        }
+
+        /// Whether `deadline` has passed.
+        ///
+        /// Checked after every frame the caller never sees: a ping, a pong, or
+        /// a message the parser could not read. The deadline is otherwise
+        /// noticed only when the socket runs dry, and a relay sending those
+        /// back to back never lets it run dry. What they cost was already
+        /// consumed, so returning here still consumes nothing the caller would
+        /// have seen.
+        fn passed(self: *const Self, deadline: ?std.Io.Clock.Timestamp) bool {
+            const d = deadline orelse return false;
+            const now = std.Io.Clock.Timestamp.now(self.io, d.clock);
+            return now.raw.nanoseconds >= d.raw.nanoseconds;
         }
 
         fn sendText(self: *Self, text: []const u8) !void {
@@ -1065,6 +1076,36 @@ test "skipping unreadable messages still stops at the deadline" {
     defer m.deinit();
     try std.testing.expectEqualStrings("after", m.value.notice.message);
     try std.testing.expectEqual(@as(u64, 2), conn.unreadable);
+}
+
+test "pings and pongs arriving back to back still stop at the deadline" {
+    const allocator = std.testing.allocator;
+    var written: std.ArrayList(u8) = .empty;
+    defer written.deinit(allocator);
+
+    var script: std.ArrayList(u8) = .empty;
+    defer script.deinit(allocator);
+    // Each control frame is directly followed by the frame after it, so a
+    // missing check after either one hands back the next frame instead.
+    try script.appendSlice(allocator, &[_]u8{ 0x8A, 0x00 }); // pong
+    try script.appendSlice(allocator, &[_]u8{ 0x89, 0x01, 'p' }); // ping
+    try appendServerText(&script, allocator, "[\"NOTICE\",\"after\"]");
+
+    var server = FakeStream{ .to_read = script.items, .written = &written, .allocator = allocator };
+    var conn = newConn(allocator, &server);
+    defer conn.deinit();
+
+    // A deadline that has already passed, on a socket that never runs dry.
+    const now: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(0), .clock = .awake } };
+    try std.testing.expectError(error.Timeout, conn.receiveTimeout(now)); // after the first pong
+    try std.testing.expectError(error.Timeout, conn.receiveTimeout(now)); // after the ping, answered
+    const pong = (try websocket.decodeFrame(written.items)).?;
+    try std.testing.expectEqual(websocket.Opcode.pong, pong.opcode);
+    try std.testing.expectEqualStrings("p", pong.payload);
+
+    var m = (try conn.receive()).?;
+    defer m.deinit();
+    try std.testing.expectEqualStrings("after", m.value.notice.message);
 }
 
 test "receive answers a ping with a pong and continues" {
