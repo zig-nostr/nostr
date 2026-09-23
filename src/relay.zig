@@ -667,8 +667,13 @@ fn resolveAndConnect(gpa: std.mem.Allocator, io: std.Io, host: []const u8, port:
     const host_z = try gpa.dupeZ(u8, host);
     defer gpa.free(host_z);
 
+    // Stream sockets only. With no hints the resolver lists every address once
+    // per socket type, so each address was tried twice, and a connect that hung
+    // hung twice.
+    var hints = std.mem.zeroes(std.c.addrinfo);
+    hints.socktype = posix.SOCK.STREAM;
     var res: ?*std.c.addrinfo = null;
-    if (@intFromEnum(std.c.getaddrinfo(host_z.ptr, null, null, &res)) != 0)
+    if (@intFromEnum(std.c.getaddrinfo(host_z.ptr, null, &hints, &res)) != 0)
         return error.NameResolutionFailed;
     const list = res orelse return error.NameResolutionFailed;
     defer std.c.freeaddrinfo(list);
@@ -688,9 +693,15 @@ fn resolveAndConnect(gpa: std.mem.Allocator, io: std.Io, host: []const u8, port:
             } },
             else => continue,
         };
-        return address.connect(io, .{ .mode = .stream }) catch |err| {
-            last_err = err;
-            continue;
+        return address.connect(io, .{ .mode = .stream }) catch |err| switch (err) {
+            // A caller that gave up on this dial meant all of it. Trying the
+            // next address would start a connect the cancellation can no
+            // longer reach, and it would run to its own timeout.
+            error.Canceled => return error.Canceled,
+            else => {
+                last_err = err;
+                continue;
+            },
         };
     }
     return last_err;
@@ -700,6 +711,11 @@ fn resolveAndConnect(gpa: std.mem.Allocator, io: std.Io, host: []const u8, port:
 /// connect, the TLS handshake for `wss://` (verifying the server certificate
 /// against the system CA bundle), and the websocket opening handshake. Returns
 /// a ready `Relay`. The caller owns it and must `deinit`.
+///
+/// Takes no deadline. To bound it, run it with `io.concurrent` and cancel it
+/// when the deadline passes: a cancelled dial stops where it is and frees what
+/// it allocated. The name lookup is the one step a cancel cannot interrupt,
+/// because it is a plain libc call.
 ///
 /// Not covered by CI (no relay is reachable there); the transport-agnostic
 /// `Connection` and the `IoStream` adapter it uses are what the tests exercise.
@@ -1469,6 +1485,31 @@ test "answering a ping does not count as hearing from the relay" {
     try conn.sendFrame(std.testing.io, .pong, &.{});
     try std.testing.expect(written.items.len > 0);
     try std.testing.expectEqual(@as(?i64, null), conn.idleMs(std.testing.io));
+}
+
+test "a dial waiting on a silent peer can be cancelled, and frees what it made" {
+    // A peer that accepts the TCP connection and then never answers the
+    // websocket upgrade is the case a caller needs a way out of. `dial` takes
+    // no deadline; running it concurrently and cancelling it is the way out,
+    // and this pins that the cancel lands and leaves nothing behind.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var listen_address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try listen_address.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    const url = try std.fmt.allocPrint(allocator, "ws://127.0.0.1:{d}", .{server.socket.address.ip4.port});
+    defer allocator.free(url);
+
+    const started = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+    var pending = try io.concurrent(dial, .{ allocator, io, url });
+    try io.sleep(.fromMilliseconds(100), .awake);
+    if (pending.cancel(io)) |relay| {
+        relay.deinit();
+        return error.TestUnexpectedResult; // the peer never answered, so no dial can have succeeded
+    } else |_| {}
+    const waited = std.Io.Timestamp.now(io, .awake).toMilliseconds() - started;
+    try std.testing.expect(waited < 5000);
 }
 
 test "a deadline fires on a quiet socket and leaves the connection usable" {
