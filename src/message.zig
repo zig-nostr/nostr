@@ -279,6 +279,25 @@ test "parse EVENT message" {
     }
 }
 
+test "parse EVENT message whose event carries a field NIP-01 does not name" {
+    const allocator = std.testing.allocator;
+    const j = try encodeEvent(allocator, sampleEvent());
+    defer allocator.free(j);
+    const inner = j["[\"EVENT\",{".len .. j.len - 1];
+    const framed = try std.fmt.allocPrint(allocator, "[\"EVENT\",\"sub1\",{{\"seen\":[1,2],{s}]", .{inner});
+    defer allocator.free(framed);
+
+    var parsed = try parseRelayMessage(allocator, framed);
+    defer parsed.deinit();
+    switch (parsed.value) {
+        .event => |e| {
+            try std.testing.expectEqualStrings("sub1", e.subscription_id);
+            try std.testing.expectEqualSlices(u8, &sampleEvent().id, &e.event.id);
+        },
+        else => return error.WrongVariant,
+    }
+}
+
 test "parse OK message (accepted and rejected)" {
     const allocator = std.testing.allocator;
     const id_hex = "d0a1d13aff1d1725d80305f74a3f8419674d726342773b06ddc6988cc5be3a40";
