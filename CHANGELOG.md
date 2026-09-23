@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.5] - 2026-09-23
+
+### Fixed
+
+- A deadline given to `receiveTimeout` holds while pings and pongs are arriving. Control frames were consumed without looking at the clock, and the deadline is otherwise noticed only when the socket runs dry, so a relay sending them back to back held the call past its deadline for as long as it kept going. The clock is now checked after every frame the caller never sees: a ping, a pong, or a message the parser could not read.
+
 ## [0.14.4] - 2026-09-23
 
 ### Fixed
