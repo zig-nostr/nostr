@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A `wss://` dial that got through the TLS handshake and then failed frees its TLS state. The state and its two 64 KiB buffers were freed only by errdefers inside the block that created them, which had already exited, so a relay that answered the websocket upgrade with anything but 101, or a dial cancelled while waiting for that answer, leaked all three. A client that retries such a relay leaked on every retry.
+
 ## [0.14.3] - 2026-09-23
 
 ### Added

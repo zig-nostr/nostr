@@ -770,6 +770,14 @@ pub fn dial(gpa: std.mem.Allocator, io: std.Io, url: []const u8) !*Relay {
         // No TLS layer, so `reader` already IS the transport reader and the
         // loop's own `bufferedLen` check covers it.
     };
+    // The TLS state outlives the block that made it, so its errdefers are gone
+    // by now. A wss dial that got through TLS and then failed the websocket
+    // upgrade, or was cancelled waiting for it, leaked all of it.
+    errdefer if (transport.tls_state) |ts| {
+        gpa.free(ts.read_buffer);
+        gpa.free(ts.write_buffer);
+        gpa.destroy(ts);
+    };
 
     const relay = try gpa.create(Relay);
     errdefer gpa.destroy(relay);
