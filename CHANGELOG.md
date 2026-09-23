@@ -8,8 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.3] - 2026-09-23
+
+### Added
+
+- `Relay.unreadable()`, and the `unreadable` field on `Connection` behind it: how many messages the connection skipped because the parser could not read them.
+
+### Changed
+
+- `receive` and `receiveTimeout` no longer return `error.InvalidMessage`. A message the parser cannot read is skipped and counted instead, so a caller that ended a session on that error now keeps the connection.
+
 ### Fixed
 
+- A message the parser cannot read costs that message and nothing after it. When `parseRelayMessage` failed inside `receive`, the error returned before the reassembly buffer was cleared, so the failed message stayed in it and every later frame was appended to it. Every message after it on that connection then failed to parse too. Bytes that are not JSON, a message type the parser has no case for, or an `EVENT` whose event is malformed were each enough. The buffer is now cleared once a message is complete, whether it parses or not. A deadline given to `receiveTimeout` still holds while messages are being skipped.
+- Running out of memory while parsing a relay message is reported as `OutOfMemory`. It was reported as `InvalidMessage`, as though the relay had sent something malformed.
 - An event object carrying a key NIP-01 does not name parses, and the extra key is ignored. `fromJson` and the relay message parser refused it with `UnknownField`, so a valid event carrying one was dropped, and on a relay connection it failed the whole `EVENT` message. The id and the signature cover the seven named fields and nothing else, so an extra key cannot change what was signed. A key named twice is still refused, because then it is ambiguous which value the signature covers.
 
 ## [0.14.2] - 2026-09-21
