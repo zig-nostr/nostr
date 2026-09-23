@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.6] - 2026-09-23
+
+### Added
+
+- `Store.ingestBatch`: `ingest` for many events in one write transaction. Every event gets exactly the treatment `ingest` gives it, in order, and sees what the events before it in the batch wrote, so a deletion or a newer replaceable event earlier in a batch applies to the events after it. LMDB syncs to disk on every commit, so events arriving one at a time cost a sync each through `ingest`, and a batch of them costs one. A client ingesting 100,000 events from a relay one call per event spent most of its time in `fsync`.
+
+### Changed
+
+- `ingest` is `ingestBatch` of one event. Its outcomes are unchanged.
+
 ## [0.14.5] - 2026-09-23
 
 ### Fixed
