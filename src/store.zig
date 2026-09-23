@@ -779,30 +779,59 @@ pub const Store = struct {
     /// This is the protocol-aware entry point; `putEvent` is the low-level
     /// insert. Callers feeding events from relays should use `ingest`.
     pub fn ingest(self: *Store, gpa: std.mem.Allocator, ev: Event, options: IngestOptions) Error!IngestResult {
+        var results: [1]IngestResult = undefined;
+        try self.ingestBatch(gpa, &.{ev}, options, &results);
+        return results[0];
+    }
+
+    /// `ingest` for many events at once, in one write transaction, writing
+    /// event `i`'s outcome to `results[i]`.
+    ///
+    /// Each event gets exactly the treatment `ingest` gives it, in order, and
+    /// sees what the events before it in the batch wrote: a deletion early in
+    /// the batch tombstones an event later in it, and a newer replaceable
+    /// event later in the batch supersedes an older one earlier in it.
+    ///
+    /// One transaction is one commit, and a commit is what costs: LMDB syncs
+    /// to disk on every one. Events arriving from relays one at a time cost a
+    /// sync each through `ingest`, and a batch of them costs one.
+    ///
+    /// Nothing is written if any event fails with an error rather than an
+    /// outcome, such as running out of memory or space.
+    pub fn ingestBatch(self: *Store, gpa: std.mem.Allocator, events: []const Event, options: IngestOptions, results: []IngestResult) Error!void {
+        std.debug.assert(results.len >= events.len);
+        var txn: ?*c.MDB_txn = null;
+        try check(c.mdb_txn_begin(self.env, null, 0, &txn));
+        errdefer c.mdb_txn_abort(txn);
+        for (events, 0..) |ev, i| results[i] = try self.ingestIn(gpa, txn, ev, options);
+        try check(c.mdb_txn_commit(txn));
+    }
+
+    fn ingestIn(self: *Store, gpa: std.mem.Allocator, txn: ?*c.MDB_txn, ev: Event, options: IngestOptions) Error!IngestResult {
         if (options.verify_with) |signer| {
             if (!(try event.verify(gpa, signer, ev))) return .invalid;
         }
         // A NIP-09 deletion tombstones an id against its author, so a later
         // re-arrival of that event from the same author is rejected.
-        if (try self.isTombstoned(ev.id, ev.pubkey)) return .deleted;
-        if (ev.kind == 5) return self.ingestDeletion(gpa, ev);
+        if (try self.isTombstoned(txn, ev.id, ev.pubkey)) return .deleted;
+        if (ev.kind == 5) return self.ingestDeletion(gpa, txn, ev);
         switch (classify(ev.kind)) {
             .ephemeral => return .ephemeral,
             .regular => {
-                const inserted = try self.putEvent(gpa, ev);
-                return if (inserted) .added else .duplicate;
+                var k = val(&ev.id);
+                var probe: c.MDB_val = undefined;
+                if (c.mdb_get(txn, self.events_dbi, &k, &probe) == c.MDB_SUCCESS) return .duplicate;
+                try self.storeEvent(gpa, txn, ev);
+                return .added;
             },
-            .replaceable, .parameterized => |class| return self.ingestReplaceable(gpa, ev, class),
+            .replaceable, .parameterized => |class| return self.ingestReplaceable(gpa, txn, ev, class),
         }
     }
 
     /// True if `id` has been tombstoned by `pubkey` (i.e. that pubkey deleted an
     /// event with this id). A tombstone recorded by a *different* pubkey does
     /// not block `pubkey`'s event, since one can only delete one's own events.
-    fn isTombstoned(self: *Store, id: [32]u8, pubkey: [32]u8) Error!bool {
-        var txn: ?*c.MDB_txn = null;
-        try check(c.mdb_txn_begin(self.env, null, @intCast(c.MDB_RDONLY), &txn));
-        defer c.mdb_txn_abort(txn);
+    fn isTombstoned(self: *Store, txn: ?*c.MDB_txn, id: [32]u8, pubkey: [32]u8) Error!bool {
         var k = val(&id);
         var v: c.MDB_val = undefined;
         const rc = c.mdb_get(txn, self.deleted_dbi, &k, &v);
@@ -817,11 +846,7 @@ pub const Store = struct {
     /// `a` deletions additionally only affect events at or older than the
     /// deletion. Every `e` target id is tombstoned so it cannot be re-added by
     /// its author, even if the target has not been seen yet.
-    fn ingestDeletion(self: *Store, gpa: std.mem.Allocator, ev: Event) Error!IngestResult {
-        var txn: ?*c.MDB_txn = null;
-        try check(c.mdb_txn_begin(self.env, null, 0, &txn));
-        errdefer c.mdb_txn_abort(txn);
-
+    fn ingestDeletion(self: *Store, gpa: std.mem.Allocator, txn: ?*c.MDB_txn, ev: Event) Error!IngestResult {
         var k = val(&ev.id);
         var probe: c.MDB_val = undefined;
         const existed = c.mdb_get(txn, self.events_dbi, &k, &probe) == c.MDB_SUCCESS;
@@ -839,7 +864,6 @@ pub const Store = struct {
             }
         }
 
-        try check(c.mdb_txn_commit(txn));
         return if (existed) .duplicate else .added;
     }
 
@@ -929,16 +953,12 @@ pub const Store = struct {
         try check(c.mdb_put(txn, self.deleted_dbi, &k, &v, 0));
     }
 
-    fn ingestReplaceable(self: *Store, gpa: std.mem.Allocator, ev: Event, class: Class) Error!IngestResult {
+    fn ingestReplaceable(self: *Store, gpa: std.mem.Allocator, txn: ?*c.MDB_txn, ev: Event, class: Class) Error!IngestResult {
         // Build the replaceable coordinate: pubkey ++ kind, plus the d-tag
         // value for parameterized-replaceable events.
         var coord: std.ArrayList(u8) = .empty;
         defer coord.deinit(gpa);
         try appendCoord(gpa, &coord, ev.pubkey, ev.kind, if (class == .parameterized) dTagValue(ev) else null);
-
-        var txn: ?*c.MDB_txn = null;
-        try check(c.mdb_txn_begin(self.env, null, 0, &txn));
-        errdefer c.mdb_txn_abort(txn);
 
         var ck = val(coord.items);
         var cv: c.MDB_val = undefined;
@@ -948,10 +968,7 @@ pub const Store = struct {
         if (crc != c.MDB_NOTFOUND) {
             try check(crc);
             const existing_id: [32]u8 = valBytes(cv)[0..32].*;
-            if (std.mem.eql(u8, &existing_id, &ev.id)) {
-                try check(c.mdb_txn_commit(txn));
-                return .duplicate;
-            }
+            if (std.mem.eql(u8, &existing_id, &ev.id)) return .duplicate;
             // Compare against the currently stored event for this coordinate.
             var ek = val(&existing_id);
             var evv: c.MDB_val = undefined;
@@ -961,10 +978,7 @@ pub const Store = struct {
                 var scratch = std.heap.ArenaAllocator.init(gpa);
                 defer scratch.deinit();
                 const existing = try decodeEvent(scratch.allocator(), valBytes(evv));
-                if (!replaces(ev, existing)) {
-                    try check(c.mdb_txn_commit(txn));
-                    return .stale;
-                }
+                if (!replaces(ev, existing)) return .stale;
                 try self.removeEvent(gpa, txn, existing);
                 result = .replaced;
             }
@@ -974,7 +988,6 @@ pub const Store = struct {
         // Point the coordinate at the new event.
         var v = val(&ev.id);
         try check(c.mdb_put(txn, self.repl_dbi, &ck, &v, 0));
-        try check(c.mdb_txn_commit(txn));
         return result;
     }
 };
@@ -1991,6 +2004,74 @@ test "store: ingest deletion removes the author's event and tombstones it" {
     // The tombstone blocks re-adding the same event by its author.
     try std.testing.expectEqual(IngestResult.deleted, try store.ingest(gpa, note, .{}));
     try std.testing.expect(!(try store.hasEvent(note.id)));
+}
+
+test "store: a batch sees what the events before it in the batch wrote" {
+    const gpa = std.testing.allocator;
+    var signer = try keys.Signer.initRandomized(std.testing.io);
+    defer signer.deinit();
+    const kp = try signer.generateKeyPair(std.testing.io);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var store = try openTempStore(&tmp, "batch-sees.mdb", &buf);
+    defer store.deinit();
+
+    const note = try event.create(gpa, signer, kp, 1000, 1, &[_]Tag{}, "deleted before it lands", null);
+    const id_hex = std.fmt.bytesToHex(note.id, .lower);
+    const e_tag = [_]Tag{&[_][]const u8{ "e", id_hex[0..] }};
+    const del = try event.create(gpa, signer, kp, 2000, 5, &e_tag, "", null);
+    const old_profile = try event.create(gpa, signer, kp, 3000, 0, &[_]Tag{}, "{\"name\":\"old\"}", null);
+    const new_profile = try event.create(gpa, signer, kp, 4000, 0, &[_]Tag{}, "{\"name\":\"new\"}", null);
+    const older_again = try event.create(gpa, signer, kp, 3500, 0, &[_]Tag{}, "{\"name\":\"older\"}", null);
+    const other = try event.create(gpa, signer, kp, 5000, 1, &[_]Tag{}, "kept", null);
+
+    const batch = [_]Event{ del, note, old_profile, new_profile, older_again, other, other };
+    var results: [batch.len]IngestResult = undefined;
+    try store.ingestBatch(gpa, &batch, .{}, &results);
+
+    try std.testing.expectEqualSlices(IngestResult, &.{ .added, .deleted, .added, .replaced, .stale, .added, .duplicate }, &results);
+    try std.testing.expect(!(try store.hasEvent(note.id)));
+    try std.testing.expect(!(try store.hasEvent(old_profile.id)));
+    try std.testing.expect(try store.hasEvent(new_profile.id));
+    try std.testing.expect(!(try store.hasEvent(older_again.id)));
+    try std.testing.expect(try store.hasEvent(other.id));
+}
+
+test "store: a batch gives every event the outcome ingest would, one at a time" {
+    const gpa = std.testing.allocator;
+    var signer = try keys.Signer.initRandomized(std.testing.io);
+    defer signer.deinit();
+    const kp_a = try signer.generateKeyPair(std.testing.io);
+    const kp_b = try signer.generateKeyPair(std.testing.io);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf_a: [std.fs.max_path_bytes]u8 = undefined;
+    var one = try openTempStore(&tmp, "one-by-one.mdb", &buf_a);
+    defer one.deinit();
+    var buf_b: [std.fs.max_path_bytes]u8 = undefined;
+    var batched = try openTempStore(&tmp, "batched.mdb", &buf_b);
+    defer batched.deinit();
+
+    const d_x = [_]Tag{&[_][]const u8{ "d", "x" }};
+    const a_note = try event.create(gpa, signer, kp_a, 100, 1, &[_]Tag{}, "a", null);
+    const b_note = try event.create(gpa, signer, kp_b, 101, 1, &[_]Tag{}, "b", null);
+    const a_hex = std.fmt.bytesToHex(a_note.id, .lower);
+    const del_by_b = try event.create(gpa, signer, kp_b, 102, 5, &[_]Tag{&[_][]const u8{ "e", a_hex[0..] }}, "", null);
+    const art1 = try event.create(gpa, signer, kp_a, 103, 30023, &d_x, "v1", null);
+    const art2 = try event.create(gpa, signer, kp_a, 104, 30023, &d_x, "v2", null);
+    const ephemeral = try event.create(gpa, signer, kp_a, 105, 20001, &[_]Tag{}, "gone", null);
+    const events = [_]Event{ a_note, b_note, del_by_b, art2, art1, ephemeral, a_note };
+
+    var want: [events.len]IngestResult = undefined;
+    for (events, 0..) |ev, i| want[i] = try one.ingest(gpa, ev, .{});
+    var got: [events.len]IngestResult = undefined;
+    try batched.ingestBatch(gpa, &events, .{}, &got);
+
+    try std.testing.expectEqualSlices(IngestResult, &want, &got);
+    try std.testing.expectEqual(try one.eventCount(), try batched.eventCount());
 }
 
 test "store: ingest deletion cannot remove another author's event" {
