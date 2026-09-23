@@ -8,8 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.4] - 2026-09-23
+
 ### Fixed
 
+- A dial cancelled while connecting stops. The connect loop caught every error, `Canceled` included, and moved on to the next resolved address, and once a task has been cancelled its later I/O can no longer be interrupted. So a caller that gave up on a relay whose host never answers the SYN still waited for connects the cancel could no longer reach: 15 seconds on loopback, and longer on a real network. It now returns `Canceled` at once.
+- Each resolved address is tried once. `getaddrinfo` was called without hints, and it lists every address once per socket type, so each address was tried twice, and a connect that hung, hung twice.
 - A `wss://` dial that got through the TLS handshake and then failed frees its TLS state. The state and its two 64 KiB buffers were freed only by errdefers inside the block that created them, which had already exited, so a relay that answered the websocket upgrade with anything but 101, or a dial cancelled while waiting for that answer, leaked all three. A client that retries such a relay leaked on every retry.
 
 ## [0.14.3] - 2026-09-23
