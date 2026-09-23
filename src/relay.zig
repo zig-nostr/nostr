@@ -1492,7 +1492,14 @@ test "a dial waiting on a silent peer can be cancelled, and frees what it made" 
     // websocket upgrade is the case a caller needs a way out of. `dial` takes
     // no deadline; running it concurrently and cancelling it is the way out,
     // and this pins that the cancel lands and leaves nothing behind.
-    const allocator = std.testing.allocator;
+    //
+    // Leak-checked, but without stack traces. On macOS capturing one takes a
+    // lock that notices a pending cancel and swallows it, so a dial cancelled
+    // while it was still allocating would never find out, and the test would
+    // hang rather than fail. `std.testing.allocator` captures them.
+    var debug: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    defer if (debug.deinit() == .leak) @panic("the cancelled dial leaked");
+    const allocator = debug.allocator();
     const io = std.testing.io;
 
     var listen_address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
