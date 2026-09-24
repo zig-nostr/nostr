@@ -72,6 +72,16 @@ BENCH_N=100000 zig build bench -Doptimize=ReleaseFast
 Methodology and the full write-up are on the
 [benchmarks page](https://zignostr.com/performance).
 
+## Using it from an agent
+
+An AI coding agent working on a Zig nostr project can learn this library from the skill in [`skills/zig-nostr`](skills/zig-nostr/SKILL.md): adding the dependency, keys and events, NIP-19 and NIP-44, relays read with a deadline, the local store, and the traps, with every snippet compiled against the current release. Add it to any agent that supports skills:
+
+```sh
+npx skills add zig-nostr/nostr
+```
+
+For work from a shell rather than in Zig, [deed](https://github.com/zig-nostr/deed) is a command line built on this library, with a skill of its own.
+
 ## Quickstart
 
 Add the library to your `build.zig.zon`:

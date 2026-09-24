@@ -1,7 +1,9 @@
 # AGENTS.md
 
 A contributor-facing guide to this repository. Points both human and AI
-coding agents at the conventions, build system, and structure used here.
+coding agents at the conventions, build system, and structure used here. To
+use the library in another project rather than change it, read
+[`skills/zig-nostr/SKILL.md`](skills/zig-nostr/SKILL.md).
 
 ## Project overview
 
@@ -9,7 +11,8 @@ coding agents at the conventions, build system, and structure used here.
 encoding, event construction and signing, relay transport, encrypted
 messaging, and a local-first event store. It has no runtime dependency on
 any specific application: it is consumed as a library by other repos in
-the `zig-nostr` org (a signer, a DM client, a read-only client).
+the `zig-nostr` org: Plaza (a client), Notary (a NIP-46 signer) and deed (a
+command line).
 
 ## Repository layout
 
