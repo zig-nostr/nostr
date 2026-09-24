@@ -110,6 +110,9 @@ pub const ConnectionError = error{
 ///     — 0 means the peer closed. A null deadline waits forever, which is what
 ///     every caller did before `receiveTimeout` existed.
 ///   * `fn writeAll(self, bytes: []const u8) !void`
+///   * optionally `fn writableBy(self, deadline: std.Io.Clock.Timestamp) bool`,
+///     whether a small write would go through before the deadline. A stream
+///     without it is taken to always have room.
 ///
 /// The connection owns two growable buffers (raw receive bytes and the
 /// reassembled message) but not the stream; call `deinit` to free them.
@@ -329,7 +332,7 @@ pub fn Connection(comptime Stream: type) type {
                             const n = @min(frame.payload.len, echo.len);
                             @memcpy(echo[0..n], frame.payload[0..n]);
                             self.consume(frame.frame_len);
-                            try self.sendFrame(self.io, .pong, echo[0..n]);
+                            try self.answerPing(echo[0..n], deadline);
                             if (self.passed(deadline)) return error.Timeout;
                         },
                         .pong => {
@@ -387,18 +390,48 @@ pub fn Connection(comptime Stream: type) type {
         }
 
         fn sendFrame(self: *Self, io: std.Io, opcode: websocket.Opcode, payload: []const u8) !void {
-            var mask: [4]u8 = undefined;
-            io.randomSecure(&mask) catch return ConnectionError.RandomFailed;
-
             var frame: std.ArrayList(u8) = .empty;
             defer frame.deinit(self.allocator);
-            try websocket.appendClientFrame(&frame, self.allocator, opcode, payload, mask);
+            try self.buildFrame(io, &frame, opcode, payload);
 
             // Uncancelable: a half-written frame is a broken stream, and the
             // only thing to do after being cancelled here would be to finish
             // anyway.
             self.write_lock.lockUncancelable(io);
             defer self.write_lock.unlock(io);
+            try self.stream.writeAll(frame.items);
+        }
+
+        fn buildFrame(self: *Self, io: std.Io, frame: *std.ArrayList(u8), opcode: websocket.Opcode, payload: []const u8) !void {
+            var mask: [4]u8 = undefined;
+            io.randomSecure(&mask) catch return ConnectionError.RandomFailed;
+            try websocket.appendClientFrame(frame, self.allocator, opcode, payload, mask);
+        }
+
+        /// Answers a ping with a pong.
+        ///
+        /// With no deadline this is an ordinary write. With one, the pong must
+        /// not become the thing that holds the call past it. A relay that has
+        /// stopped reading fills the socket, and a pong written into a full
+        /// socket waits for room that never comes, holding the write lock the
+        /// whole time. So the pong is skipped when another write holds the
+        /// lock, or when the socket has no room before the deadline. Skipping
+        /// one is harmless: a peer that is not reading would not read it, and
+        /// RFC 6455 lets an endpoint answer only the latest of several pings.
+        fn answerPing(self: *Self, payload: []const u8, deadline: ?std.Io.Clock.Timestamp) !void {
+            const d = deadline orelse return self.sendFrame(self.io, .pong, payload);
+            var frame: std.ArrayList(u8) = .empty;
+            defer frame.deinit(self.allocator);
+            try self.buildFrame(self.io, &frame, .pong, payload);
+            if (!self.write_lock.tryLock()) return;
+            defer self.write_lock.unlock(self.io);
+            const StreamType = switch (@typeInfo(Stream)) {
+                .pointer => |ptr| ptr.child,
+                else => Stream,
+            };
+            if (comptime @hasDecl(StreamType, "writableBy")) {
+                if (!self.stream.writableBy(d)) return;
+            }
             try self.stream.writeAll(frame.items);
         }
 
@@ -530,6 +563,22 @@ pub const IoStream = struct {
         @memcpy(buffer[0..n], available[0..n]);
         r.toss(n);
         return n;
+    }
+
+    /// Whether the socket has room for a small write before `deadline`.
+    ///
+    /// A wait for room, not a write, so it changes nothing when it gives up.
+    /// A control frame is far smaller than the kernel's low-water mark, so a
+    /// socket that reports room takes the whole frame without blocking. With
+    /// no socket to ask (the hermetic tests) the answer is yes.
+    pub fn writableBy(self: IoStream, deadline: std.Io.Clock.Timestamp) bool {
+        const io = self.io orelse return true;
+        const sock = self.socket orelse return true;
+        const left = deadline.raw.nanoseconds - std.Io.Clock.Timestamp.now(io, deadline.clock).raw.nanoseconds;
+        const ms: i32 = if (left <= 0) 0 else @intCast(@min(@divFloor(left + std.time.ns_per_ms - 1, std.time.ns_per_ms), std.math.maxInt(i32)));
+        var fds = [_]std.posix.pollfd{.{ .fd = sock.handle, .events = std.posix.POLL.OUT, .revents = 0 }};
+        const ready = std.posix.poll(&fds, ms) catch return true;
+        return ready > 0;
     }
 
     pub fn writeAll(self: IoStream, bytes: []const u8) std.Io.Writer.Error!void {
@@ -832,6 +881,9 @@ const FakeStream = struct {
     /// Captured client->server bytes.
     written: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
+    /// Whether the peer is taking what is written. False stands in for a
+    /// relay that has stopped reading.
+    room: bool = true,
 
     fn read(self: *FakeStream, buffer: []u8, deadline: ?std.Io.Clock.Timestamp) error{}!usize {
         // Never blocks, so a deadline is meaningless here.
@@ -841,6 +893,11 @@ const FakeStream = struct {
         @memcpy(buffer[0..n], remaining[0..n]);
         self.read_pos += n;
         return n;
+    }
+
+    fn writableBy(self: *FakeStream, deadline: std.Io.Clock.Timestamp) bool {
+        _ = deadline;
+        return self.room;
     }
 
     fn writeAll(self: *FakeStream, bytes: []const u8) !void {
@@ -1106,6 +1163,70 @@ test "pings and pongs arriving back to back still stop at the deadline" {
     var m = (try conn.receive()).?;
     defer m.deinit();
     try std.testing.expectEqualStrings("after", m.value.notice.message);
+}
+
+test "with a deadline, a pong is skipped rather than waited on when the peer has no room" {
+    const allocator = std.testing.allocator;
+    var written: std.ArrayList(u8) = .empty;
+    defer written.deinit(allocator);
+    var script: std.ArrayList(u8) = .empty;
+    defer script.deinit(allocator);
+    try script.appendSlice(allocator, &[_]u8{ 0x89, 0x01, 'p' }); // ping
+    try appendServerText(&script, allocator, "[\"NOTICE\",\"after\"]");
+
+    // A peer that has stopped reading: a pong written to it would wait for
+    // room that never comes.
+    var server = FakeStream{ .to_read = script.items, .written = &written, .allocator = allocator, .room = false };
+    var conn = newConn(allocator, &server);
+    defer conn.deinit();
+
+    var m = (try conn.receiveTimeout(.{ .duration = .{ .raw = .fromMilliseconds(1000), .clock = .awake } })).?;
+    defer m.deinit();
+    try std.testing.expectEqualStrings("after", m.value.notice.message);
+    try std.testing.expectEqual(@as(usize, 0), written.items.len);
+}
+
+test "with a deadline, a pong is skipped rather than queued behind another write" {
+    const allocator = std.testing.allocator;
+    var written: std.ArrayList(u8) = .empty;
+    defer written.deinit(allocator);
+    var script: std.ArrayList(u8) = .empty;
+    defer script.deinit(allocator);
+    try script.appendSlice(allocator, &[_]u8{ 0x89, 0x01, 'p' }); // ping
+    try appendServerText(&script, allocator, "[\"NOTICE\",\"after\"]");
+
+    var server = FakeStream{ .to_read = script.items, .written = &written, .allocator = allocator };
+    var conn = newConn(allocator, &server);
+    defer conn.deinit();
+
+    // Another writer holds the lock, as a send stuck on a full socket would.
+    try std.testing.expect(conn.write_lock.tryLock());
+    defer conn.write_lock.unlock(std.testing.io);
+
+    var m = (try conn.receiveTimeout(.{ .duration = .{ .raw = .fromMilliseconds(1000), .clock = .awake } })).?;
+    defer m.deinit();
+    try std.testing.expectEqualStrings("after", m.value.notice.message);
+    try std.testing.expectEqual(@as(usize, 0), written.items.len);
+}
+
+test "with a deadline and room to write, a ping is still answered" {
+    const allocator = std.testing.allocator;
+    var written: std.ArrayList(u8) = .empty;
+    defer written.deinit(allocator);
+    var script: std.ArrayList(u8) = .empty;
+    defer script.deinit(allocator);
+    try script.appendSlice(allocator, &[_]u8{ 0x89, 0x02, 'p', 'q' }); // ping
+    try appendServerText(&script, allocator, "[\"NOTICE\",\"after\"]");
+
+    var server = FakeStream{ .to_read = script.items, .written = &written, .allocator = allocator };
+    var conn = newConn(allocator, &server);
+    defer conn.deinit();
+
+    var m = (try conn.receiveTimeout(.{ .duration = .{ .raw = .fromMilliseconds(1000), .clock = .awake } })).?;
+    defer m.deinit();
+    const pong = (try websocket.decodeFrame(written.items)).?;
+    try std.testing.expectEqual(websocket.Opcode.pong, pong.opcode);
+    try std.testing.expectEqualStrings("pq", pong.payload);
 }
 
 test "receive answers a ping with a pong and continues" {
