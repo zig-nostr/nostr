@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.7] - 2026-09-24
+
+### Fixed
+
+- A pong no longer holds `receiveTimeout` past its deadline. A ping was answered with a write that had no bound, so a relay that sent pings and had stopped reading filled the socket, and the pong waited for room that never came while holding the connection's write lock, which also held up any other write on the connection. With a deadline, the pong is now skipped when another write holds the lock or when the socket has no room before the deadline; a peer that is not reading would not read it, and RFC 6455 allows answering only the latest of several pings. With no deadline, a ping is answered as before.
+
+### Added
+
+- A `Connection` stream may provide `writableBy(deadline)`, which `IoStream` implements as a wait for room that writes nothing. A stream without it is taken to always have room.
+
 ## [0.14.6] - 2026-09-23
 
 ### Added
