@@ -1,11 +1,11 @@
 ---
 name: zig-nostr
-description: Build nostr software in Zig with zig-nostr's `nostr` library. Use when a Zig project needs nostr keys and BIP-340 signatures, NIP-01 events (create, sign, verify, serialize), NIP-19 codes, NIP-44 encryption, NIP-46 remote signing, relay connections (dial, subscribe, publish, read with a deadline), the NIP-65 outbox model, or a local-first LMDB event store with fast queries. Also use when adding the library to build.zig.zon, or when porting Zig nostr code to Zig 0.16's std.Io.
+description: Build nostr software in Zig with zig-nostr's `nostr` library. Use when a Zig project needs nostr keys and BIP-340 signatures, NIP-01 events (create, sign, verify, serialize), NIP-19 codes, NIP-44 encryption, NIP-50 search filters, NIP-46 remote signing, relay connections (dial, subscribe, publish, read with a deadline), the NIP-65 outbox model, or a local-first LMDB event store with fast queries. Also use when adding the library to build.zig.zon, or when porting Zig nostr code to Zig 0.16's std.Io.
 ---
 
 # zig-nostr: the nostr library for Zig
 
-`nostr` is a nostr protocol library for Zig 0.16: keys and BIP-340 Schnorr signatures (libsecp256k1, full official test vectors), NIP-01 events, NIP-19, NIP-44, NIP-46 as client and server, NIP-42, NIP-49, NIP-06, relay transport with deadlines, NIP-65, and a memory-mapped LMDB event store. libsecp256k1 and LMDB are compiled from source, so no system packages are needed. Pre-1.0: APIs can still change between minor versions.
+`nostr` is a nostr protocol library for Zig 0.16: keys and BIP-340 Schnorr signatures (libsecp256k1, full official test vectors), NIP-01 events, NIP-19, NIP-44, NIP-46 as client and server, NIP-42, NIP-49, NIP-06, relay transport with deadlines, NIP-65, and a memory-mapped LMDB event store. libsecp256k1 and LMDB are compiled from source, so no system packages are needed. It builds for macOS, Linux and Windows. Pre-1.0: APIs can still change between minor versions.
 
 ## Add it
 
@@ -56,7 +56,7 @@ const payload = try nostr.nip44.encrypt(allocator, io, signer, me.secret_key, th
 const plain = try nostr.nip44.decrypt(allocator, signer, my_secret_key, their_pubkey, payload);
 ```
 
-`nip19` also has `encodeNsec`, `encodeNote`, `encodeNprofile`, `encodeNevent`, `encodeNaddr` and their `decode*` twins.
+`nip19` also has `encodeNsec`, `encodeNote`, `encodeNprofile`, `encodeNevent`, `encodeNaddr` and their `decode*` twins. Decoders read an all-lowercase or all-uppercase code (a QR code usually carries the uppercase form) and refuse a mixed-case one with `error.MixedCase`. `nip19.fromNostrUri` strips a `nostr:` scheme in any case and returns the code after it.
 
 ## Relays
 
@@ -85,6 +85,8 @@ try relay.publish(note); // then read for the .ok message with that event's id
 - **Always read with a deadline** (`receiveTimeout`). `receive` waits forever.
 - **`dial` takes no deadline.** To bound it, run it with `io.concurrent` and cancel it at the deadline; a cancelled dial stops and frees what it allocated. The name lookup is the one step a cancel cannot interrupt.
 - A message the parser cannot read is skipped and counted (`relay.unreadable()`), and the connection carries on.
+- A relay that answers the upgrade with anything but 101 (503 when busy, 401 or 403, 429) fails `dial` with `HandshakeFailed`. `nostr.relay.dialDiagnosed(allocator, io, url, &diagnostic)` is `dial` that also fills `diagnostic.status` (a `relay.DialDiagnostic`) with the status the relay answered, or 0 if it never got that far.
+- `Filter.search` is NIP-50 full-text search, sent to the relay as `"search"`. The relay does the matching, so `Filter.matches` ignores it.
 
 ## The local store
 
@@ -96,7 +98,7 @@ var found = try store.query(allocator, .{ .kinds = &.{1}, .authors = &.{me.publi
 defer found.deinit(); // found.events is newest first
 ```
 
-`ingest` handles replaceable and parameterized-replaceable events, NIP-09 deletions and ephemeral kinds. For many events at once, `ingestBatch` does the same in one transaction, which matters because every commit syncs to disk. Queries walk indexes newest-first and stop at `limit`, so a 500-note feed query takes about 0.28 ms at 100,000 stored events.
+`ingest` handles replaceable and parameterized-replaceable events, NIP-09 deletions and ephemeral kinds. For many events at once, `ingestBatch` does the same in one transaction, which matters because every commit syncs to disk. Queries walk indexes newest-first and stop at `limit`, so a 500-note feed query takes about 0.28 ms at 100,000 stored events. `Store.query` applies `Filter.search` as a substring of the content, ignoring ASCII case; no index serves it, so name the kinds you mean. On Windows a store takes its full map size on disk (1 GiB by default) from the first open.
 
 ## Traps
 

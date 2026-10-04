@@ -26,7 +26,7 @@ Keys and encodings
 Events and messages
 
 - `event.zig`: the NIP-01 event, canonical serialization, id, signing, verification, and JSON in and out.
-- `filter.zig`: subscription filters, their JSON, and local matching.
+- `filter.zig`: subscription filters, their JSON, and local matching. `Filter.search` (NIP-50) is sent to the relay and ignored by `matches`, because only a relay knows what its search matches.
 - `message.zig`: the messages a client sends and the ones a relay sends back.
 - `json.zig`: the string escaper the encoders share.
 - `nip42.zig`: the client's authentication event for a relay that asks.
@@ -34,7 +34,7 @@ Events and messages
 Transport
 
 - `websocket.zig`: RFC 6455 handshake and frame codec. No I/O.
-- `relay.zig`: a relay connection. `Connection` is the protocol state machine, generic over a byte stream. `IoStream`, `dial` and `Relay` bind it to a TCP or TLS socket.
+- `relay.zig`: a relay connection. `Connection` is the protocol state machine, generic over a byte stream. `IoStream`, `dial` and `Relay` bind it to a TCP or TLS socket. `dialDiagnosed` is `dial` that also records the HTTP status a relay answered the upgrade with.
 - `liveness.zig`: the policy for when a quiet connection should be pinged or given up on. Pure functions over two measurements.
 - `nip65.zig`: relay lists, and the read and write routing of the outbox model.
 
@@ -57,7 +57,7 @@ Outbound, a program makes a `keys.Signer`, loads or generates a key pair, and ca
 
 Inbound, bytes come off the socket into `Connection`'s receive buffer. `websocket.decodeFrame` takes whole frames from the front, answers pings, drops pongs, and reassembles fragments into one message. `message.parseRelayMessage` parses that text into an `EVENT`, `OK`, `EOSE`, `CLOSED`, `NOTICE` or `AUTH`, using `event.fromValueLeaky` for the event. Text that does not parse is counted in `unreadable` and skipped, so one bad message costs that message only.
 
-Parsing does not verify. A caller decides where to verify, and `Store.ingest` can do it (`IngestOptions.verify_with`) before an event is stored. Ingest also applies the replaceable and deletion rules. Reads go the other way: `Store.query` takes the same `Filter` that was sent to the relay, picks the most selective index, walks it newest first and stops at `limit`, so a read costs the size of the page and not the size of the store.
+Parsing does not verify. A caller decides where to verify, and `Store.ingest` can do it (`IngestOptions.verify_with`) before an event is stored. Ingest also applies the replaceable and deletion rules. Reads go the other way: `Store.query` takes the same `Filter` that was sent to the relay, picks the most selective index, walks it newest first and stops at `limit`, so a read costs the size of the page and not the size of the store. A `search` on the filter is the one constraint the store applies that `Filter.matches` does not: a substring of the content, ignoring ASCII case, with no index behind it.
 
 Which relays to ask comes from `nip65`: parse a user's kind 10002 event, then `readRoutes` or `writeRoutes` group many users by relay, so one subscription per relay covers everyone routed there.
 

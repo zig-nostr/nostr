@@ -20,10 +20,12 @@ covered by tests:
 - **Transport**: RFC 6455 WebSocket, a relay connection state machine, a live
   TCP/TLS dialer, NIP-42 authentication, and the NIP-65 outbox model with no
   hardcoded relays. A read can carry a deadline, so a thread serving a quiet
-  relay can still notice that its pool changed.
+  relay can still notice that its pool changed, and a failed dial can report the
+  HTTP status the relay answered the upgrade with.
 - **Store**: a memory-mapped LMDB event store with a bounded, newest-first query
   planner. A 500-note feed query is 0.28 ms at 100,000 stored events, and a
-  profile read is 8 microseconds.
+  profile read is 8 microseconds. A NIP-50 `search` on a filter is sent to relays
+  as is, and the store applies it as a case-insensitive substring of the content.
 - **Signing**: NIP-44 v2, and the NIP-46 bunker protocol as both client and
   server, so a signer is a shell over the library rather than its own
   implementation.
