@@ -556,7 +556,7 @@ pub const IoStream = struct {
                             // for a byte forever. The driver's poll carries its own
                             // timeout and reads nothing, which keeps the same
                             // promise. Anything but a timeout falls through to the
-                            // real read, as below.
+                            // real read, as below, a cancel included.
                             if (!afd.ready(io, sock.handle, afd.read_events, msUntil(io, d))) return error.Timeout;
                         } else {
                             var msgs: [1]std.Io.net.IncomingMessage = .{.init};
@@ -571,8 +571,16 @@ pub const IoStream = struct {
                             // through to the real read below, which is the one
                             // allowed to decide the socket is finished: a readiness
                             // probe has no business ending a connection.
+                            //
+                            // A cancel falls through too, but re-armed first. The
+                            // peek has taken it, and a task that has taken its
+                            // cancel runs every later call uncancelable, so the
+                            // read below would wait for the relay's next byte and
+                            // the cancel would never land. Re-armed, the read sees
+                            // it at once and fails.
                             if (maybe_err) |err| switch (err) {
                                 error.Timeout => return error.Timeout,
+                                error.Canceled => io.recancel(),
                                 else => {},
                             };
                         }
@@ -667,8 +675,8 @@ const afd = struct {
     };
 
     /// Whether one of `events` fires on `handle` within `ms` milliseconds. A
-    /// failed wait answers yes: the read or write that follows reports the real
-    /// error.
+    /// failed or cancelled wait answers yes: the read or write that follows
+    /// reports the real error, or the cancel.
     fn ready(io: std.Io, handle: net.Socket.Handle, events: u32, ms: i32) bool {
         comptime std.debug.assert(@as(u32, @bitCast(windows.IOCTL.AFD.POLL)) == 0x12024);
         var info: PollInfo = .{
@@ -688,12 +696,16 @@ const afd = struct {
             .in = bytes,
             .out = bytes,
         } }) catch |err| switch (err) {
-            // Not swallowed: the caller's next I/O sees the cancel. A pong is
-            // skipped, which its caller allows for, and a read gives up as at a
-            // deadline.
+            // Re-armed, and answered yes, so the read or write that follows is
+            // the call that sees the cancel and fails. Answering no turned a
+            // cancelled read into `error.Timeout`, and a reader that asks again
+            // on a timeout came straight back here, where the re-armed cancel
+            // ended the wait at once: a loop at full CPU that the cancel never
+            // got out of. A write sees it the same way, so a pong never waits
+            // for room once its caller is cancelled.
             error.Canceled => {
                 io.recancel();
-                return false;
+                return true;
             },
         };
         return switch (result.device_io_control.u.Status) {
@@ -1983,4 +1995,76 @@ test "a deadline fires on a quiet socket and leaves the connection usable" {
     var m = (try conn.receiveTimeout(.{ .duration = .{ .raw = .fromMilliseconds(5000), .clock = .awake } })).?;
     defer m.deinit();
     try std.testing.expectEqualStrings("after the deadline", m.value.notice.message);
+}
+
+test "a reader that asks again on every timeout still ends when it is cancelled" {
+    // The usual reader: a short deadline, housekeeping, ask again. Cancelling
+    // it has to end it. Before, the wait that ran when the cancel arrived took
+    // it and said nothing, and the read after it blocked until the relay sent
+    // a byte, so on a quiet relay the cancel never returned.
+    //
+    // A hang is not a failure anyone sees, so a watchdog turns one into a
+    // failure: if the cancel is still waiting after a while, it closes the
+    // relay's end, which ends the stuck read, and records that it had to.
+    //
+    // Without stack traces, for the reason in the cancelled dial's test above.
+    var debug: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    defer if (debug.deinit() == .leak) @panic("the cancelled reader leaked");
+    const allocator = debug.allocator();
+    const io = std.testing.io;
+
+    var listen_address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try listen_address.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    var bound = server.socket.address;
+    const client = try bound.connect(io, .{ .mode = .stream });
+    defer client.close(io);
+    const served = try server.accept(io);
+    defer served.close(io);
+
+    var c_read_buf: [4096]u8 = undefined;
+    var c_write_buf: [4096]u8 = undefined;
+    var c_reader = client.reader(io, &c_read_buf);
+    var c_writer = client.writer(io, &c_write_buf);
+    var conn = LiveConnection.init(allocator, io, .{
+        .reader = &c_reader.interface,
+        .writer = &c_writer.interface,
+        .io = io,
+        .socket = client.socket,
+    });
+    defer conn.deinit();
+
+    var stuck: std.atomic.Value(bool) = .init(false);
+    var reader = try io.concurrent(readUntilEnd, .{&conn});
+    var watchdog = try io.concurrent(unstickAfter, .{ io, served, &stuck });
+    defer watchdog.cancel(io) catch {};
+
+    // Let it go round a few deadlines first, so the cancel can land in the
+    // wait as well as between waits.
+    try io.sleep(.fromMilliseconds(200), .awake);
+    const started = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+    const ended = reader.cancel(io);
+    const waited = std.Io.Timestamp.now(io, .awake).toMilliseconds() - started;
+
+    try std.testing.expect(!stuck.load(.acquire));
+    try std.testing.expectError(error.ReadFailed, ended);
+    try std.testing.expect(waited < 2000);
+}
+
+/// Reads until the relay is gone, asking again on every timeout.
+fn readUntilEnd(conn: *LiveConnection) !void {
+    while (true) {
+        var m = (conn.receiveTimeout(.{ .duration = .{ .raw = .fromMilliseconds(20), .clock = .awake } }) catch |err| switch (err) {
+            error.Timeout => continue,
+            else => |e| return e,
+        }) orelse return;
+        m.deinit();
+    }
+}
+
+/// After three seconds, records that it had to and shuts the relay's end down.
+fn unstickAfter(io: std.Io, served: std.Io.net.Stream, stuck: *std.atomic.Value(bool)) !void {
+    try io.sleep(.fromMilliseconds(3000), .awake);
+    stuck.store(true, .release);
+    served.shutdown(io, .both) catch {};
 }
