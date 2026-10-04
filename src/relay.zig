@@ -1773,6 +1773,9 @@ test "dialDiagnosed reports the status a relay answered the upgrade with" {
     defer allocator.free(url);
 
     var pending = try io.concurrent(refuseUpgrade, .{ io, &server });
+    // A dial that fails before the server has answered must not leave it
+    // parked in `accept` on a socket this frame is about to close.
+    defer pending.cancel(io) catch {};
     var diagnostic: DialDiagnostic = .{};
     try std.testing.expectError(ConnectionError.HandshakeFailed, dialDiagnosed(allocator, io, url, &diagnostic));
     try pending.await(io);

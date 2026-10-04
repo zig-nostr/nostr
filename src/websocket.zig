@@ -224,8 +224,15 @@ pub fn statusCode(head: []const u8) ?u16 {
     const version = tokens.next() orelse return null;
     if (!std.mem.startsWith(u8, version, "HTTP/1.")) return null;
     const code = tokens.next() orelse return null;
+    // Three digits and nothing else. `parseInt` alone would also take a sign
+    // or an underscore, so "+50" or "5_0" would read as a status of 50.
     if (code.len != 3) return null;
-    return std.fmt.parseInt(u16, code, 10) catch null;
+    var status: u16 = 0;
+    for (code) |ch| {
+        if (!std.ascii.isDigit(ch)) return null;
+        status = status * 10 + (ch - '0');
+    }
+    return status;
 }
 
 fn isSwitchingProtocols(status_line: []const u8) bool {
@@ -365,6 +372,8 @@ test "statusCode reads the code from a status line" {
     try std.testing.expectEqual(@as(?u16, null), statusCode("HTTP/1.1 503 Service Unavail"));
     try std.testing.expectEqual(@as(?u16, null), statusCode("garbage\r\n"));
     try std.testing.expectEqual(@as(?u16, null), statusCode("HTTP/1.1 abc Nope\r\n"));
+    try std.testing.expectEqual(@as(?u16, null), statusCode("HTTP/1.1 +50 Nope\r\n"));
+    try std.testing.expectEqual(@as(?u16, null), statusCode("HTTP/1.1 5_0 Nope\r\n"));
     try std.testing.expectEqual(@as(?u16, null), statusCode(""));
 }
 
