@@ -95,9 +95,7 @@ must pass its official test vectors, before either ships.
 
 ## Orientation
 
-- [`ARCHITECTURE.md`](ARCHITECTURE.md): the modules, how data flows, the
-  threading and cancellation model, where to start reading, and how it is
-  tested (fuzz targets included).
+- [`ARCHITECTURE.md`](ARCHITECTURE.md): the modules, how data flows, the threading and cancellation model, where to start reading, and how it is tested (fuzz targets included).
 - [`CURRENT_STATE.md`](CURRENT_STATE.md): what's built, in progress, and
   next, updated on every merge.
 - [`CONTRIBUTING.md`](CONTRIBUTING.md): full contribution workflow.

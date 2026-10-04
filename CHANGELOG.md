@@ -8,12 +8,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- Decoding an `nprofile`, `nevent`, `naddr` or `nrelay` that carried an entry of 254 or 255 bytes overflowed the step to the next entry: a panic in a safety build, and undefined behaviour in the build that ships, where in practice the step wrapped to 0 or 1 and either never advanced or read the middle of the value as the next entry. A relay URL of 254 or 255 bytes in an `nprofile` is enough to hit it, and `encodeNprofile` produces one.
-- `nip19.decodeNaddr` leaked a copy of the identifier for every identifier entry but the last, so an `naddr` that carried two leaked one. The last one is still the one returned.
-- `nip49.decrypt` cast the scrypt cost read from the `ncryptsec` straight into a six bit integer, so a file with a cost above 63 was a crash instead of an error. It is now `WeakParameters`.
-
 ### Added
 
 - `relay.dialDiagnosed` and `relay.DialDiagnostic`: `dial` that also records the HTTP status the relay answered the websocket upgrade with. A relay that answers 503 when busy, 401 or 403, or 429 still fails the dial with `HandshakeFailed`, so a tool printed that and nothing else; `diagnostic.status` now lets it say "relay answered 503". `Connection.handshake_status` carries the same value for callers that drive `handshake` themselves. The error sets are unchanged, and `dial` behaves as before.
@@ -31,6 +25,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - On Windows, `keystore.writeNewKeyFile` creates the key file with the default access list of its directory, since Windows has no mode bits. POSIX still creates it `0600`.
+
+### Fixed
+
+- Decoding an `nprofile`, `nevent`, `naddr` or `nrelay` that carried an entry of 254 or 255 bytes overflowed the step to the next entry: a panic in a safety build, and undefined behaviour in the build that ships, where in practice the step wrapped to 0 or 1 and either never advanced or read the middle of the value as the next entry. A relay URL of 254 or 255 bytes in an `nprofile` is enough to hit it, and `encodeNprofile` produces one.
+- `nip19.decodeNaddr` leaked a copy of the identifier for every identifier entry but the last, so an `naddr` that carried two leaked one. The last one is still the one returned.
+- `nip49.decrypt` cast the scrypt cost read from the `ncryptsec` straight into a six bit integer, so a file with a cost above 63 was a crash instead of an error. It is now `WeakParameters`.
 
 ## [0.14.7] - 2026-09-24
 
