@@ -36,6 +36,7 @@ platforms keep libc `getaddrinfo` and `poll`.
 The parsers that read bytes from outside (frames, relay messages, events, NIP-19,
 NIP-44, NIP-46, connection URIs, key files) have fuzz targets that run over a
 seed corpus in every `zig build test` and can be fuzzed for real.
+[`ARCHITECTURE.md`](ARCHITECTURE.md) says how the pieces fit.
 
 APIs may still change. There is no 1.0 date, and tagging one is deliberately not
 on the roadmap while groups, messages, media and payments are still landing.

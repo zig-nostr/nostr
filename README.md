@@ -41,6 +41,10 @@ live at [zignostr.com](https://zignostr.com).
 - **🔐 Portable keys**: NIP-06 mnemonic derivation and NIP-49 (`ncryptsec`)
   encrypted key storage, NFKC-normalized for cross-app interop.
 
+## How it is built
+
+[`ARCHITECTURE.md`](ARCHITECTURE.md) lists the modules, follows an event from a key to a relay to the store, and explains the threading and cancellation rules and how the library is tested, fuzz targets included.
+
 ## Platforms
 
 macOS, Linux and Windows, on x86_64 and aarch64. CI builds and runs the tests on all three systems. Zig 0.16 is required, at the version pinned in `.zigversion`. To check a Windows build from another system, `zig build test -Dtarget=x86_64-windows-gnu` compiles the test binary, which a non-Windows host then cannot run.
