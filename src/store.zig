@@ -474,10 +474,9 @@ pub const Store = struct {
         // make the merge step through every other kind those authors wrote and
         // throw each one away after a decode.
         //
-        // The pairing is a product, and the merge picks the newest across live
-        // streams linearly, so a filter with many of both is left on the author
-        // index: paying a decode per rejected event beats paying a cursor and a
-        // comparison per pair.
+        // The pairing is a product, and every pair costs a cursor and a heap
+        // slot, so a filter with many of both is left on the author index:
+        // paying a decode per rejected event beats paying for the pairs.
         const author_kind: ?[]const u16 = blk: {
             const authors = filter.authors orelse break :blk null;
             const kinds = filter.kinds orelse break :blk null;
@@ -549,23 +548,20 @@ pub const Store = struct {
         var seen: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
         defer seen.deinit(gpa);
 
+        var heap = MergeHeap.init(try sa.alloc(u32, streams.items.len), streams.items);
+
         var examined: usize = 0;
         var list_checks: usize = 0;
         const width = listWidth(residual);
         const limit: usize = if (filter.limit) |l| l else std.math.maxInt(usize);
         while (matched.items.len < limit) {
             // Pop the globally newest candidate: largest (time, id) suffix
-            // across the live streams. Stream counts are small (one per
-            // author/kind/tag value), so a linear pick beats heap overhead.
-            var best: ?usize = null;
-            for (streams.items, 0..) |s, i| {
-                if (!s.live) continue;
-                if (best == null or revStreamNewer(s, streams.items[best.?])) best = i;
-            }
-            const bi = best orelse break;
+            // across the live streams, which is the top of the heap.
+            const bi = heap.top() orelse break;
             const id = streams.items[bi].id;
             examined += 1;
             try revStreamAdvance(&streams.items[bi], since_key);
+            heap.settleTop(streams.items);
 
             // The same event can surface from two streams (e.g. two queried
             // tag values on one event); yield it once.
@@ -1265,15 +1261,76 @@ fn revStreamAdvance(s: *RevStream, since_key: [8]u8) Error!void {
     try revStreamSettle(s, since_key);
 }
 
-/// True if live stream `a` is parked on a newer entry than live stream `b`:
-/// larger (time-key, id), matching `lessByTimeDesc`'s ordering.
-fn revStreamNewer(a: RevStream, b: RevStream) bool {
-    return switch (std.mem.order(u8, &a.tk, &b.tk)) {
-        .gt => true,
-        .lt => false,
-        .eq => std.mem.order(u8, &a.id, &b.id) == .gt,
-    };
-}
+/// A binary max-heap of indices into the merge's stream list, keyed by what
+/// each live stream is parked on, so the newest candidate is always `top()` and
+/// taking it costs a sift of O(log streams) instead of a scan of all of them.
+/// Streams tied on (time-key, id), which happens when one event is reached
+/// through two index prefixes, are ordered by index: the same pick the linear
+/// scan made, so the merge yields identical output either way. The streams
+/// slice must keep its length and position for as long as the heap is used.
+const MergeHeap = struct {
+    items: []u32,
+    len: usize,
+
+    /// Fills `buf` (at least `streams.len` slots) with the live streams and
+    /// orders it.
+    fn init(buf: []u32, streams: []const RevStream) MergeHeap {
+        var h = MergeHeap{ .items = buf, .len = 0 };
+        for (streams, 0..) |s, i| {
+            if (!s.live) continue;
+            h.items[h.len] = @intCast(i);
+            h.len += 1;
+        }
+        var i = h.len / 2;
+        while (i > 0) {
+            i -= 1;
+            h.siftDown(streams, i);
+        }
+        return h;
+    }
+
+    /// The index of the stream parked on the newest entry, if any is live.
+    fn top(h: MergeHeap) ?u32 {
+        return if (h.len == 0) null else h.items[0];
+    }
+
+    /// Restores the order after the top stream was advanced: it keeps its
+    /// slot if it is still live and leaves the heap if it ran out.
+    fn settleTop(h: *MergeHeap, streams: []const RevStream) void {
+        if (!streams[h.items[0]].live) {
+            h.len -= 1;
+            h.items[0] = h.items[h.len];
+        }
+        h.siftDown(streams, 0);
+    }
+
+    fn before(streams: []const RevStream, a: u32, b: u32) bool {
+        const sa = &streams[a];
+        const sb = &streams[b];
+        return switch (std.mem.order(u8, &sa.tk, &sb.tk)) {
+            .gt => true,
+            .lt => false,
+            .eq => switch (std.mem.order(u8, &sa.id, &sb.id)) {
+                .gt => true,
+                .lt => false,
+                .eq => a < b,
+            },
+        };
+    }
+
+    fn siftDown(h: *MergeHeap, streams: []const RevStream, start: usize) void {
+        var i = start;
+        while (true) {
+            const l = 2 * i + 1;
+            if (l >= h.len) return;
+            var m = l;
+            if (l + 1 < h.len and before(streams, h.items[l + 1], h.items[l])) m = l + 1;
+            if (!before(streams, h.items[m], h.items[i])) return;
+            std.mem.swap(u32, &h.items[i], &h.items[m]);
+            i = m;
+        }
+    }
+};
 
 /// Order-preserving big-endian encoding of an `i64` timestamp: flipping the
 /// sign bit maps two's-complement order onto unsigned lexicographic order, so
@@ -2742,4 +2799,100 @@ test "store: the author+kind index stays whole through deletes and replaces" {
     try std.testing.expectEqual(@as(usize, 1), r.events.len);
     try std.testing.expectEqualStrings("{\"name\":\"two\"}", r.events[0].content);
     try std.testing.expectEqual(@as(usize, 1), r.examined);
+}
+
+/// The pick the merge used before it had a heap, kept as the reference: scan
+/// every live stream and take the newest, the lowest index on a tie.
+fn linearPick(streams: []const RevStream) ?usize {
+    var best: ?usize = null;
+    for (streams, 0..) |s, i| {
+        if (!s.live) continue;
+        if (best == null or linearNewer(s, streams[best.?])) best = i;
+    }
+    return best;
+}
+
+fn linearNewer(a: RevStream, b: RevStream) bool {
+    return switch (std.mem.order(u8, &a.tk, &b.tk)) {
+        .gt => true,
+        .lt => false,
+        .eq => std.mem.order(u8, &a.id, &b.id) == .gt,
+    };
+}
+
+test "store: the heap merge picks in the same order as the linear scan" {
+    const gpa = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x6d65_7267_65);
+    const rnd = prng.random();
+
+    // Each case is a set of streams, every one a newest-first list of
+    // (time-key, id) entries. Times and ids are drawn from small ranges so
+    // that ties on time are common and the same entry shows up in several
+    // streams, which is the case the tie-break exists for.
+    var case: usize = 0;
+    while (case < 300) : (case += 1) {
+        const n_streams = rnd.intRangeAtMost(usize, 0, 40);
+        const time_range = rnd.intRangeAtMost(i64, 1, 12);
+        const id_range = rnd.intRangeAtMost(u8, 1, 6);
+
+        const lists = try gpa.alloc([]RevStream, n_streams);
+        defer gpa.free(lists);
+        var made: usize = 0;
+        defer for (lists[0..made]) |l| gpa.free(l);
+        for (lists) |*l| {
+            const len = rnd.intRangeAtMost(usize, 0, 12);
+            const entries = try gpa.alloc(RevStream, len);
+            for (entries) |*e| {
+                e.* = .{ .live = true };
+                e.tk = orderKey(rnd.intRangeAtMost(i64, -time_range, time_range));
+                @memset(&e.id, 0);
+                e.id[31] = rnd.intRangeAtMost(u8, 0, id_range);
+            }
+            // Newest first, as a reverse cursor walks them.
+            std.mem.sort(RevStream, entries, {}, struct {
+                fn newer(_: void, a: RevStream, b: RevStream) bool {
+                    return linearNewer(a, b);
+                }
+            }.newer);
+            l.* = entries;
+            made += 1;
+        }
+
+        const ref = try gpa.alloc(RevStream, n_streams);
+        defer gpa.free(ref);
+        const fast = try gpa.alloc(RevStream, n_streams);
+        defer gpa.free(fast);
+        const ref_pos = try gpa.alloc(usize, n_streams);
+        defer gpa.free(ref_pos);
+        const fast_pos = try gpa.alloc(usize, n_streams);
+        defer gpa.free(fast_pos);
+        for (lists, 0..) |l, i| {
+            ref_pos[i] = 0;
+            fast_pos[i] = 0;
+            ref[i] = if (l.len > 0) l[0] else .{};
+            fast[i] = ref[i];
+        }
+
+        const buf = try gpa.alloc(u32, n_streams);
+        defer gpa.free(buf);
+        var heap = MergeHeap.init(buf, fast);
+
+        while (true) {
+            const want = linearPick(ref);
+            const got = heap.top();
+            try std.testing.expectEqual(want == null, got == null);
+            if (want == null) break;
+            const w = want.?;
+            const g: usize = got.?;
+            try std.testing.expectEqual(w, g);
+            try std.testing.expectEqualSlices(u8, &ref[w].id, &fast[g].id);
+            try std.testing.expectEqualSlices(u8, &ref[w].tk, &fast[g].tk);
+
+            ref_pos[w] += 1;
+            ref[w] = if (ref_pos[w] < lists[w].len) lists[w][ref_pos[w]] else .{};
+            fast_pos[g] += 1;
+            fast[g] = if (fast_pos[g] < lists[g].len) lists[g][fast_pos[g]] else .{};
+            heap.settleTop(fast);
+        }
+    }
 }

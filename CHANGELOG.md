@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The store's merged query takes the newest candidate from a binary heap of the live streams instead of scanning all of them once per returned event. The order of results, and which stream wins a tie, are unchanged. A 60-note query over a follow list of 512 authors went from 358 to 254 microseconds and over 2,048 authors from 1,430 to 1,006 (best of five, ReleaseFast), and a query over 20 authors is unchanged.
+
 ## [0.14.7] - 2026-09-24
 
 ### Fixed
