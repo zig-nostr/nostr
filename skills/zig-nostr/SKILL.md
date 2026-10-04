@@ -10,7 +10,7 @@ description: Build nostr software in Zig with zig-nostr's `nostr` library. Use w
 ## Add it
 
 ```sh
-zig fetch --save https://github.com/zig-nostr/nostr/archive/refs/tags/v0.14.8.tar.gz
+zig fetch --save https://github.com/zig-nostr/nostr/archive/refs/tags/v0.14.9.tar.gz
 ```
 
 Check https://github.com/zig-nostr/nostr/releases for the latest tag. In `build.zig`:
@@ -32,7 +32,7 @@ const io = threaded.io();
 
 ## Keys, events, NIP-19, NIP-44
 
-Every snippet here was compiled and run against v0.14.8.
+Every snippet here was compiled and run against v0.14.9.
 
 ```zig
 const std = @import("std");
