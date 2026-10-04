@@ -419,6 +419,13 @@ pub const Store = struct {
     /// kinds > tags > everything-by-time) to gather candidates, then applies the
     /// full `Filter` to each, so every constraint is enforced exactly as in
     /// subscription matching.
+    ///
+    /// `filter.search`, which `Filter.matches` leaves to relays, is applied here
+    /// as a substring of `content`, ignoring case for ASCII letters (other
+    /// characters must match exactly). No index serves it, so a search with no
+    /// other constraint reads events newest-first until `limit` of them match.
+    /// Content is compared as stored, so an encrypted message is ciphertext and
+    /// a search should name the kinds it means.
     pub fn query(self: *Store, gpa: std.mem.Allocator, filter: Filter) Error!QueryResult {
         var txn: ?*c.MDB_txn = null;
         try check(c.mdb_txn_begin(self.env, null, @intCast(c.MDB_RDONLY), &txn));
@@ -579,6 +586,7 @@ pub const Store = struct {
             // check on the index agreeing with the record it points at.
             list_checks += width;
             if (!residual.matches(ev)) continue;
+            if (!searchHit(filter.search, ev.content)) continue;
             try matched.append(gpa, ev);
         }
 
@@ -645,6 +653,7 @@ pub const Store = struct {
             if (filter) |f| {
                 list_checks += width;
                 if (!f.matches(ev)) continue;
+                if (!searchHit(f.search, ev.content)) continue;
             }
             try matched.append(gpa, ev);
         }
@@ -694,8 +703,14 @@ pub const Store = struct {
     /// `message.encodeReq` of `reconcileFilter(filter)` to the relays, and feed
     /// each incoming event back through `ingest`; a later `query` then reflects
     /// the reconciled state.
+    ///
+    /// A filter with `search` comes back unchanged. Relays decide what a search
+    /// matches, so the newest local substring match says nothing about which
+    /// of their results the store already holds, and a `since` taken from it
+    /// would hide every older result the relays would have returned.
     pub fn reconcileFilter(self: *Store, gpa: std.mem.Allocator, filter: Filter) Error!Filter {
         var f = filter;
+        if (filter.search != null) return f;
         if (try self.newestMatching(gpa, filter)) |newest| {
             if (f.since == null or f.since.? < newest) f.since = newest;
         }
@@ -1114,6 +1129,12 @@ fn canonicalPair(a: [32]u8, b: [32]u8) [64]u8 {
     @memcpy(out[0..32], if (a_first) &a else &b);
     @memcpy(out[32..64], if (a_first) &b else &a);
     return out;
+}
+
+/// Whether `content` contains `search`, ignoring ASCII case. No search is a hit.
+fn searchHit(search: ?[]const u8, content: []const u8) bool {
+    const needle = search orelse return true;
+    return std.ascii.indexOfIgnoreCase(content, needle) != null;
 }
 
 fn lessByTimeDesc(_: void, a: Event, b: Event) bool {
@@ -2378,6 +2399,60 @@ test "store: local-first snapshot, then reconcile with newer events" {
         @as(?i64, null),
         try store.newestMatching(gpa, .{ .authors = &[_][32]u8{[_]u8{0xFF} ** 32} }),
     );
+}
+
+test "store: a search matches content as a case-insensitive substring" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var store = try openTempStore(&tmp, "search.mdb", &buf);
+    defer store.deinit();
+
+    const a = [_]u8{0xA1} ** 32;
+    const contents = [_][]const u8{ "Writing a relay in Zig", "nothing to see", "zig fmt saved me", "ZIGZAG" };
+    for (contents, 0..) |content, i| {
+        var ev = qEvent(@intCast(i + 1), a, 1, @intCast(100 * (i + 1)), &[_]Tag{});
+        ev.content = content;
+        _ = try store.putEvent(gpa, ev);
+    }
+    var seeds: [8]u8 = undefined;
+
+    // Every index path applies it: the time index, the author index, and an
+    // explicit id list.
+    {
+        var r = try store.query(gpa, .{ .search = "ZIG" });
+        defer r.deinit();
+        try std.testing.expectEqualSlices(u8, &[_]u8{ 4, 3, 1 }, resultSeeds(r, &seeds));
+    }
+    {
+        var r = try store.query(gpa, .{ .authors = &[_][32]u8{a}, .search = "zig ", .limit = 5 });
+        defer r.deinit();
+        try std.testing.expectEqualSlices(u8, &[_]u8{3}, resultSeeds(r, &seeds));
+    }
+    {
+        var r = try store.query(gpa, .{ .ids = &[_][32]u8{ [_]u8{1} ** 32, [_]u8{2} ** 32 }, .search = "relay" });
+        defer r.deinit();
+        try std.testing.expectEqualSlices(u8, &[_]u8{1}, resultSeeds(r, &seeds));
+    }
+    // The limit counts matches, not the events read on the way.
+    {
+        var r = try store.query(gpa, .{ .search = "zig", .limit = 2 });
+        defer r.deinit();
+        try std.testing.expectEqualSlices(u8, &[_]u8{ 4, 3 }, resultSeeds(r, &seeds));
+    }
+    {
+        var r = try store.query(gpa, .{ .search = "rust" });
+        defer r.deinit();
+        try std.testing.expectEqual(@as(usize, 0), r.events.len);
+    }
+
+    // A search filter is not advanced past the newest local match: the
+    // relays' older results are the point of asking them.
+    {
+        const rf = try store.reconcileFilter(gpa, .{ .kinds = &[_]u16{1}, .search = "zig" });
+        try std.testing.expectEqual(@as(?i64, null), rf.since);
+    }
 }
 
 test "store: evictToCap removes the oldest events and their indexes" {

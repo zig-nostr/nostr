@@ -197,7 +197,7 @@ the signer protocol. Both apps are downloadable and both keep growing, so what
 comes next lands inside them rather than as new apps.
 
 In spec terms, the library still owes NIP-17 private direct messages, with the
-NIP-59 gift wrap that carries them, and a `search` field on `Filter` for NIP-50.
+NIP-59 gift wrap that carries them.
 Most of what remains is app work on protocol the library already exports:
 Blossom uploads so a picture can be posted, NIP-57 zaps that can be sent rather
 than only verified, NIP-51 bookmarks, and NIP-29 groups. Reactions,

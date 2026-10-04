@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `relay.dialDiagnosed` and `relay.DialDiagnostic`: `dial` that also records the HTTP status the relay answered the websocket upgrade with. A relay that answers 503 when busy, 401 or 403, or 429 still fails the dial with `HandshakeFailed`, so a tool printed that and nothing else; `diagnostic.status` now lets it say "relay answered 503". `Connection.handshake_status` carries the same value for callers that drive `handshake` themselves. The error sets are unchanged, and `dial` behaves as before.
+- `Filter.search` for NIP-50 full-text search, sent to relays as `"search"`. Relays do the matching, so `Filter.matches` ignores it; `Store.query` applies it as a substring of the content, ignoring case for ASCII letters, and `Store.reconcileFilter` leaves a search filter's `since` alone so the relays' older results are still asked for.
 
 ### Changed
 

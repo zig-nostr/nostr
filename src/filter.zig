@@ -37,10 +37,18 @@ pub const Filter = struct {
     /// Relay-side cap on how many events to return. Does not affect local
     /// matching; carried so it can be sent to the relay.
     limit: ?u32 = null,
+    /// NIP-50 full-text search, sent to the relay as `"search"`. Relays do the
+    /// matching, each in its own way: NIP-50 lets a relay read the query as it
+    /// sees fit (words in any order, fields other than content, `key:value`
+    /// extensions), so `matches` ignores it rather than turn away an event a
+    /// search relay returned on purpose. `Store.query` does apply it, as a
+    /// case-insensitive substring of `content`.
+    search: ?[]const u8 = null,
 
-    /// Returns true when `ev` satisfies every present constraint. `limit` is
-    /// intentionally ignored — it bounds how many results a relay returns, not
-    /// whether a given event matches.
+    /// Returns true when `ev` satisfies every present constraint. `limit` and
+    /// `search` are ignored: `limit` bounds how many results a relay returns,
+    /// not whether a given event matches, and only a relay can say what its
+    /// search matches.
     pub fn matches(self: Filter, ev: Event) bool {
         if (self.ids) |ids| {
             if (!containsHash(ids, ev.id)) return false;
@@ -106,6 +114,10 @@ pub const Filter = struct {
         if (self.limit) |limit| {
             try appendKey(list, allocator, &first, "limit");
             try appendInt(list, allocator, limit);
+        }
+        if (self.search) |search| {
+            try appendKey(list, allocator, &first, "search");
+            try json.appendString(list, allocator, search);
         }
 
         try list.append(allocator, '}');
@@ -236,6 +248,7 @@ test "full filter serializes in canonical field order" {
         .since = 1700000000,
         .until = 1700003600,
         .limit = 25,
+        .search = "zig",
     };
     const s = try encode(allocator, f);
     defer allocator.free(s);
@@ -246,8 +259,18 @@ test "full filter serializes in canonical field order" {
         "\"kinds\":[1,7]," ++
         "\"#e\":[\"" ++ "cc" ** 32 ++ "\"]," ++
         "\"#t\":[\"nostr\"]," ++
-        "\"since\":1700000000,\"until\":1700003600,\"limit\":25}";
+        "\"since\":1700000000,\"until\":1700003600,\"limit\":25,\"search\":\"zig\"}";
     try std.testing.expectEqualStrings(expected, s);
+}
+
+test "search serializes as an escaped JSON string" {
+    // NIP-50: `{"kinds":[1],"search":"best nostr apps"}`. The query is user
+    // text, so a quote or a backslash in it must not break the REQ.
+    const allocator = std.testing.allocator;
+    const kinds = [_]u16{1};
+    const s = try encode(allocator, .{ .kinds = &kinds, .search = "say \"hi\" \\ bye" });
+    defer allocator.free(s);
+    try std.testing.expectEqualStrings("{\"kinds\":[1],\"search\":\"say \\\"hi\\\" \\\\ bye\"}", s);
 }
 
 const test_pubkey = "f7234bd4c1394dda46d09f35bd384dd30cc552ad5541990f98844fb06676e9ca";
@@ -305,6 +328,13 @@ test "matches: tag filters" {
     try std.testing.expect((Filter{ .tags = &[_]TagFilter{.{ .letter = 'p', .values = &p_ok }} }).matches(sampleEvent()));
     // A tag letter not present on the event never matches.
     try std.testing.expect(!(Filter{ .tags = &[_]TagFilter{.{ .letter = 'e', .values = &p_ok }} }).matches(sampleEvent()));
+}
+
+test "matches: search is left to the relay" {
+    // A search relay may match on words in any order or on fields other than
+    // content, so an event it returned must not be turned away locally.
+    try std.testing.expect((Filter{ .search = "hello" }).matches(sampleEvent()));
+    try std.testing.expect((Filter{ .search = "nothing like the content" }).matches(sampleEvent()));
 }
 
 test "matches: all constraints AND together" {
