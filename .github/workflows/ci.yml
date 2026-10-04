@@ -32,3 +32,23 @@ jobs:
 
       - name: Check formatting
         run: zig fmt --check .
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read Zig version
+        id: zig-version
+        shell: bash
+        run: echo "version=$(cat .zigversion)" >> "$GITHUB_OUTPUT"
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ steps.zig-version.outputs.version }}
+
+      - name: Build
+        run: zig build
+
+      - name: Test
+        run: zig build test

@@ -43,7 +43,7 @@ zig build test    # run the unit test suite
 zig fmt --check .  # verify formatting (CI enforces this)
 ```
 
-Use the Zig version pinned in `.zigversion`. CI runs on Linux and macOS.
+Use the Zig version pinned in `.zigversion`. CI runs on Linux, macOS and Windows.
 
 ## Dependency graph
 

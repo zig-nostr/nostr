@@ -16,6 +16,7 @@
 //! ever touches the already-derived 32-byte key.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const nip49 = @import("nip49.zig");
 
 const Dir = std.Io.Dir;
@@ -60,13 +61,20 @@ pub fn decryptKey(gpa: std.mem.Allocator, ncryptsec: []const u8, passphrase: []c
 /// Writes `ncryptsec` into `dir` at `path` as a new `0600` file, refusing to
 /// overwrite an existing one so a second init can't silently clobber a stored
 /// key. `dir` is the containing directory (the process cwd in production).
+///
+/// Windows has no mode bits: the file takes the access list of the directory it
+/// is created in, which for a path under the user's profile is already private
+/// to that user. The key is encrypted either way (NIP-49).
 pub fn writeNewKeyFile(io: std.Io, dir: Dir, path: []const u8, ncryptsec: []const u8) !void {
     dir.writeFile(io, .{
         .sub_path = path,
         .data = ncryptsec,
         .flags = .{
             .exclusive = true,
-            .permissions = std.Io.File.Permissions.fromMode(0o600),
+            .permissions = if (builtin.os.tag == .windows)
+                .default_file
+            else
+                std.Io.File.Permissions.fromMode(0o600),
         },
     }) catch |err| switch (err) {
         error.PathAlreadyExists => return Error.KeyFileExists,
@@ -112,9 +120,11 @@ test "writeNewKeyFile then readKeyFile round-trips, is 0600, and refuses overwri
 
     try writeNewKeyFile(io, tmp.dir, "key.ncryptsec", ncryptsec);
 
-    // Stored 0600: no group/other permission bits.
-    const st = try tmp.dir.statFile(io, "key.ncryptsec", .{});
-    try testing.expectEqual(@as(std.posix.mode_t, 0), st.permissions.toMode() & 0o077);
+    // Stored 0600: no group/other permission bits. (Windows has no mode bits.)
+    if (builtin.os.tag != .windows) {
+        const st = try tmp.dir.statFile(io, "key.ncryptsec", .{});
+        try testing.expectEqual(@as(std.posix.mode_t, 0), st.permissions.toMode() & 0o077);
+    }
 
     // Round-trips through the file and decrypts back to the same key.
     const loaded = try readKeyFile(gpa, io, tmp.dir, "key.ncryptsec");

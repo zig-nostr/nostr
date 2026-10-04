@@ -28,6 +28,11 @@ covered by tests:
   server, so a signer is a shell over the library rather than its own
   implementation.
 
+The library builds for macOS, Linux and Windows (x86_64 and aarch64 on each). CI
+builds and runs the tests on Linux, macOS and Windows. On Windows, hostnames
+resolve through std's resolver and the pong wait uses `WSAPoll`; the other
+platforms keep libc `getaddrinfo` and `poll`.
+
 APIs may still change. There is no 1.0 date, and tagging one is deliberately not
 on the roadmap while groups, messages, media and payments are still landing.
 

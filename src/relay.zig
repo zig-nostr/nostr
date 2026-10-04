@@ -10,6 +10,7 @@
 //! makes it testable.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const websocket = @import("websocket.zig");
 const message = @import("message.zig");
 const event_mod = @import("event.zig");
@@ -591,15 +592,64 @@ pub const IoStream = struct {
         const sock = self.socket orelse return true;
         const left = deadline.raw.nanoseconds - std.Io.Clock.Timestamp.now(io, deadline.clock).raw.nanoseconds;
         const ms: i32 = if (left <= 0) 0 else @intCast(@min(@divFloor(left + std.time.ns_per_ms - 1, std.time.ns_per_ms), std.math.maxInt(i32)));
-        var fds = [_]std.posix.pollfd{.{ .fd = sock.handle, .events = std.posix.POLL.OUT, .revents = 0 }};
-        const ready = std.posix.poll(&fds, ms) catch return true;
-        return ready > 0;
+        return socketWritable(sock.handle, ms);
     }
 
     pub fn writeAll(self: IoStream, bytes: []const u8) std.Io.Writer.Error!void {
         try self.writer.writeAll(bytes);
         try self.writer.flush();
         if (self.transport_writer) |tw| try tw.flush();
+    }
+};
+
+/// Whether `handle` can take a write within `ms` milliseconds. A failed wait
+/// answers yes: the write that follows reports the real error.
+fn socketWritable(handle: net.Socket.Handle, ms: i32) bool {
+    if (comptime builtin.os.tag == .windows) return winsock.writable(handle, ms);
+    var fds = [_]posix.pollfd{.{ .fd = handle, .events = posix.POLL.OUT, .revents = 0 }};
+    const ready = posix.poll(&fds, ms) catch return true;
+    return ready > 0;
+}
+
+/// The two Winsock calls the library makes itself. std's Windows io talks to
+/// the AFD driver directly and never starts Winsock, and it exposes no
+/// readiness wait for writing, so this declares just `WSAStartup` and
+/// `WSAPoll`. Only referenced on Windows targets.
+const winsock = struct {
+    const POLLWRNORM: i16 = 0x0010;
+
+    const WSAPOLLFD = extern struct {
+        fd: usize,
+        events: i16,
+        revents: i16,
+    };
+
+    extern "ws2_32" fn WSAStartup(version: u16, data: *anyopaque) callconv(.winapi) c_int;
+    extern "ws2_32" fn WSAPoll(fds: [*]WSAPOLLFD, count: u32, timeout_ms: c_int) callconv(.winapi) c_int;
+
+    /// 0 not started, 1 started, 2 failed. Startup is reference counted by
+    /// Windows, so two threads racing here only cost one extra count.
+    var state: std.atomic.Value(u8) = .init(0);
+
+    fn start() bool {
+        switch (state.load(.acquire)) {
+            1 => return true,
+            2 => return false,
+            else => {},
+        }
+        // WSADATA is 400 bytes on 32-bit and 408 on 64-bit Windows.
+        var data: [512]u8 align(8) = undefined;
+        const ok = WSAStartup(0x0202, &data) == 0;
+        state.store(if (ok) 1 else 2, .release);
+        return ok;
+    }
+
+    fn writable(handle: net.Socket.Handle, ms: i32) bool {
+        if (!start()) return true;
+        var fds = [_]WSAPOLLFD{.{ .fd = @intFromPtr(handle), .events = POLLWRNORM, .revents = 0 }};
+        const ready = WSAPoll(&fds, 1, ms);
+        if (ready < 0) return true;
+        return ready > 0;
     }
 };
 
@@ -727,18 +777,38 @@ pub const Relay = struct {
     }
 };
 
-/// Resolves `host` with the system resolver (libc `getaddrinfo`) and connects a
-/// TCP stream to `port`, trying each returned address until one connects.
+/// Resolves `host` with the system resolver and connects a TCP stream to
+/// `port`, trying each returned address until one connects.
 ///
-/// We deliberately bypass std's built-in DNS resolver (`net.HostName.connect`):
-/// it reads nameservers from `/etc/resolv.conf`, but on macOS that file is empty
-/// (name resolution is handled by the system configuration framework, not
-/// resolv.conf), so std falls back to querying `127.0.0.1:53` — where nothing is
-/// listening — and a hostname lookup hangs indefinitely. `getaddrinfo` uses the
-/// OS resolver and works on both macOS and Linux. It needs libc, which the
-/// library already links for libsecp256k1 and LMDB. A numeric host (an IP
-/// literal) resolves through the same path.
+/// On POSIX this is libc `getaddrinfo`, and we deliberately bypass std's
+/// built-in DNS resolver (`net.HostName.connect`): it reads nameservers from
+/// `/etc/resolv.conf`, but on macOS that file is empty (name resolution is
+/// handled by the system configuration framework, not resolv.conf), so std
+/// falls back to querying `127.0.0.1:53`, where nothing is listening, and a
+/// hostname lookup hangs indefinitely. `getaddrinfo` uses the OS resolver and
+/// works on both macOS and Linux. It needs libc, which the library already
+/// links for libsecp256k1 and LMDB. A numeric host (an IP literal) resolves
+/// through the same path.
+///
+/// Windows has no `getaddrinfo` in std's declarations, and std's own resolver
+/// there asks the OS (DnsQueryEx) rather than a resolv.conf, so the macOS
+/// problem does not exist and `net.HostName.connect` is used. An IP literal is
+/// parsed first, since a host name must be a valid DNS name and `::1` is not.
 fn resolveAndConnect(gpa: std.mem.Allocator, io: std.Io, host: []const u8, port: u16) !net.Stream {
+    if (comptime builtin.os.tag == .windows) {
+        if (net.IpAddress.parse(host, port)) |address| {
+            return address.connect(io, .{ .mode = .stream });
+        } else |_| {}
+        const name = net.HostName.init(host) catch return error.NameResolutionFailed;
+        return name.connect(io, port, .{ .mode = .stream }) catch |err| switch (err) {
+            error.UnknownHostName, error.NameServerFailure, error.NoAddressReturned => error.NameResolutionFailed,
+            else => err,
+        };
+    }
+    return resolveAndConnectLibc(gpa, io, host, port);
+}
+
+fn resolveAndConnectLibc(gpa: std.mem.Allocator, io: std.Io, host: []const u8, port: u16) !net.Stream {
     const host_z = try gpa.dupeZ(u8, host);
     defer gpa.free(host_z);
 

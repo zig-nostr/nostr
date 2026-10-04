@@ -17,6 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The store's merged query takes the newest candidate from a binary heap of the live streams instead of scanning all of them once per returned event. The order of results, and which stream wins a tie, are unchanged. A 60-note query over a follow list of 512 authors went from 358 to 254 microseconds and over 2,048 authors from 1,430 to 1,006 (best of five, ReleaseFast), and a query over 20 authors is unchanged.
 
+- The library builds for `x86_64-windows-gnu` and `aarch64-windows-gnu`. Hostname resolution on Windows goes through std's own resolver, which asks the OS, instead of libc `getaddrinfo`, which std does not declare there; an IP literal is parsed first so `[::1]` and `127.0.0.1` never reach the name resolver. The wait for room before a pong is written uses `WSAPoll` through a local Winsock binding. POSIX targets keep `getaddrinfo` and `poll` exactly as before. (#59)
+- CI builds and tests on Windows.
+
+### Changed
+
+- On Windows, `keystore.writeNewKeyFile` creates the key file with the default access list of its directory, since Windows has no mode bits. POSIX still creates it `0600`.
+
 ## [0.14.7] - 2026-09-24
 
 ### Fixed
