@@ -41,6 +41,7 @@ Only declarations re-exported from `root.zig` are part of the public API.
 zig build         # build the library module
 zig build test    # run the unit test suite
 zig fmt --check .  # verify formatting (CI enforces this)
+zig build test --fuzz -Doptimize=ReleaseSafe  # fuzz the parsers until stopped
 ```
 
 Use the Zig version pinned in `.zigversion`. CI runs on Linux, macOS and Windows.

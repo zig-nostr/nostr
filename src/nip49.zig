@@ -129,7 +129,12 @@ pub fn decrypt(allocator: std.mem.Allocator, ncryptsec: []const u8, password: []
 
     var key: [key_len]u8 = undefined;
     defer std.crypto.secureZero(u8, &key);
-    std.crypto.pwhash.scrypt.kdf(allocator, &key, norm_pw.slice, salt, .{ .ln = @intCast(log_n), .r = 8, .p = 1 }) catch
+    // The cost is a byte of the file, and the KDF takes six bits of it. A file
+    // that asks for more is refusing nothing the KDF could do, so it is rejected
+    // here rather than cast: an `@intCast` that does not fit is a crash in a
+    // safety build and undefined behaviour in the build that ships.
+    const ln = std.math.cast(u6, log_n) orelse return Error.WeakParameters;
+    std.crypto.pwhash.scrypt.kdf(allocator, &key, norm_pw.slice, salt, .{ .ln = ln, .r = 8, .p = 1 }) catch
         return Error.WeakParameters;
 
     var privkey: [key_len]u8 = undefined;
@@ -175,6 +180,23 @@ test "decrypt rejects wrong password" {
     defer allocator.free(ncryptsec);
 
     try std.testing.expectError(Error.DecryptionFailed, decrypt(allocator, ncryptsec, "wrong password"));
+}
+
+test "a cost that does not fit the KDF is an error, not a crash" {
+    // The cost is read out of the file. Anything above 63 used to be cast into
+    // the six bit field scrypt takes, which is a panic in a safety build and
+    // undefined behaviour in ReleaseFast, reachable by opening a key file.
+    const allocator = std.testing.allocator;
+    for ([_]u8{ 64, 65, 128, 200, 255 }) |log_n| {
+        var payload: [payload_len]u8 = @splat(0);
+        payload[0] = version_number;
+        payload[1] = log_n;
+        const data5 = try bech32.convertBits(allocator, &payload, 8, 5, true);
+        defer allocator.free(data5);
+        const s = try bech32.encode(allocator, "ncryptsec", data5);
+        defer allocator.free(s);
+        try std.testing.expectError(Error.WeakParameters, decrypt(allocator, s, "password"));
+    }
 }
 
 test "NFKC: compatibility-equivalent passwords derive the same key" {

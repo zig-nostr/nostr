@@ -119,7 +119,9 @@ pub fn decodeNprofile(allocator: std.mem.Allocator, s: []const u8) Error!Profile
             1 => try relays.append(allocator, try allocator.dupe(u8, v)),
             else => {}, // unrecognized TLV types are ignored per spec
         }
-        i += 2 + l;
+        // `l` is a byte: `2 + l` on its own is a byte too, and a length of 254
+        // or 255 overflows it.
+        i += @as(usize, l) + 2;
     }
 
     const pk = pubkey orelse return Error.InvalidTlv;
@@ -204,7 +206,9 @@ pub fn decodeNevent(allocator: std.mem.Allocator, s: []const u8) Error!EventPoin
             },
             else => {},
         }
-        i += 2 + l;
+        // `l` is a byte: `2 + l` on its own is a byte too, and a length of 254
+        // or 255 overflows it.
+        i += @as(usize, l) + 2;
     }
 
     const eid = id orelse return Error.InvalidTlv;
@@ -289,7 +293,9 @@ pub fn decodeNaddr(allocator: std.mem.Allocator, s: []const u8) Error!AddrPointe
             },
             else => {},
         }
-        i += 2 + l;
+        // `l` is a byte: `2 + l` on its own is a byte too, and a length of 254
+        // or 255 overflows it.
+        i += @as(usize, l) + 2;
     }
 
     const ident = identifier orelse return Error.InvalidTlv;
@@ -328,7 +334,9 @@ pub fn decodeNrelay(allocator: std.mem.Allocator, s: []const u8) Error![]u8 {
         const l = raw[i + 1];
         if (i + 2 + l > raw.len) return Error.InvalidTlv;
         if (t == 0) return allocator.dupe(u8, raw[i + 2 .. i + 2 + l]);
-        i += 2 + l;
+        // `l` is a byte: `2 + l` on its own is a byte too, and a length of 254
+        // or 255 overflows it.
+        i += @as(usize, l) + 2;
     }
     return Error.InvalidTlv;
 }
@@ -459,6 +467,53 @@ test "nrelay round trip (deprecated)" {
     const decoded = try decodeNrelay(allocator, encoded);
     defer allocator.free(decoded);
     try std.testing.expectEqualStrings("wss://relay.example.com", decoded);
+}
+
+test "a TLV of 254 or 255 bytes is read, and the next one after it" {
+    // The step to the next entry was `2 + l` with `l` a byte, so a value of 254
+    // or 255 bytes overflowed it: a panic in a safety build, and in ReleaseFast a
+    // wrap to a step of 0 or 1 that read the middle of the value as the next
+    // entry (or, at 0, never advanced at all).
+    const allocator = std.testing.allocator;
+    const pubkey = [_]u8{0x11} ** 32;
+    const long255 = "w" ** 255;
+    const long254 = "v" ** 254;
+    const relays = [_][]const u8{ long255, long254, "wss://after.example" };
+
+    const nprofile = try encodeNprofile(allocator, pubkey, &relays);
+    defer allocator.free(nprofile);
+    var profile = try decodeNprofile(allocator, nprofile);
+    defer profile.deinit(allocator);
+    try std.testing.expectEqualSlices(u8, &pubkey, &profile.pubkey);
+    try std.testing.expectEqual(@as(usize, 3), profile.relays.len);
+    try std.testing.expectEqualStrings(long255, profile.relays[0]);
+    try std.testing.expectEqualStrings(long254, profile.relays[1]);
+    try std.testing.expectEqualStrings("wss://after.example", profile.relays[2]);
+
+    const nevent = try encodeNevent(allocator, pubkey, &relays, pubkey, 1);
+    defer allocator.free(nevent);
+    var ev = try decodeNevent(allocator, nevent);
+    defer ev.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 3), ev.relays.len);
+    try std.testing.expectEqual(@as(?u32, 1), ev.kind);
+
+    const naddr = try encodeNaddr(allocator, long255, pubkey, 30023, &relays);
+    defer allocator.free(naddr);
+    var addr = try decodeNaddr(allocator, naddr);
+    defer addr.deinit(allocator);
+    try std.testing.expectEqualStrings(long255, addr.identifier);
+    try std.testing.expectEqual(@as(usize, 3), addr.relays.len);
+    try std.testing.expectEqual(@as(u32, 30023), addr.kind);
+
+    // An entry of a type nobody defined, 255 bytes long, ahead of the one wanted.
+    const tlv = "\x09\xff" ++ "z" ** 255 ++ "\x00\x05hello";
+    const data5 = try bech32.convertBits(allocator, tlv, 8, 5, true);
+    defer allocator.free(data5);
+    const nrelay = try bech32.encode(allocator, "nrelay", data5);
+    defer allocator.free(nrelay);
+    const url = try decodeNrelay(allocator, nrelay);
+    defer allocator.free(url);
+    try std.testing.expectEqualStrings("hello", url);
 }
 
 test "NIP-21 nostr: URI wrap/unwrap" {

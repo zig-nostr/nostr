@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Decoding an `nprofile`, `nevent`, `naddr` or `nrelay` that carried an entry of 254 or 255 bytes overflowed the step to the next entry: a panic in a safety build, and in the build that ships a wrap to a step of 0 or 1 that either never advanced or read the middle of the value as the next entry. A relay URL of 254 or 255 bytes in an `nprofile` is enough to hit it, and `encodeNprofile` produces one.
+- `nip49.decrypt` cast the scrypt cost read from the `ncryptsec` straight into a six bit integer, so a file with a cost above 63 was a crash instead of an error. It is now `WeakParameters`.
+
 ### Added
 
 - `relay.dialDiagnosed` and `relay.DialDiagnostic`: `dial` that also records the HTTP status the relay answered the websocket upgrade with. A relay that answers 503 when busy, 401 or 403, or 429 still fails the dial with `HandshakeFailed`, so a tool printed that and nothing else; `diagnostic.status` now lets it say "relay answered 503". `Connection.handshake_status` carries the same value for callers that drive `handshake` themselves. The error sets are unchanged, and `dial` behaves as before.
@@ -17,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The store's merged query takes the newest candidate from a binary heap of the live streams instead of scanning all of them once per returned event. The order of results, and which stream wins a tie, are unchanged. A 60-note query over a follow list of 512 authors went from 358 to 254 microseconds and over 2,048 authors from 1,430 to 1,006 (best of five, ReleaseFast), and a query over 20 authors is unchanged.
 
+- Fuzz targets for the parsers that read bytes someone else wrote: websocket frames and handshake responses, relay messages, events, NIP-19 strings and entities, bech32, hex, NIP-44 payloads and messages, NIP-46 requests, responses and connection URIs, the signer's local wire types, NIP-65 relay lists, relay URLs, mnemonics, `ncryptsec` files, filters and JSON strings. `zig build test` runs each over a seed corpus; `zig build test --fuzz -Doptimize=ReleaseSafe` fuzzes them. Each asserts that nothing crashes or leaks and, where one exists, an invariant such as parse, serialise, parse giving the same value.
 - The library builds for `x86_64-windows-gnu` and `aarch64-windows-gnu`. Hostname resolution on Windows goes through std's own resolver, which asks the OS, instead of libc `getaddrinfo`, which std does not declare there; an IP literal is parsed first so `[::1]` and `127.0.0.1` never reach the name resolver. The wait for room before a pong is written uses `WSAPoll` through a local Winsock binding. POSIX targets keep `getaddrinfo` and `poll` exactly as before. (#59)
 - CI builds and tests on Windows.
 
