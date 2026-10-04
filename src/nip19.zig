@@ -338,10 +338,12 @@ pub fn toNostrUri(allocator: std.mem.Allocator, bech: []const u8) Error![]u8 {
     return std.fmt.allocPrint(allocator, "nostr:{s}", .{bech});
 }
 
-/// Strips the `nostr:` prefix if present; returns a slice into `s` (no allocation).
+/// Strips the `nostr:` prefix if present, in any case; returns a slice into
+/// `s` (no allocation). A URI scheme is case-insensitive (RFC 3986), and a QR
+/// code of a `nostr:` URI usually reads back as `NOSTR:NPUB1...`.
 pub fn fromNostrUri(s: []const u8) []const u8 {
     const prefix = "nostr:";
-    if (std.mem.startsWith(u8, s, prefix)) return s[prefix.len..];
+    if (std.ascii.startsWithIgnoreCase(s, prefix)) return s[prefix.len..];
     return s;
 }
 
@@ -595,4 +597,20 @@ test "every decoder refuses a mixed-case code with MixedCase" {
         mixed[letter] = std.ascii.toUpper(mixed[letter]);
         try std.testing.expectError(error.MixedCase, decodeAndFree(allocator, entity, mixed));
     }
+}
+
+test "NIP-21 nostr: scheme is stripped in any case" {
+    const allocator = std.testing.allocator;
+    const upper = "NPUB10ELFCS4FR0L0R8AF98JLMGDH9C8TCXJVZ9QKW038JS35MP4DMA8QZVJPTG";
+
+    // The whole URI in uppercase, as a QR code gives it.
+    const code = fromNostrUri("NOSTR:" ++ upper);
+    try std.testing.expectEqualStrings(upper, code);
+    const expected = try hexToBytes32("7e7e9c42a91bfef19fa929e5fda1b72e0ebc1a4c1141673e2794234d86addf4e");
+    try std.testing.expectEqualSlices(u8, &expected, &(try decodeNpub(allocator, code)));
+
+    try std.testing.expectEqualStrings("npub1x", fromNostrUri("Nostr:npub1x"));
+    // Too short to hold the scheme, or not it: returned unchanged.
+    try std.testing.expectEqualStrings("NOST", fromNostrUri("NOST"));
+    try std.testing.expectEqualStrings("nostrx:npub1x", fromNostrUri("nostrx:npub1x"));
 }
