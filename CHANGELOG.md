@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.8] - 2026-10-04
+
 ### Added
 
 - The library builds for `x86_64-windows-gnu` and `aarch64-windows-gnu`. Hostname resolution on Windows goes through std's own resolver, which asks the OS, instead of libc `getaddrinfo`, which std does not declare there; an IP literal is parsed first so `[::1]` and `127.0.0.1` never reach the name resolver. The wait for room before a pong is written, and the wait for bytes that lets `receiveTimeout` give up at its deadline, use the AFD driver's poll request on the socket handle std opened, through the caller's `std.Io`, since std never registers its sockets with Winsock and its receive there blocks without looking at a deadline. POSIX targets keep `getaddrinfo` and `poll` exactly as before. A store on Windows takes its full map size on disk (1 GiB by default) from the first open, because LMDB sizes the file to the map there. (#59)
