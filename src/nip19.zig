@@ -1,8 +1,14 @@
 //! NIP-19: bech32-encoded entities (npub/nsec/note, and TLV-based
 //! nprofile/nevent/naddr/nrelay), plus NIP-21 `nostr:` URIs.
 //!
-//! These encodings are for display, copy-paste, and input only — never for
+//! These encodings are for display, copy-paste, and input only, never for
 //! wire-format events or filters.
+//!
+//! Encoding always emits lowercase. Decoding accepts a code in all lowercase
+//! or all uppercase, as BIP-173 allows (a QR code usually carries the
+//! uppercase form), and fails with `error.MixedCase` on a code that mixes the
+//! two. `bech32.decode` lowercases the prefix before it is compared, so each
+//! decoder below compares it against a lowercase literal.
 
 const std = @import("std");
 const bech32 = @import("bech32.zig");
@@ -459,4 +465,134 @@ test "NIP-21 nostr: URI wrap/unwrap" {
     defer allocator.free(uri);
     try std.testing.expectEqualStrings("nostr:npub10elfcs4fr0l0r8af98jlmgdh9c8tcxjvz9qkw038js35mp4dma8qzvjptg", uri);
     try std.testing.expectEqualStrings("npub10elfcs4fr0l0r8af98jlmgdh9c8tcxjvz9qkw038js35mp4dma8qzvjptg", fromNostrUri(uri));
+}
+
+const Entity = enum { npub, nsec, note, nprofile, nevent, naddr, nrelay };
+
+/// A lowercase code of each entity type, from its own encoder.
+fn encodeSample(allocator: std.mem.Allocator, entity: Entity) ![]u8 {
+    const key = try hexToBytes32("7e7e9c42a91bfef19fa929e5fda1b72e0ebc1a4c1141673e2794234d86addf4e");
+    const id = try hexToBytes32("5c83da77af1dec6d7289834998ad7aafbd9e2191396d75ec3cc27f5a77226f36");
+    const relays = [_][]const u8{"wss://nostr.example.com"};
+    return switch (entity) {
+        .npub => encodeNpub(allocator, key),
+        .nsec => encodeNsec(allocator, key),
+        .note => encodeNote(allocator, id),
+        .nprofile => encodeNprofile(allocator, key, &relays),
+        .nevent => encodeNevent(allocator, id, &relays, key, 1),
+        .naddr => encodeNaddr(allocator, "abcd", key, 30023, &relays),
+        .nrelay => encodeNrelay(allocator, "wss://relay.example.com"),
+    };
+}
+
+/// Decodes `s` through the entity's own entry point and frees the result.
+fn decodeAndFree(allocator: std.mem.Allocator, entity: Entity, s: []const u8) Error!void {
+    switch (entity) {
+        .npub => _ = try decodeNpub(allocator, s),
+        .nsec => _ = try decodeNsec(allocator, s),
+        .note => _ = try decodeNote(allocator, s),
+        .nprofile => {
+            var p = try decodeNprofile(allocator, s);
+            p.deinit(allocator);
+        },
+        .nevent => {
+            var p = try decodeNevent(allocator, s);
+            p.deinit(allocator);
+        },
+        .naddr => {
+            var p = try decodeNaddr(allocator, s);
+            p.deinit(allocator);
+        },
+        .nrelay => allocator.free(try decodeNrelay(allocator, s)),
+    }
+}
+
+test "every encoder emits lowercase" {
+    const allocator = std.testing.allocator;
+    for (std.enums.values(Entity)) |entity| {
+        const code = try encodeSample(allocator, entity);
+        defer allocator.free(code);
+        for (code) |c| try std.testing.expect(!std.ascii.isUpper(c));
+    }
+}
+
+test "the official npub vector decodes in uppercase" {
+    const allocator = std.testing.allocator;
+    const expected = try hexToBytes32("7e7e9c42a91bfef19fa929e5fda1b72e0ebc1a4c1141673e2794234d86addf4e");
+    const decoded = try decodeNpub(allocator, "NPUB10ELFCS4FR0L0R8AF98JLMGDH9C8TCXJVZ9QKW038JS35MP4DMA8QZVJPTG");
+    try std.testing.expectEqualSlices(u8, &expected, &decoded);
+}
+
+test "every decoder reads an all-uppercase code the same as its lowercase form" {
+    const allocator = std.testing.allocator;
+    for (std.enums.values(Entity)) |entity| {
+        const lower = try encodeSample(allocator, entity);
+        defer allocator.free(lower);
+        const upper = try std.ascii.allocUpperString(allocator, lower);
+        defer allocator.free(upper);
+
+        switch (entity) {
+            .npub => try std.testing.expectEqual(try decodeNpub(allocator, lower), try decodeNpub(allocator, upper)),
+            .nsec => try std.testing.expectEqual(try decodeNsec(allocator, lower), try decodeNsec(allocator, upper)),
+            .note => try std.testing.expectEqual(try decodeNote(allocator, lower), try decodeNote(allocator, upper)),
+            .nprofile => {
+                var a = try decodeNprofile(allocator, lower);
+                defer a.deinit(allocator);
+                var b = try decodeNprofile(allocator, upper);
+                defer b.deinit(allocator);
+                try std.testing.expectEqual(a.pubkey, b.pubkey);
+                try std.testing.expectEqual(@as(usize, 1), b.relays.len);
+                try std.testing.expectEqualStrings(a.relays[0], b.relays[0]);
+            },
+            .nevent => {
+                var a = try decodeNevent(allocator, lower);
+                defer a.deinit(allocator);
+                var b = try decodeNevent(allocator, upper);
+                defer b.deinit(allocator);
+                try std.testing.expectEqual(a.id, b.id);
+                try std.testing.expectEqual(a.author, b.author);
+                try std.testing.expectEqual(a.kind, b.kind);
+                try std.testing.expectEqual(@as(usize, 1), b.relays.len);
+                try std.testing.expectEqualStrings(a.relays[0], b.relays[0]);
+            },
+            .naddr => {
+                var a = try decodeNaddr(allocator, lower);
+                defer a.deinit(allocator);
+                var b = try decodeNaddr(allocator, upper);
+                defer b.deinit(allocator);
+                // The identifier is payload, so the code's case must not reach it.
+                try std.testing.expectEqualStrings("abcd", b.identifier);
+                try std.testing.expectEqual(a.pubkey, b.pubkey);
+                try std.testing.expectEqual(a.kind, b.kind);
+                try std.testing.expectEqual(@as(usize, 1), b.relays.len);
+                try std.testing.expectEqualStrings(a.relays[0], b.relays[0]);
+            },
+            .nrelay => {
+                const b = try decodeNrelay(allocator, upper);
+                defer allocator.free(b);
+                try std.testing.expectEqualStrings("wss://relay.example.com", b);
+            },
+        }
+    }
+}
+
+test "every decoder refuses a mixed-case code with MixedCase" {
+    const allocator = std.testing.allocator;
+    for (std.enums.values(Entity)) |entity| {
+        const code = try encodeSample(allocator, entity);
+        defer allocator.free(code);
+        const sep = std.mem.lastIndexOfScalar(u8, code, '1').?;
+
+        // A capital on the prefix only, then a capital in the data only.
+        // Either way the code is otherwise valid, so only the case can fail it.
+        const mixed = try allocator.dupe(u8, code);
+        defer allocator.free(mixed);
+        mixed[0] = std.ascii.toUpper(mixed[0]);
+        try std.testing.expectError(error.MixedCase, decodeAndFree(allocator, entity, mixed));
+
+        @memcpy(mixed, code);
+        const letter = sep + 1 + std.mem.indexOfAny(u8, code[sep + 1 ..], "acdefghjklmnpqrstuvwxyz").?;
+        mixed[letter] = std.ascii.toUpper(mixed[letter]);
+        try std.testing.expectError(error.MixedCase, decodeAndFree(allocator, entity, mixed));
+    }
 }
