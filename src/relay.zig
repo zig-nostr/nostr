@@ -550,22 +550,32 @@ pub const IoStream = struct {
                 if (self.io) |io| if (self.socket) |sock| {
                     const raw_empty = if (self.transport_reader) |tr| tr.bufferedLen() == 0 else true;
                     if (raw_empty) {
-                        var msgs: [1]std.Io.net.IncomingMessage = .{.init};
-                        var one: [1]u8 = undefined;
-                        const maybe_err, _ = sock.receiveManyTimeout(io, &msgs, &one, .{ .peek = true }, .{ .deadline = d });
-                        // Its own error, never `ReadFailed`. A caller has to be
-                        // able to tell "nothing yet, ask again" from "this
-                        // socket is finished", and they are the same value if
-                        // this collapses them.
-                        //
-                        // Only Timeout is acted on. Every other outcome falls
-                        // through to the real read below, which is the one
-                        // allowed to decide the socket is finished: a readiness
-                        // probe has no business ending a connection.
-                        if (maybe_err) |err| switch (err) {
-                            error.Timeout => return error.Timeout,
-                            else => {},
-                        };
+                        if (comptime builtin.os.tag == .windows) {
+                            // std's Windows receive is a blocking call that never
+                            // looks at the deadline, so the peek below would wait
+                            // for a byte forever. The driver's poll carries its own
+                            // timeout and reads nothing, which keeps the same
+                            // promise. Anything but a timeout falls through to the
+                            // real read, as below.
+                            if (!afd.ready(io, sock.handle, afd.read_events, msUntil(io, d))) return error.Timeout;
+                        } else {
+                            var msgs: [1]std.Io.net.IncomingMessage = .{.init};
+                            var one: [1]u8 = undefined;
+                            const maybe_err, _ = sock.receiveManyTimeout(io, &msgs, &one, .{ .peek = true }, .{ .deadline = d });
+                            // Its own error, never `ReadFailed`. A caller has to be
+                            // able to tell "nothing yet, ask again" from "this
+                            // socket is finished", and they are the same value if
+                            // this collapses them.
+                            //
+                            // Only Timeout is acted on. Every other outcome falls
+                            // through to the real read below, which is the one
+                            // allowed to decide the socket is finished: a readiness
+                            // probe has no business ending a connection.
+                            if (maybe_err) |err| switch (err) {
+                                error.Timeout => return error.Timeout,
+                                else => {},
+                            };
+                        }
                     }
                 };
             }
@@ -590,9 +600,7 @@ pub const IoStream = struct {
     pub fn writableBy(self: IoStream, deadline: std.Io.Clock.Timestamp) bool {
         const io = self.io orelse return true;
         const sock = self.socket orelse return true;
-        const left = deadline.raw.nanoseconds - std.Io.Clock.Timestamp.now(io, deadline.clock).raw.nanoseconds;
-        const ms: i32 = if (left <= 0) 0 else @intCast(@min(@divFloor(left + std.time.ns_per_ms - 1, std.time.ns_per_ms), std.math.maxInt(i32)));
-        return socketWritable(io, sock.handle, ms);
+        return socketWritable(io, sock.handle, msUntil(io, deadline));
     }
 
     pub fn writeAll(self: IoStream, bytes: []const u8) std.Io.Writer.Error!void {
@@ -602,16 +610,23 @@ pub const IoStream = struct {
     }
 };
 
+/// Milliseconds left until `deadline`, rounded up, and 0 once it has passed.
+fn msUntil(io: std.Io, deadline: std.Io.Clock.Timestamp) i32 {
+    const left = deadline.raw.nanoseconds - std.Io.Clock.Timestamp.now(io, deadline.clock).raw.nanoseconds;
+    return if (left <= 0) 0 else @intCast(@min(@divFloor(left + std.time.ns_per_ms - 1, std.time.ns_per_ms), std.math.maxInt(i32)));
+}
+
 /// Whether `handle` can take a write within `ms` milliseconds. A failed wait
 /// answers yes: the write that follows reports the real error.
 fn socketWritable(io: std.Io, handle: net.Socket.Handle, ms: i32) bool {
-    if (comptime builtin.os.tag == .windows) return afd.writable(io, handle, ms);
+    if (comptime builtin.os.tag == .windows) return afd.ready(io, handle, afd.write_events, ms);
     var fds = [_]posix.pollfd{.{ .fd = handle, .events = posix.POLL.OUT, .revents = 0 }};
     const ready = posix.poll(&fds, ms) catch return true;
     return ready > 0;
 }
 
-/// The wait for write room on Windows. Only referenced on Windows targets.
+/// The waits for bytes and for write room on Windows. Only referenced on
+/// Windows targets.
 ///
 /// std's Windows io opens a socket as an endpoint of the AFD driver itself and
 /// never registers it with Winsock, so a Winsock call such as `WSAPoll` would be
@@ -621,13 +636,19 @@ fn socketWritable(io: std.Io, handle: net.Socket.Handle, ms: i32) bool {
 const afd = struct {
     const windows = std.os.windows;
 
-    // AFD_POLL_* event bits. SEND is room to write; the rest end the
-    // connection, and the write that follows reports them.
+    // AFD_POLL_* event bits. RECEIVE is bytes to read and SEND is room to
+    // write; the rest end the connection, and the read or write that follows
+    // reports them.
+    const poll_receive: u32 = 0x0001;
     const poll_send: u32 = 0x0004;
     const poll_disconnect: u32 = 0x0008;
     const poll_abort: u32 = 0x0010;
     const poll_local_close: u32 = 0x0020;
     const poll_connect_fail: u32 = 0x0100;
+
+    const ending = poll_disconnect | poll_abort | poll_local_close | poll_connect_fail;
+    const read_events = poll_receive | ending;
+    const write_events = poll_send | ending;
 
     const HandleInfo = extern struct {
         handle: windows.HANDLE,
@@ -645,7 +666,10 @@ const afd = struct {
         handles: [1]HandleInfo,
     };
 
-    fn writable(io: std.Io, handle: net.Socket.Handle, ms: i32) bool {
+    /// Whether one of `events` fires on `handle` within `ms` milliseconds. A
+    /// failed wait answers yes: the read or write that follows reports the real
+    /// error.
+    fn ready(io: std.Io, handle: net.Socket.Handle, events: u32, ms: i32) bool {
         comptime std.debug.assert(@as(u32, @bitCast(windows.IOCTL.AFD.POLL)) == 0x12024);
         var info: PollInfo = .{
             .timeout = -@as(i64, ms) * 10_000,
@@ -653,7 +677,7 @@ const afd = struct {
             .exclusive = 0,
             .handles = .{.{
                 .handle = handle,
-                .events = poll_send | poll_disconnect | poll_abort | poll_local_close | poll_connect_fail,
+                .events = events,
                 .status = .SUCCESS,
             }},
         };
@@ -664,8 +688,9 @@ const afd = struct {
             .in = bytes,
             .out = bytes,
         } }) catch |err| switch (err) {
-            // Not swallowed: the caller's next I/O sees the cancel. The pong is
-            // skipped, which the caller allows for.
+            // Not swallowed: the caller's next I/O sees the cancel. A pong is
+            // skipped, which its caller allows for, and a read gives up as at a
+            // deadline.
             error.Canceled => {
                 io.recancel();
                 return false;

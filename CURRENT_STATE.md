@@ -30,7 +30,7 @@ covered by tests:
   server, so a signer is a shell over the library rather than its own
   implementation.
 
-The library builds for macOS, Linux and Windows (x86_64 and aarch64 on each). CI builds and runs the tests on Linux, macOS and Windows. On Windows, hostnames resolve through std's resolver and the pong wait is a poll request to the AFD driver; the other platforms keep libc `getaddrinfo` and `poll`.
+The library builds for macOS, Linux and Windows (x86_64 and aarch64 on each). CI builds and runs the tests on Linux, macOS and Windows. On Windows, hostnames resolve through std's resolver and both the wait for bytes before a read's deadline and the wait for room before a pong are a poll request to the AFD driver; the other platforms keep libc `getaddrinfo`, a timed peek and `poll`.
 
 The parsers that read bytes from outside (frames, relay messages, events, NIP-19, NIP-44, NIP-46, connection URIs, key files) have fuzz targets that run over a seed corpus in every `zig build test` and can be fuzzed for real. [`ARCHITECTURE.md`](ARCHITECTURE.md) says how the pieces fit.
 
