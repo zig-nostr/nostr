@@ -1,0 +1,4 @@
+# Every text file is checked out with LF endings, on Windows too, so the
+# embedded BIP-39 word list (split on newlines) and the test vectors are the
+# same bytes on every system.
+* text=auto eol=lf

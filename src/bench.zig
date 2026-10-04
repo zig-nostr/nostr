@@ -20,13 +20,13 @@
 //! past, which is why this fills a mixed store.
 //!
 //! The wide-feed and by-id shapes are the two halves of one decision. A merged
-//! query opens a cursor per author and picks the newest across every live
-//! stream once per returned event, so its cost is set by how many people the
-//! reader follows, not by how many notes come back. A client that re-runs it to
-//! pick up what just arrived pays that in full for a handful of new notes;
-//! naming the ids instead is a direct read each. Twenty authors, the shape this
-//! measured for its first year, is not a follow list, and it made the query
-//! look free at a size nobody has.
+//! query opens a cursor per author and takes the newest across every live
+//! stream from a heap once per returned event, so its cost is set mostly by
+//! how many people the reader follows (a cursor each), not by how many notes
+//! come back. A client that re-runs it to pick up what just arrived pays that
+//! in full for a handful of new notes; naming the ids instead is a direct read
+//! each. Twenty authors, the shape this measured for its first year, is not a
+//! follow list, and it made the query look free at a size nobody has.
 //!
 //! Results print to stderr; the temporary database is removed on exit.
 
@@ -48,7 +48,7 @@ const feed_limit: u32 = 500;
 /// A screenful, which is what a client re-queries for on a tick, as opposed to
 /// the 500-note backfill the shapes above measure. Overridable with
 /// `BENCH_FEED_LIMIT`, because this is the number a reader raises by scrolling
-/// and the merge pays the whole author set again for every extra note.
+/// and every extra note is another pick from the merge's heap of authors.
 var wide_feed_limit: u32 = 60;
 /// How many ids the by-id shape names. Eight is one tick's worth of arrivals;
 /// a client refreshing a feed it already holds names the whole screenful it is

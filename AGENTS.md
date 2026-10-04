@@ -41,9 +41,10 @@ Only declarations re-exported from `root.zig` are part of the public API.
 zig build         # build the library module
 zig build test    # run the unit test suite
 zig fmt --check .  # verify formatting (CI enforces this)
+zig build test --fuzz -Doptimize=ReleaseSafe  # fuzz the parsers until stopped
 ```
 
-Use the Zig version pinned in `.zigversion`. CI runs on Linux and macOS.
+Use the Zig version pinned in `.zigversion`. CI runs on Linux, macOS and Windows.
 
 ## Dependency graph
 
@@ -94,6 +95,7 @@ must pass its official test vectors, before either ships.
 
 ## Orientation
 
+- [`ARCHITECTURE.md`](ARCHITECTURE.md): the modules, how data flows, the threading and cancellation model, where to start reading, and how it is tested (fuzz targets included).
 - [`CURRENT_STATE.md`](CURRENT_STATE.md): what's built, in progress, and
   next, updated on every merge.
 - [`CONTRIBUTING.md`](CONTRIBUTING.md): full contribution workflow.

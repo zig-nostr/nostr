@@ -10,6 +10,7 @@
 //! makes it testable.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const websocket = @import("websocket.zig");
 const message = @import("message.zig");
 const event_mod = @import("event.zig");
@@ -153,6 +154,12 @@ pub fn Connection(comptime Stream: type) type {
         /// Read it on the thread that calls `receive`, which is the only one
         /// that writes it.
         unreadable: u64,
+        /// The HTTP status the relay answered the opening handshake with, or
+        /// zero when no status line has been read. Set by `handshake` whether
+        /// it succeeds or not, so after a `HandshakeFailed` it says why: 503
+        /// when the relay is busy, 401 or 403 when it wants something first,
+        /// 429 when it is rate limiting.
+        handshake_status: u16,
 
         pub fn init(allocator: std.mem.Allocator, io: std.Io, stream: Stream) Self {
             return .{
@@ -164,6 +171,7 @@ pub fn Connection(comptime Stream: type) type {
                 .write_lock = .init,
                 .last_rx_ms = .init(0),
                 .unreadable = 0,
+                .handshake_status = 0,
             };
         }
 
@@ -175,6 +183,10 @@ pub fn Connection(comptime Stream: type) type {
 
         /// Performs the RFC 6455 opening handshake for `host`/`path`. Any bytes
         /// the relay sent after the response head are retained for `receive`.
+        ///
+        /// A relay that answers with anything but 101 fails with
+        /// `HandshakeFailed`, and the status it answered with is left in
+        /// `handshake_status`.
         pub fn handshake(self: *Self, host: []const u8, path: []const u8) !void {
             const key = websocket.generateKey(self.io) catch return ConnectionError.RandomFailed;
 
@@ -187,11 +199,15 @@ pub fn Connection(comptime Stream: type) type {
 
             // Read until the blank line terminating the response head.
             while (std.mem.indexOf(u8, self.recv.items, "\r\n\r\n") == null) {
+                // A relay that sends a status line and then closes, or never
+                // finishes the head, still said what it answered.
+                self.handshake_status = websocket.statusCode(self.recv.items) orelse 0;
                 if (self.recv.items.len > 16 * 1024) return ConnectionError.HandshakeFailed;
                 if (!try self.fill(null)) return ConnectionError.HandshakeFailed;
             }
             const idx = std.mem.indexOf(u8, self.recv.items, "\r\n\r\n").?;
             const head_len = idx + 4;
+            self.handshake_status = websocket.statusCode(self.recv.items[0..head_len]) orelse 0;
             websocket.checkHandshakeResponse(self.recv.items[0..head_len], &accept) catch
                 return ConnectionError.HandshakeFailed;
             self.consume(head_len);
@@ -534,22 +550,32 @@ pub const IoStream = struct {
                 if (self.io) |io| if (self.socket) |sock| {
                     const raw_empty = if (self.transport_reader) |tr| tr.bufferedLen() == 0 else true;
                     if (raw_empty) {
-                        var msgs: [1]std.Io.net.IncomingMessage = .{.init};
-                        var one: [1]u8 = undefined;
-                        const maybe_err, _ = sock.receiveManyTimeout(io, &msgs, &one, .{ .peek = true }, .{ .deadline = d });
-                        // Its own error, never `ReadFailed`. A caller has to be
-                        // able to tell "nothing yet, ask again" from "this
-                        // socket is finished", and they are the same value if
-                        // this collapses them.
-                        //
-                        // Only Timeout is acted on. Every other outcome falls
-                        // through to the real read below, which is the one
-                        // allowed to decide the socket is finished: a readiness
-                        // probe has no business ending a connection.
-                        if (maybe_err) |err| switch (err) {
-                            error.Timeout => return error.Timeout,
-                            else => {},
-                        };
+                        if (comptime builtin.os.tag == .windows) {
+                            // std's Windows receive is a blocking call that never
+                            // looks at the deadline, so the peek below would wait
+                            // for a byte forever. The driver's poll carries its own
+                            // timeout and reads nothing, which keeps the same
+                            // promise. Anything but a timeout falls through to the
+                            // real read, as below.
+                            if (!afd.ready(io, sock.handle, afd.read_events, msUntil(io, d))) return error.Timeout;
+                        } else {
+                            var msgs: [1]std.Io.net.IncomingMessage = .{.init};
+                            var one: [1]u8 = undefined;
+                            const maybe_err, _ = sock.receiveManyTimeout(io, &msgs, &one, .{ .peek = true }, .{ .deadline = d });
+                            // Its own error, never `ReadFailed`. A caller has to be
+                            // able to tell "nothing yet, ask again" from "this
+                            // socket is finished", and they are the same value if
+                            // this collapses them.
+                            //
+                            // Only Timeout is acted on. Every other outcome falls
+                            // through to the real read below, which is the one
+                            // allowed to decide the socket is finished: a readiness
+                            // probe has no business ending a connection.
+                            if (maybe_err) |err| switch (err) {
+                                error.Timeout => return error.Timeout,
+                                else => {},
+                            };
+                        }
                     }
                 };
             }
@@ -574,17 +600,106 @@ pub const IoStream = struct {
     pub fn writableBy(self: IoStream, deadline: std.Io.Clock.Timestamp) bool {
         const io = self.io orelse return true;
         const sock = self.socket orelse return true;
-        const left = deadline.raw.nanoseconds - std.Io.Clock.Timestamp.now(io, deadline.clock).raw.nanoseconds;
-        const ms: i32 = if (left <= 0) 0 else @intCast(@min(@divFloor(left + std.time.ns_per_ms - 1, std.time.ns_per_ms), std.math.maxInt(i32)));
-        var fds = [_]std.posix.pollfd{.{ .fd = sock.handle, .events = std.posix.POLL.OUT, .revents = 0 }};
-        const ready = std.posix.poll(&fds, ms) catch return true;
-        return ready > 0;
+        return socketWritable(io, sock.handle, msUntil(io, deadline));
     }
 
     pub fn writeAll(self: IoStream, bytes: []const u8) std.Io.Writer.Error!void {
         try self.writer.writeAll(bytes);
         try self.writer.flush();
         if (self.transport_writer) |tw| try tw.flush();
+    }
+};
+
+/// Milliseconds left until `deadline`, rounded up, and 0 once it has passed.
+fn msUntil(io: std.Io, deadline: std.Io.Clock.Timestamp) i32 {
+    const left = deadline.raw.nanoseconds - std.Io.Clock.Timestamp.now(io, deadline.clock).raw.nanoseconds;
+    return if (left <= 0) 0 else @intCast(@min(@divFloor(left + std.time.ns_per_ms - 1, std.time.ns_per_ms), std.math.maxInt(i32)));
+}
+
+/// Whether `handle` can take a write within `ms` milliseconds. A failed wait
+/// answers yes: the write that follows reports the real error.
+fn socketWritable(io: std.Io, handle: net.Socket.Handle, ms: i32) bool {
+    if (comptime builtin.os.tag == .windows) return afd.ready(io, handle, afd.write_events, ms);
+    var fds = [_]posix.pollfd{.{ .fd = handle, .events = posix.POLL.OUT, .revents = 0 }};
+    const ready = posix.poll(&fds, ms) catch return true;
+    return ready > 0;
+}
+
+/// The waits for bytes and for write room on Windows. Only referenced on
+/// Windows targets.
+///
+/// std's Windows io opens a socket as an endpoint of the AFD driver itself and
+/// never registers it with Winsock, so a Winsock call such as `WSAPoll` would be
+/// handed a handle Winsock has no record of. The driver's own poll request is
+/// what Winsock's `select` is built on, and it takes the handle std holds. It
+/// goes through `io` the same way std sends its writes, so a cancel reaches it.
+const afd = struct {
+    const windows = std.os.windows;
+
+    // AFD_POLL_* event bits. RECEIVE is bytes to read and SEND is room to
+    // write; the rest end the connection, and the read or write that follows
+    // reports them.
+    const poll_receive: u32 = 0x0001;
+    const poll_send: u32 = 0x0004;
+    const poll_disconnect: u32 = 0x0008;
+    const poll_abort: u32 = 0x0010;
+    const poll_local_close: u32 = 0x0020;
+    const poll_connect_fail: u32 = 0x0100;
+
+    const ending = poll_disconnect | poll_abort | poll_local_close | poll_connect_fail;
+    const read_events = poll_receive | ending;
+    const write_events = poll_send | ending;
+
+    const HandleInfo = extern struct {
+        handle: windows.HANDLE,
+        events: u32,
+        status: windows.NTSTATUS,
+    };
+
+    /// AFD_POLL_INFO with room for one handle. The driver reads it as the
+    /// request and writes it back with the handles that fired.
+    const PollInfo = extern struct {
+        /// In 100 ns units; negative is relative to now.
+        timeout: i64,
+        count: u32,
+        exclusive: u32,
+        handles: [1]HandleInfo,
+    };
+
+    /// Whether one of `events` fires on `handle` within `ms` milliseconds. A
+    /// failed wait answers yes: the read or write that follows reports the real
+    /// error.
+    fn ready(io: std.Io, handle: net.Socket.Handle, events: u32, ms: i32) bool {
+        comptime std.debug.assert(@as(u32, @bitCast(windows.IOCTL.AFD.POLL)) == 0x12024);
+        var info: PollInfo = .{
+            .timeout = -@as(i64, ms) * 10_000,
+            .count = 1,
+            .exclusive = 0,
+            .handles = .{.{
+                .handle = handle,
+                .events = events,
+                .status = .SUCCESS,
+            }},
+        };
+        const bytes = std.mem.asBytes(&info);
+        const result = io.operate(.{ .device_io_control = .{
+            .file = .{ .handle = handle, .flags = .{ .nonblocking = true } },
+            .code = windows.IOCTL.AFD.POLL,
+            .in = bytes,
+            .out = bytes,
+        } }) catch |err| switch (err) {
+            // Not swallowed: the caller's next I/O sees the cancel. A pong is
+            // skipped, which its caller allows for, and a read gives up as at a
+            // deadline.
+            error.Canceled => {
+                io.recancel();
+                return false;
+            },
+        };
+        return switch (result.device_io_control.u.Status) {
+            .SUCCESS, .TIMEOUT => info.count != 0,
+            else => true,
+        };
     }
 };
 
@@ -712,18 +827,38 @@ pub const Relay = struct {
     }
 };
 
-/// Resolves `host` with the system resolver (libc `getaddrinfo`) and connects a
-/// TCP stream to `port`, trying each returned address until one connects.
+/// Resolves `host` with the system resolver and connects a TCP stream to
+/// `port`, trying each returned address until one connects.
 ///
-/// We deliberately bypass std's built-in DNS resolver (`net.HostName.connect`):
-/// it reads nameservers from `/etc/resolv.conf`, but on macOS that file is empty
-/// (name resolution is handled by the system configuration framework, not
-/// resolv.conf), so std falls back to querying `127.0.0.1:53` — where nothing is
-/// listening — and a hostname lookup hangs indefinitely. `getaddrinfo` uses the
-/// OS resolver and works on both macOS and Linux. It needs libc, which the
-/// library already links for libsecp256k1 and LMDB. A numeric host (an IP
-/// literal) resolves through the same path.
+/// On POSIX this is libc `getaddrinfo`, and we deliberately bypass std's
+/// built-in DNS resolver (`net.HostName.connect`): it reads nameservers from
+/// `/etc/resolv.conf`, but on macOS that file is empty (name resolution is
+/// handled by the system configuration framework, not resolv.conf), so std
+/// falls back to querying `127.0.0.1:53`, where nothing is listening, and a
+/// hostname lookup hangs indefinitely. `getaddrinfo` uses the OS resolver and
+/// works on both macOS and Linux. It needs libc, which the library already
+/// links for libsecp256k1 and LMDB. A numeric host (an IP literal) resolves
+/// through the same path.
+///
+/// Windows has no `getaddrinfo` in std's declarations, and std's own resolver
+/// there asks the OS (DnsQueryEx) rather than a resolv.conf, so the macOS
+/// problem does not exist and `net.HostName.connect` is used. An IP literal is
+/// parsed first, since a host name must be a valid DNS name and `::1` is not.
 fn resolveAndConnect(gpa: std.mem.Allocator, io: std.Io, host: []const u8, port: u16) !net.Stream {
+    if (comptime builtin.os.tag == .windows) {
+        if (net.IpAddress.parse(host, port)) |address| {
+            return address.connect(io, .{ .mode = .stream });
+        } else |_| {}
+        const name = net.HostName.init(host) catch return error.NameResolutionFailed;
+        return name.connect(io, port, .{ .mode = .stream }) catch |err| switch (err) {
+            error.UnknownHostName, error.NameServerFailure, error.NoAddressReturned => error.NameResolutionFailed,
+            else => err,
+        };
+    }
+    return resolveAndConnectLibc(gpa, io, host, port);
+}
+
+fn resolveAndConnectLibc(gpa: std.mem.Allocator, io: std.Io, host: []const u8, port: u16) !net.Stream {
     const host_z = try gpa.dupeZ(u8, host);
     defer gpa.free(host_z);
 
@@ -774,12 +909,36 @@ fn resolveAndConnect(gpa: std.mem.Allocator, io: std.Io, host: []const u8, port:
 ///
 /// Takes no deadline. To bound it, run it with `io.concurrent` and cancel it
 /// when the deadline passes: a cancelled dial stops where it is and frees what
-/// it allocated. The name lookup is the one step a cancel cannot interrupt,
-/// because it is a plain libc call.
+/// it allocated. The name lookup is the one step a cancel cannot cut short. On
+/// POSIX it is a plain libc call, and on Windows std waits for the OS query to
+/// finish before it reports the cancel.
 ///
-/// Not covered by CI (no relay is reachable there); the transport-agnostic
-/// `Connection` and the `IoStream` adapter it uses are what the tests exercise.
+/// Not covered by CI against a public relay (none is reachable there); the
+/// transport-agnostic `Connection` and the `IoStream` adapter it uses are what
+/// the tests exercise, along with a loopback server for the upgrade.
+///
+/// A relay that answers the upgrade with anything but 101 fails with
+/// `ConnectionError.HandshakeFailed`. Use `dialDiagnosed` to learn the status.
 pub fn dial(gpa: std.mem.Allocator, io: std.Io, url: []const u8) !*Relay {
+    var diagnostic: DialDiagnostic = .{};
+    return dialDiagnosed(gpa, io, url, &diagnostic);
+}
+
+/// What a failed `dial` can say beyond its error.
+pub const DialDiagnostic = struct {
+    /// The HTTP status the relay answered the websocket upgrade with, or zero
+    /// when it never got that far (a name that did not resolve, a refused
+    /// connection, a TLS failure) or sent no readable status line. Meaningful
+    /// after `HandshakeFailed`: 503 when the relay is busy, 401 or 403 when it
+    /// requires authentication, 429 when it is rate limiting.
+    status: u16 = 0,
+};
+
+/// `dial`, which also records in `diagnostic` what the relay answered the
+/// upgrade with. The error set is the same, so a caller that only wants "relay
+/// answered 503" for a `HandshakeFailed` reads `diagnostic.status`.
+pub fn dialDiagnosed(gpa: std.mem.Allocator, io: std.Io, url: []const u8, diagnostic: *DialDiagnostic) !*Relay {
+    diagnostic.* = .{};
     const parsed = try parseUrl(url);
 
     const transport = try gpa.create(Transport);
@@ -866,7 +1025,10 @@ pub fn dial(gpa: std.mem.Allocator, io: std.Io, url: []const u8) !*Relay {
     errdefer relay.conn.deinit();
 
     var host_buf: [263]u8 = undefined; // max host (253) + ":65535"
-    try relay.conn.handshake(parsed.hostHeader(&host_buf), parsed.path);
+    relay.conn.handshake(parsed.hostHeader(&host_buf), parsed.path) catch |err| {
+        diagnostic.status = relay.conn.handshake_status;
+        return err;
+    };
     return relay;
 }
 
@@ -1005,6 +1167,44 @@ test "handshake fails on a mismatched accept" {
     var conn = Connection(*HandshakeStream).init(allocator, std.testing.io, &server);
     defer conn.deinit();
     try std.testing.expectError(ConnectionError.HandshakeFailed, conn.handshake("relay.example.com", "/"));
+}
+
+test "a handshake refused with a status says which one" {
+    const allocator = std.testing.allocator;
+    var written: std.ArrayList(u8) = .empty;
+    defer written.deinit(allocator);
+    var server = FakeStream{
+        .to_read = "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 5\r\nContent-Length: 0\r\n\r\n",
+        .written = &written,
+        .allocator = allocator,
+    };
+    var conn = TestConn.init(allocator, std.testing.io, &server);
+    defer conn.deinit();
+    try std.testing.expectError(ConnectionError.HandshakeFailed, conn.handshake("relay.example.com", "/"));
+    try std.testing.expectEqual(@as(u16, 503), conn.handshake_status);
+}
+
+test "a status line followed by a close still reports the status" {
+    const allocator = std.testing.allocator;
+    var written: std.ArrayList(u8) = .empty;
+    defer written.deinit(allocator);
+    var server = FakeStream{ .to_read = "HTTP/1.1 429 Too Many Requests\r\n", .written = &written, .allocator = allocator };
+    var conn = TestConn.init(allocator, std.testing.io, &server);
+    defer conn.deinit();
+    try std.testing.expectError(ConnectionError.HandshakeFailed, conn.handshake("relay.example.com", "/"));
+    try std.testing.expectEqual(@as(u16, 429), conn.handshake_status);
+}
+
+test "a mismatched accept still reports the 101" {
+    const allocator = std.testing.allocator;
+    var written: std.ArrayList(u8) = .empty;
+    defer written.deinit(allocator);
+    var server = HandshakeStream{ .written = &written, .allocator = allocator, .break_accept = true };
+    defer server.deinit();
+    var conn = Connection(*HandshakeStream).init(allocator, std.testing.io, &server);
+    defer conn.deinit();
+    try std.testing.expectError(ConnectionError.HandshakeFailed, conn.handshake("relay.example.com", "/"));
+    try std.testing.expectEqual(@as(u16, 101), conn.handshake_status);
 }
 
 test "publish/subscribe/unsubscribe write correct client frames" {
@@ -1679,6 +1879,50 @@ test "a dial waiting on a silent peer can be cancelled, and frees what it made" 
     } else |_| {}
     const waited = std.Io.Timestamp.now(io, .awake).toMilliseconds() - started;
     try std.testing.expect(waited < 5000);
+}
+
+test "dialDiagnosed reports the status a relay answered the upgrade with" {
+    // A relay that is busy answers the upgrade with a plain HTTP 503. The
+    // error stays `HandshakeFailed`; the status is what lets a caller say so.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var listen_address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try listen_address.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    const url = try std.fmt.allocPrint(allocator, "ws://127.0.0.1:{d}", .{server.socket.address.ip4.port});
+    defer allocator.free(url);
+
+    var pending = try io.concurrent(refuseUpgrade, .{ io, &server });
+    // A dial that fails before the server has answered must not leave it
+    // parked in `accept` on a socket this frame is about to close.
+    defer pending.cancel(io) catch {};
+    var diagnostic: DialDiagnostic = .{};
+    try std.testing.expectError(ConnectionError.HandshakeFailed, dialDiagnosed(allocator, io, url, &diagnostic));
+    try pending.await(io);
+    try std.testing.expectEqual(@as(u16, 503), diagnostic.status);
+
+    // A dial that never reached the upgrade has nothing to report.
+    var unreached: DialDiagnostic = .{ .status = 999 };
+    try std.testing.expectError(UrlError.UnsupportedScheme, dialDiagnosed(allocator, io, "http://127.0.0.1/", &unreached));
+    try std.testing.expectEqual(@as(u16, 0), unreached.status);
+}
+
+/// Accepts one connection, reads the upgrade request, and answers 503.
+fn refuseUpgrade(io: std.Io, server: *std.Io.net.Server) !void {
+    const served = try server.accept(io);
+    defer served.close(io);
+    var read_buf: [4096]u8 = undefined;
+    var reader = served.reader(io, &read_buf);
+    // The request head ends at the blank line.
+    while (true) {
+        const line = try reader.interface.takeDelimiterInclusive('\n');
+        if (line.len <= 2) break;
+    }
+    var write_buf: [256]u8 = undefined;
+    var writer = served.writer(io, &write_buf);
+    try writer.interface.writeAll("HTTP/1.1 503 Service Unavailable\r\nRetry-After: 5\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    try writer.interface.flush();
 }
 
 test "a deadline fires on a quiet socket and leaves the connection usable" {

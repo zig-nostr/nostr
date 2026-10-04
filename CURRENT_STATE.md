@@ -20,13 +20,19 @@ covered by tests:
 - **Transport**: RFC 6455 WebSocket, a relay connection state machine, a live
   TCP/TLS dialer, NIP-42 authentication, and the NIP-65 outbox model with no
   hardcoded relays. A read can carry a deadline, so a thread serving a quiet
-  relay can still notice that its pool changed.
+  relay can still notice that its pool changed, and a failed dial can report the
+  HTTP status the relay answered the upgrade with.
 - **Store**: a memory-mapped LMDB event store with a bounded, newest-first query
   planner. A 500-note feed query is 0.28 ms at 100,000 stored events, and a
-  profile read is 8 microseconds.
+  profile read is 8 microseconds. A NIP-50 `search` on a filter is sent to relays
+  as is, and the store applies it as a case-insensitive substring of the content.
 - **Signing**: NIP-44 v2, and the NIP-46 bunker protocol as both client and
   server, so a signer is a shell over the library rather than its own
   implementation.
+
+The library builds for macOS, Linux and Windows (x86_64 and aarch64 on each). CI builds and runs the tests on Linux, macOS and Windows. On Windows, hostnames resolve through std's resolver and both the wait for bytes before a read's deadline and the wait for room before a pong are a poll request to the AFD driver; the other platforms keep libc `getaddrinfo`, a timed peek and `poll`.
+
+The parsers that read bytes from outside (frames, relay messages, events, NIP-19, NIP-44, NIP-46, connection URIs, key files) have fuzz targets that run over a seed corpus in every `zig build test` and can be fuzzed for real. [`ARCHITECTURE.md`](ARCHITECTURE.md) says how the pieces fit.
 
 APIs may still change. There is no 1.0 date, and tagging one is deliberately not
 on the roadmap while groups, messages, media and payments are still landing.

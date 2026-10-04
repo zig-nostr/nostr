@@ -41,6 +41,14 @@ live at [zignostr.com](https://zignostr.com).
 - **🔐 Portable keys**: NIP-06 mnemonic derivation and NIP-49 (`ncryptsec`)
   encrypted key storage, NFKC-normalized for cross-app interop.
 
+## How it is built
+
+[`ARCHITECTURE.md`](ARCHITECTURE.md) lists the modules, follows an event from a key to a relay to the store, and explains the threading and cancellation rules and how the library is tested, fuzz targets included.
+
+## Platforms
+
+macOS, Linux and Windows, on x86_64 and aarch64. CI builds and runs the tests on all three systems. Zig 0.16 is required, at the version pinned in `.zigversion`. To check a Windows build from another system, `zig build test -Dtarget=x86_64-windows-gnu` compiles the test binary and then stops with an error, because a non-Windows host cannot run it.
+
 ## Performance
 
 Performance is a design goal, not an afterthought. These are the library's own
@@ -160,6 +168,7 @@ against their official specification vectors.
 | [44](https://github.com/nostr-protocol/nips/blob/master/44.md) | Encrypted payloads (v2) | ✅ |
 | [46](https://github.com/nostr-protocol/nips/blob/master/46.md) | Nostr Connect, remote signing | ✅ |
 | [49](https://github.com/nostr-protocol/nips/blob/master/49.md) | Private key encryption (`ncryptsec`) | ✅ |
+| [50](https://github.com/nostr-protocol/nips/blob/master/50.md) | Search: the `search` filter field (relays do the matching) | ✅ |
 | [65](https://github.com/nostr-protocol/nips/blob/master/65.md) | Relay list metadata (outbox) | ✅ |
 | [17](https://github.com/nostr-protocol/nips/blob/master/17.md) | Private direct messages | 🚧 planned |
 | [59](https://github.com/nostr-protocol/nips/blob/master/59.md) | Gift wrap | 🚧 planned |
@@ -197,7 +206,7 @@ the signer protocol. Both apps are downloadable and both keep growing, so what
 comes next lands inside them rather than as new apps.
 
 In spec terms, the library still owes NIP-17 private direct messages, with the
-NIP-59 gift wrap that carries them, and a `search` field on `Filter` for NIP-50.
+NIP-59 gift wrap that carries them.
 Most of what remains is app work on protocol the library already exports:
 Blossom uploads so a picture can be posted, NIP-57 zaps that can be sent rather
 than only verified, NIP-51 bookmarks, and NIP-29 groups. Reactions,
