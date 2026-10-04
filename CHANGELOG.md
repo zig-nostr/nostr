@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `relay.dialDiagnosed` and `relay.DialDiagnostic`: `dial` that also records the HTTP status the relay answered the websocket upgrade with. A relay that answers 503 when busy, 401 or 403, or 429 still fails the dial with `HandshakeFailed`, so a tool printed that and nothing else; `diagnostic.status` now lets it say "relay answered 503". `Connection.handshake_status` carries the same value for callers that drive `handshake` themselves. The error sets are unchanged, and `dial` behaves as before.
+
 ### Changed
 
 - The store's merged query takes the newest candidate from a binary heap of the live streams instead of scanning all of them once per returned event. The order of results, and which stream wins a tie, are unchanged. A 60-note query over a follow list of 512 authors went from 358 to 254 microseconds and over 2,048 authors from 1,430 to 1,006 (best of five, ReleaseFast), and a query over 20 authors is unchanged.

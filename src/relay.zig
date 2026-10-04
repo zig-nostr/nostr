@@ -153,6 +153,12 @@ pub fn Connection(comptime Stream: type) type {
         /// Read it on the thread that calls `receive`, which is the only one
         /// that writes it.
         unreadable: u64,
+        /// The HTTP status the relay answered the opening handshake with, or
+        /// zero when no status line has been read. Set by `handshake` whether
+        /// it succeeds or not, so after a `HandshakeFailed` it says why: 503
+        /// when the relay is busy, 401 or 403 when it wants something first,
+        /// 429 when it is rate limiting.
+        handshake_status: u16,
 
         pub fn init(allocator: std.mem.Allocator, io: std.Io, stream: Stream) Self {
             return .{
@@ -164,6 +170,7 @@ pub fn Connection(comptime Stream: type) type {
                 .write_lock = .init,
                 .last_rx_ms = .init(0),
                 .unreadable = 0,
+                .handshake_status = 0,
             };
         }
 
@@ -175,6 +182,10 @@ pub fn Connection(comptime Stream: type) type {
 
         /// Performs the RFC 6455 opening handshake for `host`/`path`. Any bytes
         /// the relay sent after the response head are retained for `receive`.
+        ///
+        /// A relay that answers with anything but 101 fails with
+        /// `HandshakeFailed`, and the status it answered with is left in
+        /// `handshake_status`.
         pub fn handshake(self: *Self, host: []const u8, path: []const u8) !void {
             const key = websocket.generateKey(self.io) catch return ConnectionError.RandomFailed;
 
@@ -187,11 +198,15 @@ pub fn Connection(comptime Stream: type) type {
 
             // Read until the blank line terminating the response head.
             while (std.mem.indexOf(u8, self.recv.items, "\r\n\r\n") == null) {
+                // A relay that sends a status line and then closes, or never
+                // finishes the head, still said what it answered.
+                self.handshake_status = websocket.statusCode(self.recv.items) orelse 0;
                 if (self.recv.items.len > 16 * 1024) return ConnectionError.HandshakeFailed;
                 if (!try self.fill(null)) return ConnectionError.HandshakeFailed;
             }
             const idx = std.mem.indexOf(u8, self.recv.items, "\r\n\r\n").?;
             const head_len = idx + 4;
+            self.handshake_status = websocket.statusCode(self.recv.items[0..head_len]) orelse 0;
             websocket.checkHandshakeResponse(self.recv.items[0..head_len], &accept) catch
                 return ConnectionError.HandshakeFailed;
             self.consume(head_len);
@@ -777,9 +792,32 @@ fn resolveAndConnect(gpa: std.mem.Allocator, io: std.Io, host: []const u8, port:
 /// it allocated. The name lookup is the one step a cancel cannot interrupt,
 /// because it is a plain libc call.
 ///
-/// Not covered by CI (no relay is reachable there); the transport-agnostic
-/// `Connection` and the `IoStream` adapter it uses are what the tests exercise.
+/// Not covered by CI against a public relay (none is reachable there); the
+/// transport-agnostic `Connection` and the `IoStream` adapter it uses are what
+/// the tests exercise, along with a loopback server for the upgrade.
+///
+/// A relay that answers the upgrade with anything but 101 fails with
+/// `ConnectionError.HandshakeFailed`. Use `dialDiagnosed` to learn the status.
 pub fn dial(gpa: std.mem.Allocator, io: std.Io, url: []const u8) !*Relay {
+    var diagnostic: DialDiagnostic = .{};
+    return dialDiagnosed(gpa, io, url, &diagnostic);
+}
+
+/// What a failed `dial` can say beyond its error.
+pub const DialDiagnostic = struct {
+    /// The HTTP status the relay answered the websocket upgrade with, or zero
+    /// when it never got that far (a name that did not resolve, a refused
+    /// connection, a TLS failure) or sent no readable status line. Meaningful
+    /// after `HandshakeFailed`: 503 when the relay is busy, 401 or 403 when it
+    /// requires authentication, 429 when it is rate limiting.
+    status: u16 = 0,
+};
+
+/// `dial`, which also records in `diagnostic` what the relay answered the
+/// upgrade with. The error set is the same, so a caller that only wants "relay
+/// answered 503" for a `HandshakeFailed` reads `diagnostic.status`.
+pub fn dialDiagnosed(gpa: std.mem.Allocator, io: std.Io, url: []const u8, diagnostic: *DialDiagnostic) !*Relay {
+    diagnostic.* = .{};
     const parsed = try parseUrl(url);
 
     const transport = try gpa.create(Transport);
@@ -866,7 +904,10 @@ pub fn dial(gpa: std.mem.Allocator, io: std.Io, url: []const u8) !*Relay {
     errdefer relay.conn.deinit();
 
     var host_buf: [263]u8 = undefined; // max host (253) + ":65535"
-    try relay.conn.handshake(parsed.hostHeader(&host_buf), parsed.path);
+    relay.conn.handshake(parsed.hostHeader(&host_buf), parsed.path) catch |err| {
+        diagnostic.status = relay.conn.handshake_status;
+        return err;
+    };
     return relay;
 }
 
@@ -1005,6 +1046,44 @@ test "handshake fails on a mismatched accept" {
     var conn = Connection(*HandshakeStream).init(allocator, std.testing.io, &server);
     defer conn.deinit();
     try std.testing.expectError(ConnectionError.HandshakeFailed, conn.handshake("relay.example.com", "/"));
+}
+
+test "a handshake refused with a status says which one" {
+    const allocator = std.testing.allocator;
+    var written: std.ArrayList(u8) = .empty;
+    defer written.deinit(allocator);
+    var server = FakeStream{
+        .to_read = "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 5\r\nContent-Length: 0\r\n\r\n",
+        .written = &written,
+        .allocator = allocator,
+    };
+    var conn = TestConn.init(allocator, std.testing.io, &server);
+    defer conn.deinit();
+    try std.testing.expectError(ConnectionError.HandshakeFailed, conn.handshake("relay.example.com", "/"));
+    try std.testing.expectEqual(@as(u16, 503), conn.handshake_status);
+}
+
+test "a status line followed by a close still reports the status" {
+    const allocator = std.testing.allocator;
+    var written: std.ArrayList(u8) = .empty;
+    defer written.deinit(allocator);
+    var server = FakeStream{ .to_read = "HTTP/1.1 429 Too Many Requests\r\n", .written = &written, .allocator = allocator };
+    var conn = TestConn.init(allocator, std.testing.io, &server);
+    defer conn.deinit();
+    try std.testing.expectError(ConnectionError.HandshakeFailed, conn.handshake("relay.example.com", "/"));
+    try std.testing.expectEqual(@as(u16, 429), conn.handshake_status);
+}
+
+test "a mismatched accept still reports the 101" {
+    const allocator = std.testing.allocator;
+    var written: std.ArrayList(u8) = .empty;
+    defer written.deinit(allocator);
+    var server = HandshakeStream{ .written = &written, .allocator = allocator, .break_accept = true };
+    defer server.deinit();
+    var conn = Connection(*HandshakeStream).init(allocator, std.testing.io, &server);
+    defer conn.deinit();
+    try std.testing.expectError(ConnectionError.HandshakeFailed, conn.handshake("relay.example.com", "/"));
+    try std.testing.expectEqual(@as(u16, 101), conn.handshake_status);
 }
 
 test "publish/subscribe/unsubscribe write correct client frames" {
@@ -1679,6 +1758,47 @@ test "a dial waiting on a silent peer can be cancelled, and frees what it made" 
     } else |_| {}
     const waited = std.Io.Timestamp.now(io, .awake).toMilliseconds() - started;
     try std.testing.expect(waited < 5000);
+}
+
+test "dialDiagnosed reports the status a relay answered the upgrade with" {
+    // A relay that is busy answers the upgrade with a plain HTTP 503. The
+    // error stays `HandshakeFailed`; the status is what lets a caller say so.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var listen_address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try listen_address.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    const url = try std.fmt.allocPrint(allocator, "ws://127.0.0.1:{d}", .{server.socket.address.ip4.port});
+    defer allocator.free(url);
+
+    var pending = try io.concurrent(refuseUpgrade, .{ io, &server });
+    var diagnostic: DialDiagnostic = .{};
+    try std.testing.expectError(ConnectionError.HandshakeFailed, dialDiagnosed(allocator, io, url, &diagnostic));
+    try pending.await(io);
+    try std.testing.expectEqual(@as(u16, 503), diagnostic.status);
+
+    // A dial that never reached the upgrade has nothing to report.
+    var unreached: DialDiagnostic = .{ .status = 999 };
+    try std.testing.expectError(UrlError.UnsupportedScheme, dialDiagnosed(allocator, io, "http://127.0.0.1/", &unreached));
+    try std.testing.expectEqual(@as(u16, 0), unreached.status);
+}
+
+/// Accepts one connection, reads the upgrade request, and answers 503.
+fn refuseUpgrade(io: std.Io, server: *std.Io.net.Server) !void {
+    const served = try server.accept(io);
+    defer served.close(io);
+    var read_buf: [4096]u8 = undefined;
+    var reader = served.reader(io, &read_buf);
+    // The request head ends at the blank line.
+    while (true) {
+        const line = try reader.interface.takeDelimiterInclusive('\n');
+        if (line.len <= 2) break;
+    }
+    var write_buf: [256]u8 = undefined;
+    var writer = served.writer(io, &write_buf);
+    try writer.interface.writeAll("HTTP/1.1 503 Service Unavailable\r\nRetry-After: 5\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    try writer.interface.flush();
 }
 
 test "a deadline fires on a quiet socket and leaves the connection usable" {
