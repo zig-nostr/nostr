@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.9] - 2026-10-04
+
+### Fixed
+
+- Cancelling a task that reads a relay with `receiveTimeout` and asks again on every `error.Timeout` now ends it, with `error.ReadFailed`. On macOS and Linux the wait for bytes took the cancel and the read after it waited for the relay's next byte, so on a quiet relay the cancel never returned. On Windows the cancelled wait came back as `error.Timeout`, and asking again ended each wait at once, so the task spun at full CPU and the cancel never returned either.
+
 ## [0.14.8] - 2026-10-04
 
 ### Added
