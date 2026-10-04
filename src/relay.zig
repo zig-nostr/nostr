@@ -592,7 +592,7 @@ pub const IoStream = struct {
         const sock = self.socket orelse return true;
         const left = deadline.raw.nanoseconds - std.Io.Clock.Timestamp.now(io, deadline.clock).raw.nanoseconds;
         const ms: i32 = if (left <= 0) 0 else @intCast(@min(@divFloor(left + std.time.ns_per_ms - 1, std.time.ns_per_ms), std.math.maxInt(i32)));
-        return socketWritable(sock.handle, ms);
+        return socketWritable(io, sock.handle, ms);
     }
 
     pub fn writeAll(self: IoStream, bytes: []const u8) std.Io.Writer.Error!void {
@@ -604,52 +604,77 @@ pub const IoStream = struct {
 
 /// Whether `handle` can take a write within `ms` milliseconds. A failed wait
 /// answers yes: the write that follows reports the real error.
-fn socketWritable(handle: net.Socket.Handle, ms: i32) bool {
-    if (comptime builtin.os.tag == .windows) return winsock.writable(handle, ms);
+fn socketWritable(io: std.Io, handle: net.Socket.Handle, ms: i32) bool {
+    if (comptime builtin.os.tag == .windows) return afd.writable(io, handle, ms);
     var fds = [_]posix.pollfd{.{ .fd = handle, .events = posix.POLL.OUT, .revents = 0 }};
     const ready = posix.poll(&fds, ms) catch return true;
     return ready > 0;
 }
 
-/// The two Winsock calls the library makes itself. std's Windows io talks to
-/// the AFD driver directly and never starts Winsock, and it exposes no
-/// readiness wait for writing, so this declares just `WSAStartup` and
-/// `WSAPoll`. Only referenced on Windows targets.
-const winsock = struct {
-    const POLLWRNORM: i16 = 0x0010;
+/// The wait for write room on Windows. Only referenced on Windows targets.
+///
+/// std's Windows io opens a socket as an endpoint of the AFD driver itself and
+/// never registers it with Winsock, so a Winsock call such as `WSAPoll` would be
+/// handed a handle Winsock has no record of. The driver's own poll request is
+/// what Winsock's `select` is built on, and it takes the handle std holds. It
+/// goes through `io` the same way std sends its writes, so a cancel reaches it.
+const afd = struct {
+    const windows = std.os.windows;
 
-    const WSAPOLLFD = extern struct {
-        fd: usize,
-        events: i16,
-        revents: i16,
+    // AFD_POLL_* event bits. SEND is room to write; the rest end the
+    // connection, and the write that follows reports them.
+    const poll_send: u32 = 0x0004;
+    const poll_disconnect: u32 = 0x0008;
+    const poll_abort: u32 = 0x0010;
+    const poll_local_close: u32 = 0x0020;
+    const poll_connect_fail: u32 = 0x0100;
+
+    const HandleInfo = extern struct {
+        handle: windows.HANDLE,
+        events: u32,
+        status: windows.NTSTATUS,
     };
 
-    extern "ws2_32" fn WSAStartup(version: u16, data: *anyopaque) callconv(.winapi) c_int;
-    extern "ws2_32" fn WSAPoll(fds: [*]WSAPOLLFD, count: u32, timeout_ms: c_int) callconv(.winapi) c_int;
+    /// AFD_POLL_INFO with room for one handle. The driver reads it as the
+    /// request and writes it back with the handles that fired.
+    const PollInfo = extern struct {
+        /// In 100 ns units; negative is relative to now.
+        timeout: i64,
+        count: u32,
+        exclusive: u32,
+        handles: [1]HandleInfo,
+    };
 
-    /// 0 not started, 1 started, 2 failed. Startup is reference counted by
-    /// Windows, so two threads racing here only cost one extra count.
-    var state: std.atomic.Value(u8) = .init(0);
-
-    fn start() bool {
-        switch (state.load(.acquire)) {
-            1 => return true,
-            2 => return false,
-            else => {},
-        }
-        // WSADATA is 400 bytes on 32-bit and 408 on 64-bit Windows.
-        var data: [512]u8 align(8) = undefined;
-        const ok = WSAStartup(0x0202, &data) == 0;
-        state.store(if (ok) 1 else 2, .release);
-        return ok;
-    }
-
-    fn writable(handle: net.Socket.Handle, ms: i32) bool {
-        if (!start()) return true;
-        var fds = [_]WSAPOLLFD{.{ .fd = @intFromPtr(handle), .events = POLLWRNORM, .revents = 0 }};
-        const ready = WSAPoll(&fds, 1, ms);
-        if (ready < 0) return true;
-        return ready > 0;
+    fn writable(io: std.Io, handle: net.Socket.Handle, ms: i32) bool {
+        comptime std.debug.assert(@as(u32, @bitCast(windows.IOCTL.AFD.POLL)) == 0x12024);
+        var info: PollInfo = .{
+            .timeout = -@as(i64, ms) * 10_000,
+            .count = 1,
+            .exclusive = 0,
+            .handles = .{.{
+                .handle = handle,
+                .events = poll_send | poll_disconnect | poll_abort | poll_local_close | poll_connect_fail,
+                .status = .SUCCESS,
+            }},
+        };
+        const bytes = std.mem.asBytes(&info);
+        const result = io.operate(.{ .device_io_control = .{
+            .file = .{ .handle = handle, .flags = .{ .nonblocking = true } },
+            .code = windows.IOCTL.AFD.POLL,
+            .in = bytes,
+            .out = bytes,
+        } }) catch |err| switch (err) {
+            // Not swallowed: the caller's next I/O sees the cancel. The pong is
+            // skipped, which the caller allows for.
+            error.Canceled => {
+                io.recancel();
+                return false;
+            },
+        };
+        return switch (result.device_io_control.u.Status) {
+            .SUCCESS, .TIMEOUT => info.count != 0,
+            else => true,
+        };
     }
 };
 
@@ -859,8 +884,9 @@ fn resolveAndConnectLibc(gpa: std.mem.Allocator, io: std.Io, host: []const u8, p
 ///
 /// Takes no deadline. To bound it, run it with `io.concurrent` and cancel it
 /// when the deadline passes: a cancelled dial stops where it is and frees what
-/// it allocated. The name lookup is the one step a cancel cannot interrupt,
-/// because it is a plain libc call.
+/// it allocated. The name lookup is the one step a cancel cannot cut short. On
+/// POSIX it is a plain libc call, and on Windows std waits for the OS query to
+/// finish before it reports the cancel.
 ///
 /// Not covered by CI against a public relay (none is reachable there); the
 /// transport-agnostic `Connection` and the `IoStream` adapter it uses are what

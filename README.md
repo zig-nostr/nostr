@@ -47,7 +47,7 @@ live at [zignostr.com](https://zignostr.com).
 
 ## Platforms
 
-macOS, Linux and Windows, on x86_64 and aarch64. CI builds and runs the tests on all three systems. Zig 0.16 is required, at the version pinned in `.zigversion`. To check a Windows build from another system, `zig build test -Dtarget=x86_64-windows-gnu` compiles the test binary, which a non-Windows host then cannot run.
+macOS, Linux and Windows, on x86_64 and aarch64. CI builds and runs the tests on all three systems. Zig 0.16 is required, at the version pinned in `.zigversion`. To check a Windows build from another system, `zig build test -Dtarget=x86_64-windows-gnu` compiles the test binary and then stops with an error, because a non-Windows host cannot run it.
 
 ## Performance
 

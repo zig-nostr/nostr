@@ -86,7 +86,9 @@ pub const Store = struct {
     pub const OpenOptions = struct {
         /// Upper bound on the memory map (and thus the on-disk database) size.
         /// LMDB reserves this as virtual address space, not physical memory,
-        /// so a generous default is cheap. Defaults to 1 GiB.
+        /// so a generous default is cheap. Defaults to 1 GiB. Windows is the
+        /// exception: there LMDB sets the file to this size when it opens it,
+        /// so the whole map is taken on disk from the start.
         map_size: usize = 1 << 30,
         /// Maximum number of named sub-databases. Defaults to 16.
         max_dbs: u32 = 16,

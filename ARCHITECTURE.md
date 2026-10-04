@@ -79,7 +79,7 @@ Giving up is `Relay.shutdown`, which half-closes the socket so a blocked `receiv
 
 A reader that wants to come up for air without being torn down uses `receiveTimeout`. The `std.Io.Timeout` is turned into an absolute deadline once, and the wait is a readiness check that reads nothing, so when it returns `error.Timeout` the socket, the buffers and any TLS record state are exactly as they were and the call can be repeated. `Timeout` is a different value from `null`, which means the relay is gone. When a deadline is set, a pong is skipped if another write holds the lock or the socket has no room, so a peer that stopped reading cannot wedge the connection.
 
-`dial` has no deadline of its own. To bound it, start it with `io.concurrent` and cancel it: a cancelled dial stops where it is and frees what it allocated. On POSIX the name lookup is a libc call and cannot be interrupted. On Windows the lookup goes through std and can.
+`dial` has no deadline of its own. To bound it, start it with `io.concurrent` and cancel it: a cancelled dial stops where it is and frees what it allocated. The name lookup is the one step a cancel cannot cut short: on POSIX it is a libc call, and on Windows std waits for the OS query to finish before it reports the cancel.
 
 Shared signer state is small and locked. `SeenRequests` (replay defence) and the authorized-clients record are shared across the reader threads of every relay a signer serves, behind short spin locks.
 
@@ -87,7 +87,7 @@ The store relies on LMDB for concurrency: many read transactions beside one writ
 
 ## Platforms
 
-macOS, Linux and Windows. On POSIX the dialer resolves names with `getaddrinfo` and waits for write room with `poll`. On Windows it resolves with std's resolver and waits with `WSAPoll`, and a key file takes its directory's default access list because there are no mode bits. `zig build` only compiles what the benchmark uses, so a cross-compile check has to build the tests: `zig build test -Dtarget=x86_64-windows-gnu` compiles every file for Windows, and a non-Windows host then cannot run the result.
+macOS, Linux and Windows. On POSIX the dialer resolves names with `getaddrinfo` and waits for write room with `poll`. On Windows it resolves with std's resolver and waits with a poll request to the AFD driver, because std opens its sockets on that driver directly and never registers them with Winsock. A key file there takes its directory's default access list because there are no mode bits, and a store's file takes its full map size on disk (1 GiB by default) from the first open, because that is how LMDB maps a file on Windows. `zig build` only compiles what the benchmark uses, so a cross-compile check has to build the tests: `zig build test -Dtarget=x86_64-windows-gnu` compiles every file for Windows and then stops with an error, because a non-Windows host cannot run the result.
 
 ## Where to start reading
 
