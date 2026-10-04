@@ -279,7 +279,13 @@ pub fn decodeNaddr(allocator: std.mem.Allocator, s: []const u8) Error!AddrPointe
         if (i + 2 + l > raw.len) return Error.InvalidTlv;
         const v = raw[i + 2 .. i + 2 + l];
         switch (t) {
-            0 => identifier = try allocator.dupe(u8, v),
+            0 => {
+                // A later entry replaces an earlier one, as for every other
+                // field here, and the earlier copy is freed rather than lost.
+                const ident = try allocator.dupe(u8, v);
+                if (identifier) |old| allocator.free(old);
+                identifier = ident;
+            },
             1 => try relays.append(allocator, try allocator.dupe(u8, v)),
             2 => {
                 if (l != 32) return Error.WrongLength;
@@ -514,6 +520,22 @@ test "a TLV of 254 or 255 bytes is read, and the next one after it" {
     const url = try decodeNrelay(allocator, nrelay);
     defer allocator.free(url);
     try std.testing.expectEqualStrings("hello", url);
+}
+
+test "an naddr with its identifier twice decodes the last one, and frees the first" {
+    // The identifier was copied for every entry of type 0, and each copy
+    // replaced the one before it without freeing it, so an naddr carrying two
+    // leaked one. `std.testing.allocator` fails the test on that leak.
+    const allocator = std.testing.allocator;
+    const tlv = "\x00\x05first" ++ "\x00\x06second" ++ "\x02\x20" ++ "\x11" ** 32 ++ "\x03\x04\x00\x00\x75\x47";
+    const data5 = try bech32.convertBits(allocator, tlv, 8, 5, true);
+    defer allocator.free(data5);
+    const naddr = try bech32.encode(allocator, "naddr", data5);
+    defer allocator.free(naddr);
+    var addr = try decodeNaddr(allocator, naddr);
+    defer addr.deinit(allocator);
+    try std.testing.expectEqualStrings("second", addr.identifier);
+    try std.testing.expectEqual(@as(u32, 30023), addr.kind);
 }
 
 test "NIP-21 nostr: URI wrap/unwrap" {

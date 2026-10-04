@@ -53,7 +53,10 @@
 //! ships, silently (see the test beside it in bip39.zig). `nip49.decrypt` cast
 //! the scrypt cost out of a hostile `ncryptsec` straight into a six bit integer,
 //! so a payload with a cost above 63 was an illegal cast and a crash rather than
-//! an error (see the test beside it in nip49.zig).
+//! an error (see the test beside it in nip49.zig). The NIP-19 TLV decoders
+//! stepped past an entry with a byte-wide sum, which overflowed on an entry of
+//! 254 or 255 bytes, and `decodeNaddr` leaked its identifier when an naddr
+//! carried two (see the tests beside them in nip19.zig).
 
 const std = @import("std");
 const testing = std.testing;
@@ -554,6 +557,8 @@ test "fuzz: a NIP-19 entity built around fuzzed contents" {
             seed(&.{ .{ .int = 3 }, .{ .slice = "\x00\xff\x01" } }),
             seed(&.{ .{ .int = 3 }, .{ .slice = "\x09\x01x" ++ pk } }),
             seed(&.{ .{ .int = 3 }, .{ .slice = "\x00\x03abc" } }),
+            // An naddr with its identifier twice.
+            seed(&.{ .{ .int = 5 }, .{ .slice = "\x00\x03abc\x00\x03xyz" ++ author ++ kind } }),
         },
     });
 }

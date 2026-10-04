@@ -130,9 +130,9 @@ pub fn decrypt(allocator: std.mem.Allocator, ncryptsec: []const u8, password: []
     var key: [key_len]u8 = undefined;
     defer std.crypto.secureZero(u8, &key);
     // The cost is a byte of the file, and the KDF takes six bits of it. A file
-    // that asks for more is refusing nothing the KDF could do, so it is rejected
-    // here rather than cast: an `@intCast` that does not fit is a crash in a
-    // safety build and undefined behaviour in the build that ships.
+    // that asks for more asks for something the KDF cannot do, so it is
+    // rejected here rather than cast: an `@intCast` that does not fit is a crash
+    // in a safety build and undefined behaviour in the build that ships.
     const ln = std.math.cast(u6, log_n) orelse return Error.WeakParameters;
     std.crypto.pwhash.scrypt.kdf(allocator, &key, norm_pw.slice, salt, .{ .ln = ln, .r = 8, .p = 1 }) catch
         return Error.WeakParameters;
