@@ -196,14 +196,18 @@ one core:
   fast, local-first client where you read without an account, post in four
   clicks, and the feed renders from disk. Downloadable for the same two.
 
-Private messages, zaps and groups land inside Plaza rather than as separate apps.
+Private messages, zaps and groups land inside Plaza.
 A messenger you have to switch to is one you stop using.
 
 ## Roadmap
 
-The library foundation has shipped: keys, transport, the local-first store and
-the signer protocol. Both apps are downloadable and both keep growing, so what
-comes next lands inside them rather than as new apps.
+The library foundation has shipped: keys, transport, the local-first store and the signer protocol, built and tested on Linux, macOS and Windows. The apps and the command line are built on it, so what comes next for the library is how far it reaches:
+
+- A C ABI over keys, events, NIP-19, NIP-44, relay reads and the local store, with a C header, and Swift bindings published as a Swift package. Both are tested in CI.
+- An app engine extracted from Plaza: the parts with no pixels in them, which are sync, relay and outbox routing, signer sessions, caches for profiles, follow lists and relay lists, and content parsing into structured data. It has no views and no UI templates, so an app gets data and draws its own interface. Plaza moves onto it, and new small apps can be built on it, each with its own interface.
+- An Android proof of concept that uses the library through the C ABI to read a feed into a local store on a phone. It is a proof of concept, not a store release.
+
+Around those: Notary packaged for Windows, so the library, deed and Notary are each tested on Windows, macOS and Linux; `deed mcp`, which puts deed's verbs behind the Model Context Protocol so an agent can read relays, query the local store and verify events, with signing only through a NIP-46 signer that asks first; and Plaza 1.0.
 
 In spec terms, the library still owes NIP-17 private direct messages, with the
 NIP-59 gift wrap that carries them.
@@ -215,14 +219,11 @@ be sent, though one written by somebody you follow does not yet reach your
 feed. The [NIP support page](https://zignostr.com/nips) maps each one to the
 milestone that lands it.
 
-There are no dates. The [roadmap](https://zignostr.com/roadmap) is an order, and
-it also names what is deliberately not being built (set-reconciliation sync,
-NIP-77, is on that list), which is the half most roadmaps leave out.
+The [roadmap](https://zignostr.com/roadmap) has the full list, and it also names what is deliberately not being built (set-reconciliation sync, NIP-77, is on that list).
 
 See [`CURRENT_STATE.md`](CURRENT_STATE.md) for exactly what's in progress, the
-[roadmap](https://zignostr.com/roadmap) for the sequence, and the
-[project board](https://github.com/orgs/zig-nostr/projects) for the milestone
-tracker.
+[roadmap](https://zignostr.com/roadmap) for the rest, and the
+[project board](https://github.com/orgs/zig-nostr/projects) for the open work.
 
 ## Development
 
