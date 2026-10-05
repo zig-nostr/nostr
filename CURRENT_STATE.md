@@ -1,9 +1,8 @@
 # Current state
 
 A snapshot for somebody reading this repo. The
-[roadmap](https://zignostr.com/roadmap) is the plan and the
-[milestones](https://github.com/zig-nostr/plaza/milestones) are the tracker; this
-file only says where things stand today.
+[roadmap](https://zignostr.com/roadmap) says what comes next; this file only says
+where things stand today.
 
 Version numbers are deliberately not repeated here. This file went nine releases
 out of date saying them, and a stale number is worse than no number: it is
@@ -49,15 +48,17 @@ on the roadmap while groups, messages, media and payments are still landing.
 Both are downloadable for macOS (Apple Silicon) and Linux (x86_64 and aarch64).
 Off macOS there is no platform text layer, so both draw every glyph from faces
 they carry: emoji are drawn in colour, and scripts those faces do not cover are
-not drawn at all. What comes next lands inside these two rather than as new apps.
+not drawn at all.
 
 ## What is next
 
-The ten milestones, in order, are on the
-[roadmap](https://zignostr.com/roadmap). The first is everything you do on the
-first day: the four things already built that do not work (reposts by people you
-follow, relay hints, hashtags, bookmarks), then pictures, a full profile, zaps
-you can send, and search.
+For the library:
+
+- A C ABI over keys, events, NIP-19, NIP-44, relay reads and the local store, with a C header, and Swift bindings published as a Swift package. Both are tested in CI.
+- An app engine extracted from Plaza: sync, relay and outbox routing, signer sessions, caches for profiles, follow lists and relay lists, and content parsing into structured data. It has no views and no UI templates, so an app gets data and draws its own interface. Plaza moves onto it, and new small apps can be built on it, each with its own interface.
+- An Android proof of concept that uses the library through the C ABI to read a feed into a local store on a phone. It is a proof of concept, not a store release.
+
+Around the library: Notary packaged for Windows, so the library, deed and Notary are each tested on Windows, macOS and Linux; `deed mcp`, which puts deed's verbs behind the Model Context Protocol so an agent can read relays, query the local store and verify events, with signing only through a NIP-46 signer that asks first; and Plaza 1.0. Plaza's own next features, such as zaps you can send, notifications and private messages, are on the [roadmap](https://zignostr.com/roadmap) too.
 
 That page also lists what is deliberately **not** being built, and why. Reading
 the second half is the faster way to understand the first.
