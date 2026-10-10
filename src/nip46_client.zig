@@ -751,6 +751,7 @@ const relay = @import("relay.zig");
 const signer_mod = @import("signer.zig");
 const websocket = @import("websocket.zig");
 const nip44 = @import("nip44.zig");
+const nip04 = @import("nip04.zig");
 
 test "nip46_client: compiles against a live relay" {
     std.testing.refAllDecls(Client(*relay.Relay));
@@ -1049,9 +1050,27 @@ test "nip46_client: nip44 encrypt and decrypt round trip through the signer" {
     const back = try f.client.?.nip44Decrypt(peer.public_key, ciphertext);
     defer testing.allocator.free(back);
     try testing.expectEqualStrings("for your eyes", back);
+}
 
-    // nip04 goes out the same way; this bunker does not speak it.
-    try testing.expectError(Error.Rejected, f.client.?.nip04Encrypt(peer.public_key, "x"));
+test "nip46_client: nip04 encrypt and decrypt round trip through the signer" {
+    var f: Fixture = undefined;
+    try f.init(testing.allocator, testing.io, null, null, .{ .timeout_ms = 5000 });
+    defer f.deinit();
+    try f.client.?.connect();
+
+    const peer = try testKeyPair(f.ctx, 12);
+    const ciphertext = try f.client.?.nip04Encrypt(peer.public_key, "an old style message");
+    defer testing.allocator.free(ciphertext);
+
+    const opened = try nip04.decrypt(testing.allocator, f.ctx, peer.secret_key, f.user.public_key, ciphertext);
+    defer testing.allocator.free(opened);
+    try testing.expectEqualStrings("an old style message", opened);
+
+    const back = try f.client.?.nip04Decrypt(peer.public_key, ciphertext);
+    defer testing.allocator.free(back);
+    try testing.expectEqualStrings("an old style message", back);
+
+    try testing.expectError(Error.Rejected, f.client.?.nip04Decrypt(peer.public_key, "not a payload"));
 }
 
 test "nip46_client: a request nobody answers times out instead of hanging" {

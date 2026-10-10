@@ -19,6 +19,7 @@ const std = @import("std");
 const keys = @import("keys.zig");
 const event = @import("event.zig");
 const nip44 = @import("nip44.zig");
+const nip04 = @import("nip04.zig");
 const hex = @import("hex.zig");
 const json = @import("json.zig");
 
@@ -47,6 +48,8 @@ pub const Method = enum {
     get_public_key,
     nip44_encrypt,
     nip44_decrypt,
+    nip04_encrypt,
+    nip04_decrypt,
     logout,
 
     pub fn fromString(s: []const u8) ?Method {
@@ -57,6 +60,8 @@ pub const Method = enum {
             .{ "get_public_key", .get_public_key },
             .{ "nip44_encrypt", .nip44_encrypt },
             .{ "nip44_decrypt", .nip44_decrypt },
+            .{ "nip04_encrypt", .nip04_encrypt },
+            .{ "nip04_decrypt", .nip04_decrypt },
             .{ "logout", .logout },
         });
         return map.get(s);
@@ -768,6 +773,23 @@ pub const Bunker = struct {
                     };
                 return okResponse(arena, id, out);
             },
+            // NIP-04 is deprecated in favour of NIP-44, but clients still ask
+            // for it to read and write old direct messages. It touches the key
+            // the same way, so it gets the same checks as the NIP-44 pair.
+            .nip04_encrypt, .nip04_decrypt => {
+                if (request.params.len < 2) return errorResponse(arena, id, "missing params");
+                const third = hex.decodeFixed(32, request.params[0]) catch
+                    return errorResponse(arena, id, "invalid pubkey");
+                const out = (if (method == .nip04_encrypt)
+                    nip04.encrypt(a, io, self.signer, self.user.secret_key, third, request.params[1])
+                else
+                    nip04.decrypt(a, self.signer, self.user.secret_key, third, request.params[1])) catch |e|
+                    {
+                        if (e == error.OutOfMemory) return error.OutOfMemory;
+                        return errorResponse(arena, id, "nip04 operation failed");
+                    };
+                return okResponse(arena, id, out);
+            },
         }
     }
 
@@ -1116,7 +1138,8 @@ test "NIP-46 response JSON round trip with and without error" {
 test "NIP-46 method parsing" {
     try testing.expectEqual(Method.sign_event, Method.fromString("sign_event").?);
     try testing.expectEqual(Method.nip44_decrypt, Method.fromString("nip44_decrypt").?);
-    try testing.expectEqual(@as(?Method, null), Method.fromString("nip04_encrypt"));
+    try testing.expectEqual(Method.nip04_encrypt, Method.fromString("nip04_encrypt").?);
+    try testing.expectEqual(@as(?Method, null), Method.fromString("switch_relays"));
     try testing.expectEqualStrings("get_public_key", Method.get_public_key.name());
 }
 
@@ -1395,6 +1418,56 @@ test "NIP-46 bunker nip44 encrypt then decrypt round trips" {
     try testing.expectEqualStrings("secret note", dec_resp.value.result);
 }
 
+test "NIP-46 bunker nip04 encrypt then decrypt round trips" {
+    const gpa = testing.allocator;
+    var p = try TestParties.init();
+    defer p.deinit();
+    var bunker_clients: AuthorizedClients = .{};
+    var bunker = Bunker.initSingleKey(p.signer, p.user, approveAll(), &bunker_clients);
+
+    const third = try p.signer.generateKeyPair(testing.io);
+    const third_hex = try hex.encode(gpa, &third.public_key);
+    defer gpa.free(third_hex);
+    const enc_params = [_][]const u8{ third_hex, "old style note" };
+
+    // Like the NIP-44 pair, it touches the key, so a stranger is refused.
+    {
+        var resp = try exchange(gpa, &p, &bunker, .{ .id = "s", .method = "nip04_encrypt", .params = &enc_params });
+        defer resp.deinit();
+        try testing.expectEqualStrings("not connected", resp.value.err);
+    }
+    try connectFirst(gpa, &p, &bunker);
+
+    var enc_resp = try exchange(gpa, &p, &bunker, .{ .id = "e", .method = "nip04_encrypt", .params = &enc_params });
+    defer enc_resp.deinit();
+    try testing.expectEqualStrings("", enc_resp.value.err);
+
+    // The third party reads it with its own key.
+    const opened = try nip04.decrypt(gpa, p.signer, third.secret_key, p.user.public_key, enc_resp.value.result);
+    defer gpa.free(opened);
+    try testing.expectEqualStrings("old style note", opened);
+
+    const dec_params = [_][]const u8{ third_hex, enc_resp.value.result };
+    var dec_resp = try exchange(gpa, &p, &bunker, .{ .id = "d", .method = "nip04_decrypt", .params = &dec_params });
+    defer dec_resp.deinit();
+    try testing.expectEqualStrings("old style note", dec_resp.value.result);
+
+    const junk_params = [_][]const u8{ third_hex, "not a payload" };
+    var junk = try exchange(gpa, &p, &bunker, .{ .id = "j", .method = "nip04_decrypt", .params = &junk_params });
+    defer junk.deinit();
+    try testing.expectEqualStrings("nip04 operation failed", junk.value.err);
+}
+
+test "NIP-46 PolicyConfig can refuse nip04 while allowing nip44" {
+    const allowed = [_]Method{ .get_public_key, .nip44_encrypt, .nip44_decrypt };
+    var cfg = PolicyConfig{ .gpa = testing.allocator, .allowed_methods = &allowed };
+    const pol = cfg.policy();
+    const params = [_][]const u8{ "aa", "bb" };
+    const client = [_]u8{1} ** 32;
+    try testing.expectEqual(Decision.reject, pol.decide(&.{ .id = "1", .method = "nip04_decrypt", .params = &params }, client));
+    try testing.expectEqual(Decision.approve, pol.decide(&.{ .id = "2", .method = "nip44_decrypt", .params = &params }, client));
+}
+
 test "NIP-46 bunker rejects denied and unknown requests" {
     const gpa = testing.allocator;
     var p = try TestParties.init();
@@ -1417,7 +1490,7 @@ test "NIP-46 bunker rejects denied and unknown requests" {
     // Unknown methods are rejected even under an approve-all policy.
     var open_bunker_clients: AuthorizedClients = .{};
     var open_bunker = Bunker.initSingleKey(p.signer, p.user, approveAll(), &open_bunker_clients);
-    const unknown = Request{ .id = "u", .method = "nip04_encrypt", .params = &.{} };
+    const unknown = Request{ .id = "u", .method = "switch_relays", .params = &.{} };
     var uresp = try exchange(gpa, &p, &open_bunker, unknown);
     defer uresp.deinit();
     try testing.expectEqualStrings("unsupported method", uresp.value.err);
