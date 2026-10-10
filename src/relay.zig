@@ -1298,7 +1298,7 @@ test "a message the parser cannot read costs that message and nothing after it" 
     // Not JSON, then a type this parser has no case for, then an EVENT whose
     // event is malformed, and only then something readable.
     try appendServerText(&script, allocator, "not json at all");
-    try appendServerText(&script, allocator, "[\"COUNT\",\"s1\",{\"count\":3}]");
+    try appendServerText(&script, allocator, "[\"BOGUS\",\"s1\",{\"count\":3}]");
     try appendServerText(&script, allocator, "[\"EVENT\",\"s1\",{\"id\":\"zz\"}]");
     try appendServerText(&script, allocator, "[\"NOTICE\",\"still here\"]");
     try appendServerText(&script, allocator, "[\"EOSE\",\"s1\"]");
@@ -1326,8 +1326,8 @@ test "skipping unreadable messages still stops at the deadline" {
 
     var script: std.ArrayList(u8) = .empty;
     defer script.deinit(allocator);
-    try appendServerText(&script, allocator, "[\"COUNT\",\"s1\",{\"count\":1}]");
-    try appendServerText(&script, allocator, "[\"COUNT\",\"s1\",{\"count\":2}]");
+    try appendServerText(&script, allocator, "[\"BOGUS\",\"s1\",{\"count\":1}]");
+    try appendServerText(&script, allocator, "[\"BOGUS\",\"s1\",{\"count\":2}]");
     try appendServerText(&script, allocator, "[\"NOTICE\",\"after\"]");
 
     var server = FakeStream{ .to_read = script.items, .written = &written, .allocator = allocator };

@@ -273,6 +273,10 @@ test "fuzz: a relay message" {
         one("[\"CLOSED\",\"sub\",\"auth-required: pay up\"]"),
         one("[\"NOTICE\",\"hello\"]"),
         one("[\"AUTH\",\"challenge\"]"),
+        one("[\"COUNT\",\"sub\",{\"count\":12,\"approximate\":true,\"hll\":\"00\"}]"),
+        one("[\"COUNT\",\"sub\",{\"count\":18446744073709551615}]"),
+        one("[\"NEG-MSG\",\"sub\",\"6100000a\"]"),
+        one("[\"NEG-ERR\",\"sub\",\"blocked: too big\"]"),
         one("[\"EVENT\",\"sub\",{\"kind\":70000}]"),
         one("[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[["),
     } });
@@ -302,6 +306,9 @@ test "fuzz: a relay message with a plausible envelope" {
         seed(&.{ .{ .int = 3 }, .{ .slice = "\"sub\",\"closed\"" } }),
         seed(&.{ .{ .int = 4 }, .{ .slice = "\"hello\"" } }),
         seed(&.{ .{ .int = 5 }, .{ .slice = "\"challenge\"" } }),
+        seed(&.{ .{ .int = 6 }, .{ .slice = "\"sub\",{\"count\":3,\"approximate\":false}" } }),
+        seed(&.{ .{ .int = 7 }, .{ .slice = "\"sub\",\"00ff\"" } }),
+        seed(&.{ .{ .int = 8 }, .{ .slice = "\"sub\",\"closed\"" } }),
     } });
 }
 
@@ -313,13 +320,16 @@ test "fuzz: a relay message with a plausible envelope" {
 /// the generator's effort lands on the fields rather than on the brackets.
 fn fuzzEnvelope(_: void, smith: *testing.Smith) anyerror!void {
     @disableInstrumentation();
-    const verb = switch (smith.value(enum(u3) { event, ok, eose, closed, notice, auth })) {
+    const verb = switch (smith.value(enum(u4) { event, ok, eose, closed, notice, auth, count, neg_msg, neg_err })) {
         .event => "EVENT",
         .ok => "OK",
         .eose => "EOSE",
         .closed => "CLOSED",
         .notice => "NOTICE",
         .auth => "AUTH",
+        .count => "COUNT",
+        .neg_msg => "NEG-MSG",
+        .neg_err => "NEG-ERR",
     };
     var body: [1024]u8 = undefined;
     const n = smith.slice(&body);
@@ -331,6 +341,186 @@ fn fuzzEnvelope(_: void, smith: *testing.Smith) anyerror!void {
     switch (parsed.value) {
         .event => |e| try expectEventRoundTrips(e.event),
         else => {},
+    }
+}
+
+// -- What a client says -------------------------------------------------------
+
+test "fuzz: a client message" {
+    try testing.fuzz({}, fuzzClientMessage, .{ .corpus = &.{
+        one("[\"EVENT\"," ++ sample_event ++ "]"),
+        one("[\"AUTH\"," ++ sample_event ++ "]"),
+        one("[\"REQ\",\"sub\",{\"ids\":[\"" ++ zeros32 ++ "\"],\"kinds\":[1,7],\"#e\":[\"x\"],\"since\":1,\"limit\":5,\"search\":\"hi\"},{}]"),
+        one("[\"REQ\",\"sub\"]"),
+        one("[\"COUNT\",\"sub\",{\"authors\":[\"" ++ zeros32 ++ "\"],\"unknown\":[1]}]"),
+        one("[\"CLOSE\",\"sub\"]"),
+        one("[\"NEG-OPEN\",\"sub\",{\"kinds\":[1]},\"6100000a\"]"),
+        one("[\"NEG-MSG\",\"sub\",\"00ff\"]"),
+        one("[\"NEG-CLOSE\",\"sub\"]"),
+        one("[\"REQ\",\"sub\",{\"kinds\":[65536],\"limit\":-1}]"),
+        one("[\"NEG-MSG\",\"sub\",\"abc\"]"),
+        one("[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[["),
+    } });
+}
+
+/// The relay-side front door: every byte a client sends arrives here. Beyond
+/// not crashing, a parsed REQ or COUNT must re-encode to something the parser
+/// reads back as the same filters, so a filter the parser accepts is one the
+/// encoder can write down.
+fn fuzzClientMessage(_: void, smith: *testing.Smith) anyerror!void {
+    @disableInstrumentation();
+    var buf: [4096]u8 = undefined;
+    const n = smith.slice(&buf);
+    var parsed = message.parseClientMessage(testing.allocator, buf[0..n]) catch return;
+    defer parsed.deinit();
+    try expectClientMessageStable(parsed.value);
+}
+
+fn expectClientMessageStable(value: message.ClientMessage) !void {
+    switch (value) {
+        .event, .auth => |ev| try expectEventRoundTrips(ev),
+        .req => |r| {
+            const again = try message.encodeReq(testing.allocator, r.subscription_id, r.filters);
+            defer testing.allocator.free(again);
+            var p2 = try message.parseClientMessage(testing.allocator, again);
+            defer p2.deinit();
+            try expectSameFilters(r.filters, p2.value.req.filters);
+        },
+        .count => |c| {
+            const again = try message.encodeCount(testing.allocator, c.subscription_id, c.filters);
+            defer testing.allocator.free(again);
+            var p2 = try message.parseClientMessage(testing.allocator, again);
+            defer p2.deinit();
+            try expectSameFilters(c.filters, p2.value.count.filters);
+        },
+        .neg_open => |o| {
+            const again = try message.encodeNegOpen(testing.allocator, o.sub_id, o.filter, o.initial_hex);
+            defer testing.allocator.free(again);
+            var p2 = try message.parseClientMessage(testing.allocator, again);
+            defer p2.deinit();
+            try expectSameFilters(&.{o.filter}, &.{p2.value.neg_open.filter});
+            try testing.expectEqualStrings(o.initial_hex, p2.value.neg_open.initial_hex);
+        },
+        .close, .neg_msg, .neg_close => {},
+    }
+}
+
+fn expectSameFilters(a: []const filter.Filter, b: []const filter.Filter) !void {
+    try testing.expectEqual(a.len, b.len);
+    for (a, b) |fa, fb| {
+        var la: std.ArrayList(u8) = .empty;
+        defer la.deinit(testing.allocator);
+        var lb: std.ArrayList(u8) = .empty;
+        defer lb.deinit(testing.allocator);
+        try fa.appendJson(&la, testing.allocator);
+        try fb.appendJson(&lb, testing.allocator);
+        try testing.expectEqualStrings(la.items, lb.items);
+    }
+}
+
+test "fuzz: a client message with a plausible envelope" {
+    try testing.fuzz({}, fuzzClientEnvelope, .{ .corpus = &.{
+        seed(&.{ .{ .int = 0 }, .{ .slice = sample_event } }),
+        seed(&.{ .{ .int = 1 }, .{ .slice = "\"sub\",{\"kinds\":[1],\"#p\":[\"a\"]},{\"limit\":3}" } }),
+        seed(&.{ .{ .int = 2 }, .{ .slice = "\"sub\",{\"since\":-5}" } }),
+        seed(&.{ .{ .int = 3 }, .{ .slice = "\"sub\"" } }),
+        seed(&.{ .{ .int = 4 }, .{ .slice = "\"sub\",{},\"6100\"" } }),
+        seed(&.{ .{ .int = 5 }, .{ .slice = "\"sub\",\"6100\"" } }),
+        seed(&.{ .{ .int = 6 }, .{ .slice = "\"sub\"" } }),
+        seed(&.{ .{ .int = 7 }, .{ .slice = sample_event } }),
+    } });
+}
+
+/// The client-side parser, reached past the first `if`, for the same reason as
+/// `fuzzEnvelope`.
+fn fuzzClientEnvelope(_: void, smith: *testing.Smith) anyerror!void {
+    @disableInstrumentation();
+    const verb = switch (smith.value(enum(u4) { event, req, count, close, neg_open, neg_msg, neg_close, auth })) {
+        .event => "EVENT",
+        .req => "REQ",
+        .count => "COUNT",
+        .close => "CLOSE",
+        .neg_open => "NEG-OPEN",
+        .neg_msg => "NEG-MSG",
+        .neg_close => "NEG-CLOSE",
+        .auth => "AUTH",
+    };
+    var body: [1024]u8 = undefined;
+    const n = smith.slice(&body);
+
+    var text: [1200]u8 = undefined;
+    const built = std.fmt.bufPrint(&text, "[\"{s}\",{s}]", .{ verb, body[0..n] }) catch return;
+    var parsed = message.parseClientMessage(testing.allocator, built) catch return;
+    defer parsed.deinit();
+    try expectClientMessageStable(parsed.value);
+}
+
+test "fuzz: relay replies and negentropy frames read back as written" {
+    try testing.fuzz({}, fuzzReplyRoundTrip, .{ .corpus = &.{
+        seed(&.{ .{ .slice = "sub" }, .{ .slice = "blocked: no" }, .{ .int = 7 } }),
+        seed(&.{ .{ .slice = "a\"b\\c\n" }, .{ .slice = "\x01\x1f" }, .{ .int = 0 } }),
+        seed(&.{ .{ .slice = "\u{e9}" }, .{ .slice = "" }, .{ .int = 255 } }),
+    } });
+}
+
+/// Every reply a local relay writes has to be read back by the client parser
+/// as the strings it was given, whatever those strings hold.
+fn fuzzReplyRoundTrip(_: void, smith: *testing.Smith) anyerror!void {
+    @disableInstrumentation();
+    var a_buf: [256]u8 = undefined;
+    const an = smith.slice(&a_buf);
+    var b_buf: [256]u8 = undefined;
+    const bn = smith.slice(&b_buf);
+    const a = a_buf[0..an];
+    const b = b_buf[0..bn];
+    if (!std.unicode.utf8ValidateSlice(a) or !std.unicode.utf8ValidateSlice(b)) return;
+    const count = smith.value(u64);
+    const approx: ?bool = switch (smith.value(u2)) {
+        0 => null,
+        1 => true,
+        else => false,
+    };
+
+    {
+        const s = try message.encodeClosed(testing.allocator, a, b);
+        defer testing.allocator.free(s);
+        var p = try message.parseRelayMessage(testing.allocator, s);
+        defer p.deinit();
+        try testing.expectEqualStrings(a, p.value.closed.subscription_id);
+        try testing.expectEqualStrings(b, p.value.closed.message);
+    }
+    {
+        const s = try message.encodeNegErr(testing.allocator, a, b);
+        defer testing.allocator.free(s);
+        var p = try message.parseRelayMessage(testing.allocator, s);
+        defer p.deinit();
+        try testing.expectEqualStrings(a, p.value.neg_err.sub_id);
+        try testing.expectEqualStrings(b, p.value.neg_err.reason);
+    }
+    {
+        const s = try message.encodeCountReply(testing.allocator, a, count, approx);
+        defer testing.allocator.free(s);
+        var p = try message.parseRelayMessage(testing.allocator, s);
+        defer p.deinit();
+        try testing.expectEqualStrings(a, p.value.count.subscription_id);
+        try testing.expectEqual(count, p.value.count.count);
+        try testing.expectEqual(approx, p.value.count.approximate);
+    }
+    {
+        // Hex built from the bytes, so it is valid whatever the fuzzer sent.
+        const h = try hex.encode(testing.allocator, b);
+        defer testing.allocator.free(h);
+        const s = try message.encodeNegMsg(testing.allocator, a, h);
+        defer testing.allocator.free(s);
+        var p = try message.parseRelayMessage(testing.allocator, s);
+        defer p.deinit();
+        try testing.expectEqualStrings(h, p.value.neg_msg.hex);
+        if (a.len >= 1 and a.len <= message.max_subscription_id_len) {
+            var c = try message.parseClientMessage(testing.allocator, s);
+            defer c.deinit();
+            try testing.expectEqualStrings(a, c.value.neg_msg.sub_id);
+            try testing.expectEqualStrings(h, c.value.neg_msg.hex);
+        }
     }
 }
 

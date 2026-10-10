@@ -126,6 +126,7 @@ pub fn serve(
                 }
             },
             .notice => |n| std.debug.print("signer: relay notice: {s}\n", .{n.message}),
+            .count, .neg_msg, .neg_err => {},
         }
     }
 }
