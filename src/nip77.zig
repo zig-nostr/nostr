@@ -217,9 +217,11 @@ pub const Storage = struct {
     }
 
     /// The items of every stored event matching `filter`, read through
-    /// `Store.syncItems`.
-    pub fn fromStore(gpa: std.mem.Allocator, s: *store_mod.Store, filter: Filter) (Error || store_mod.Error)!Storage {
-        const items = try s.syncItems(gpa, filter);
+    /// `Store.syncItems`. With `options.max_items` set, a filter matching more
+    /// fails early with `error.TooManyItems`; a relay answers that with
+    /// `NEG-ERR "blocked: too many records"`.
+    pub fn fromStore(gpa: std.mem.Allocator, s: *store_mod.Store, filter: Filter, options: store_mod.SyncOptions) (Error || store_mod.Error)!Storage {
+        const items = try s.syncItems(gpa, filter, options);
         errdefer gpa.free(items);
         return seal(gpa, items);
     }
@@ -1104,7 +1106,7 @@ test "nip77: storage built from the store reconciles against a slice" {
         if (i % 10 != 1) try local.append(gpa, .{ .created_at = @intCast(ev.created_at), .id = id });
     }
 
-    var from_store = try Storage.fromStore(gpa, &s, .{});
+    var from_store = try Storage.fromStore(gpa, &s, .{}, .{});
     defer from_store.deinit(gpa);
     try testing.expectEqual(@as(usize, 90), from_store.size());
     var from_slice = try Storage.fromSlice(gpa, local.items);

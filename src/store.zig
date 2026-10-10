@@ -42,6 +42,8 @@ pub const Error = error{
     Lmdb,
     /// A stored event record was truncated or malformed.
     CorruptRecord,
+    /// More events match than `SyncOptions.max_items` allows.
+    TooManyItems,
     OutOfMemory,
 };
 
@@ -727,19 +729,32 @@ pub const Store = struct {
     /// matches). Events with a negative `created_at` are left out, since a
     /// negentropy timestamp is unsigned.
     ///
-    /// A filter that constrains nothing but `since` and `until` is answered
-    /// from the keys of the time index alone, in a single forward walk with no
-    /// event decoded. Any other filter goes through `query` and is sorted.
-    pub fn syncItems(self: *Store, gpa: std.mem.Allocator, filter: Filter) Error![]SyncItem {
+    /// A filter that constrains nothing but `authors`, `kinds`, `since` and
+    /// `until` is answered from index keys alone, which already hold the
+    /// timestamp and the id, so no event is read or decoded. Any other filter
+    /// goes through `query` and is sorted.
+    ///
+    /// With `options.max_items` set, a filter matching more than that fails
+    /// with `error.TooManyItems` as soon as the walk passes it, so a relay
+    /// can refuse a reconciliation over too large a set (NIP-77's
+    /// `NEG-ERR "blocked: too many records"`) without first collecting it.
+    pub fn syncItems(self: *Store, gpa: std.mem.Allocator, filter: Filter, options: SyncOptions) Error![]SyncItem {
         var out: std.ArrayList(SyncItem) = .empty;
         errdefer out.deinit(gpa);
+        const max = options.max_items orelse std.math.maxInt(usize);
 
-        const time_only = filter.ids == null and filter.authors == null and
-            filter.kinds == null and filter.tags == null and
+        const from_index = filter.ids == null and filter.tags == null and
             filter.search == null and filter.limit == null;
-        if (!time_only) {
-            var r = try self.query(gpa, filter);
+        if (!from_index) {
+            var f = filter;
+            // One past the cap is enough to know the cap was passed.
+            if (options.max_items) |m| {
+                const over: u32 = std.math.cast(u32, m +| 1) orelse std.math.maxInt(u32);
+                f.limit = if (filter.limit) |l| @min(l, over) else over;
+            }
+            var r = try self.query(gpa, f);
             defer r.deinit();
+            if (r.events.len > max) return error.TooManyItems;
             try out.ensureTotalCapacity(gpa, r.events.len);
             for (r.events) |ev| {
                 if (ev.created_at < 0) continue;
@@ -752,29 +767,41 @@ pub const Store = struct {
         const since = @max(filter.since orelse 0, 0);
         const until = filter.until orelse std.math.maxInt(i64);
         if (until < since) return out.toOwnedSlice(gpa);
-        const since_key = orderKey(since);
-        const until_key = orderKey(until);
+        const range: SyncRange = .{ .since_key = orderKey(since), .until_key = orderKey(until), .max = max };
 
         var txn: ?*c.MDB_txn = null;
         try check(c.mdb_txn_begin(self.env, null, @intCast(c.MDB_RDONLY), &txn));
         defer c.mdb_txn_abort(txn);
-        var cursor: ?*c.MDB_cursor = null;
-        try check(c.mdb_cursor_open(txn, self.idx_created_dbi, &cursor));
-        defer c.mdb_cursor_close(cursor);
 
-        // Keys are time-key ++ id, so a forward walk is already in
-        // (created_at, id) order.
-        var k = val(&since_key);
-        var v: c.MDB_val = undefined;
-        var rc = c.mdb_cursor_get(cursor, &k, &v, c.MDB_SET_RANGE);
-        while (rc == c.MDB_SUCCESS) : (rc = c.mdb_cursor_get(cursor, &k, &v, c.MDB_NEXT)) {
-            const key = valBytes(k);
-            if (key.len != 40) continue;
-            if (std.mem.order(u8, key[0..8], &until_key) == .gt) break;
-            const t: i64 = @bitCast(std.mem.readInt(u64, key[0..8], .big) ^ (@as(u64, 1) << 63));
-            try out.append(gpa, .{ .created_at = @intCast(t), .id = key[8..40].* });
+        // The same author or kind named twice would list its events twice.
+        const authors = try sortedUnique([32]u8, gpa, filter.authors orelse &.{});
+        defer gpa.free(authors);
+        const kinds = try sortedUnique(u16, gpa, filter.kinds orelse &.{});
+        defer gpa.free(kinds);
+
+        if (filter.authors == null and filter.kinds == null) {
+            // Keys are time-key ++ id, so a forward walk is already in
+            // (created_at, id) order.
+            try walkSyncRange(gpa, txn, self.idx_created_dbi, &.{}, range, &out);
+            return out.toOwnedSlice(gpa);
         }
-        if (rc != c.MDB_SUCCESS and rc != c.MDB_NOTFOUND) return error.Lmdb;
+        var prefix: [34]u8 = undefined;
+        if (filter.authors != null and filter.kinds != null) {
+            for (authors) |pk| for (kinds) |kind| {
+                prefix[0..32].* = pk;
+                std.mem.writeInt(u16, prefix[32..34], kind, .big);
+                try walkSyncRange(gpa, txn, self.idx_author_kind_dbi, &prefix, range, &out);
+            };
+        } else if (filter.authors != null) {
+            for (authors) |pk| try walkSyncRange(gpa, txn, self.idx_author_dbi, &pk, range, &out);
+        } else {
+            for (kinds) |kind| {
+                std.mem.writeInt(u16, prefix[0..2], kind, .big);
+                try walkSyncRange(gpa, txn, self.idx_kind_dbi, prefix[0..2], range, &out);
+            }
+        }
+        // One walk is in order already; several have to be merged.
+        std.mem.sort(SyncItem, out.items, {}, SyncItem.lessThan);
         return out.toOwnedSlice(gpa);
     }
 
@@ -1119,6 +1146,64 @@ pub const Store = struct {
 
 /// A stored event reduced to what NIP-77 negentropy reconciles: its
 /// `created_at` and its id. See `Store.syncItems`.
+pub const SyncOptions = struct {
+    /// Fail with `error.TooManyItems` once more than this many events match.
+    /// Null is no cap.
+    max_items: ?usize = null,
+};
+
+/// The time bounds and the cap of one `syncItems` walk.
+const SyncRange = struct {
+    since_key: [8]u8,
+    until_key: [8]u8,
+    max: usize,
+};
+
+/// Appends the `(created_at, id)` of every key in `dbi` that is `prefix`
+/// followed by a time key inside `range` and an id, reading only the keys.
+fn walkSyncRange(gpa: std.mem.Allocator, txn: ?*c.MDB_txn, dbi: c.MDB_dbi, prefix: []const u8, range: SyncRange, out: *std.ArrayList(SyncItem)) Error!void {
+    var cursor: ?*c.MDB_cursor = null;
+    try check(c.mdb_cursor_open(txn, dbi, &cursor));
+    defer c.mdb_cursor_close(cursor);
+
+    var start_buf: [34 + 8]u8 = undefined;
+    @memcpy(start_buf[0..prefix.len], prefix);
+    start_buf[prefix.len..][0..8].* = range.since_key;
+    var k = val(start_buf[0 .. prefix.len + 8]);
+    var v: c.MDB_val = undefined;
+    var rc = c.mdb_cursor_get(cursor, &k, &v, c.MDB_SET_RANGE);
+    while (rc == c.MDB_SUCCESS) : (rc = c.mdb_cursor_get(cursor, &k, &v, c.MDB_NEXT)) {
+        const key = valBytes(k);
+        if (!std.mem.startsWith(u8, key, prefix)) break;
+        const rest = key[prefix.len..];
+        if (rest.len != 40) continue;
+        if (std.mem.order(u8, rest[0..8], &range.until_key) == .gt) break;
+        if (out.items.len >= range.max) return error.TooManyItems;
+        const t: i64 = @bitCast(std.mem.readInt(u64, rest[0..8], .big) ^ (@as(u64, 1) << 63));
+        try out.append(gpa, .{ .created_at = @intCast(t), .id = rest[8..40].* });
+    }
+    if (rc != c.MDB_SUCCESS and rc != c.MDB_NOTFOUND) return error.Lmdb;
+}
+
+/// A sorted copy of `items` with duplicates removed. The caller frees it.
+fn sortedUnique(comptime T: type, gpa: std.mem.Allocator, items: []const T) Error![]T {
+    const copy = try gpa.dupe(T, items);
+    const less = struct {
+        fn f(_: void, a: T, b: T) bool {
+            return if (T == u16) a < b else std.mem.order(u8, &a, &b) == .lt;
+        }
+    }.f;
+    std.mem.sort(T, copy, {}, less);
+    var n: usize = 0;
+    for (copy) |item| {
+        if (n > 0 and std.meta.eql(copy[n - 1], item)) continue;
+        copy[n] = item;
+        n += 1;
+    }
+    if (n == copy.len) return copy;
+    return gpa.realloc(copy, n) catch copy[0..n];
+}
+
 pub const SyncItem = struct {
     created_at: u64,
     id: [32]u8,
@@ -3215,16 +3300,79 @@ test "store: syncItems lists (created_at, id) ascending for nip77" {
         // A filter with other constraints goes through query and is sorted.
         .{ .filter = .{ .kinds = &.{1} }, .want = &.{ s.item(100, 5), s.item(200, 9), s.item(300, 7) } },
         .{ .filter = .{ .authors = &.{author_b} }, .want = &.{ s.item(200, 3), s.item(300, 7) } },
+        // Several authors and kinds, named twice, are merged without repeats.
+        .{ .filter = .{ .authors = &.{ author_a, author_b, author_a } }, .want = &.{ s.item(100, 5), s.item(200, 3), s.item(200, 9), s.item(300, 7) } },
+        .{ .filter = .{ .authors = &.{ author_a, author_b }, .kinds = &.{ 1, 1 }, .since = 150 }, .want = &.{ s.item(200, 9), s.item(300, 7) } },
+        .{ .filter = .{ .kinds = &.{ 7, 1 }, .until = 200 }, .want = &.{ s.item(100, 5), s.item(200, 3), s.item(200, 9) } },
         // limit keeps the newest matches, still returned ascending.
         .{ .filter = .{ .limit = 2 }, .want = &.{ s.item(200, 9), s.item(300, 7) } },
     };
     for (cases) |case| {
-        const got = try store.syncItems(gpa, case.filter);
+        const got = try store.syncItems(gpa, case.filter, .{});
         defer gpa.free(got);
         try std.testing.expectEqual(case.want.len, got.len);
         for (case.want, got) |w, g| {
             try std.testing.expectEqual(w.created_at, g.created_at);
             try std.testing.expectEqualSlices(u8, &w.id, &g.id);
         }
+    }
+}
+
+test "store: syncItems stops at max_items instead of collecting everything" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var store = try openTempStore(&tmp, "sync-cap.mdb", &buf);
+    defer store.deinit();
+    const gpa = std.testing.allocator;
+    for (1..6) |i| {
+        const seed: u8 = @intCast(i);
+        _ = try store.putEvent(gpa, qEvent(seed, if (i % 2 == 0) author_a else author_b, 1, @as(i64, @intCast(i)) * 100, &.{}));
+    }
+    const filters = [_]Filter{
+        .{},
+        .{ .kinds = &.{1} },
+        .{ .authors = &.{ author_a, author_b } },
+        .{ .authors = &.{ author_a, author_b }, .kinds = &.{1} },
+        .{ .ids = &.{ [_]u8{1} ** 32, [_]u8{2} ** 32, [_]u8{3} ** 32, [_]u8{4} ** 32 } },
+    };
+    for (filters) |f| {
+        try std.testing.expectError(error.TooManyItems, store.syncItems(gpa, f, .{ .max_items = 3 }));
+        const all = try store.syncItems(gpa, f, .{ .max_items = 5 });
+        gpa.free(all);
+    }
+    // A limit under the cap keeps the set under it.
+    const capped = try store.syncItems(gpa, .{ .ids = &.{ [_]u8{1} ** 32, [_]u8{2} ** 32, [_]u8{3} ** 32, [_]u8{4} ** 32 }, .limit = 3 }, .{ .max_items = 3 });
+    defer gpa.free(capped);
+    try std.testing.expectEqual(@as(usize, 3), capped.len);
+}
+
+test "store: syncItems by author or kind reads index keys, not events" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var store = try openTempStore(&tmp, "sync-keys.mdb", &buf);
+    defer store.deinit();
+    const gpa = std.testing.allocator;
+    _ = try store.putEvent(gpa, qEvent(4, author_a, 1, 400, &.{}));
+
+    // Overwrite the record behind the indexes with bytes no decoder accepts.
+    // Anything that decodes it fails; a walk over the index keys does not.
+    {
+        var txn: ?*c.MDB_txn = null;
+        try check(c.mdb_txn_begin(store.env, null, 0, &txn));
+        errdefer c.mdb_txn_abort(txn);
+        const id = [_]u8{4} ** 32;
+        var k = val(&id);
+        var v = val("junk");
+        try check(c.mdb_put(txn, store.events_dbi, &k, &v, 0));
+        try check(c.mdb_txn_commit(txn));
+    }
+    const filters = [_]Filter{ .{ .kinds = &.{1} }, .{ .authors = &.{author_a} }, .{ .authors = &.{author_a}, .kinds = &.{1} } };
+    for (filters) |f| {
+        const got = try store.syncItems(gpa, f, .{});
+        defer gpa.free(got);
+        try std.testing.expectEqual(@as(usize, 1), got.len);
+        try std.testing.expectEqual(@as(u64, 400), got[0].created_at);
     }
 }
