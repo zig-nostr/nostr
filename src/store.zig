@@ -719,6 +719,65 @@ pub const Store = struct {
         return f;
     }
 
+    /// Every stored event matching `filter` as a `(created_at, id)` pair,
+    /// sorted by `created_at` ascending and then by id: the order NIP-77
+    /// negentropy reconciles over. The caller owns the returned slice.
+    ///
+    /// `limit` is honoured the way `query` honours it (the newest `limit`
+    /// matches). Events with a negative `created_at` are left out, since a
+    /// negentropy timestamp is unsigned.
+    ///
+    /// A filter that constrains nothing but `since` and `until` is answered
+    /// from the keys of the time index alone, in a single forward walk with no
+    /// event decoded. Any other filter goes through `query` and is sorted.
+    pub fn syncItems(self: *Store, gpa: std.mem.Allocator, filter: Filter) Error![]SyncItem {
+        var out: std.ArrayList(SyncItem) = .empty;
+        errdefer out.deinit(gpa);
+
+        const time_only = filter.ids == null and filter.authors == null and
+            filter.kinds == null and filter.tags == null and
+            filter.search == null and filter.limit == null;
+        if (!time_only) {
+            var r = try self.query(gpa, filter);
+            defer r.deinit();
+            try out.ensureTotalCapacity(gpa, r.events.len);
+            for (r.events) |ev| {
+                if (ev.created_at < 0) continue;
+                out.appendAssumeCapacity(.{ .created_at = @intCast(ev.created_at), .id = ev.id });
+            }
+            std.mem.sort(SyncItem, out.items, {}, SyncItem.lessThan);
+            return out.toOwnedSlice(gpa);
+        }
+
+        const since = @max(filter.since orelse 0, 0);
+        const until = filter.until orelse std.math.maxInt(i64);
+        if (until < since) return out.toOwnedSlice(gpa);
+        const since_key = orderKey(since);
+        const until_key = orderKey(until);
+
+        var txn: ?*c.MDB_txn = null;
+        try check(c.mdb_txn_begin(self.env, null, @intCast(c.MDB_RDONLY), &txn));
+        defer c.mdb_txn_abort(txn);
+        var cursor: ?*c.MDB_cursor = null;
+        try check(c.mdb_cursor_open(txn, self.idx_created_dbi, &cursor));
+        defer c.mdb_cursor_close(cursor);
+
+        // Keys are time-key ++ id, so a forward walk is already in
+        // (created_at, id) order.
+        var k = val(&since_key);
+        var v: c.MDB_val = undefined;
+        var rc = c.mdb_cursor_get(cursor, &k, &v, c.MDB_SET_RANGE);
+        while (rc == c.MDB_SUCCESS) : (rc = c.mdb_cursor_get(cursor, &k, &v, c.MDB_NEXT)) {
+            const key = valBytes(k);
+            if (key.len != 40) continue;
+            if (std.mem.order(u8, key[0..8], &until_key) == .gt) break;
+            const t: i64 = @bitCast(std.mem.readInt(u64, key[0..8], .big) ^ (@as(u64, 1) << 63));
+            try out.append(gpa, .{ .created_at = @intCast(t), .id = key[8..40].* });
+        }
+        if (rc != c.MDB_SUCCESS and rc != c.MDB_NOTFOUND) return error.Lmdb;
+        return out.toOwnedSlice(gpa);
+    }
+
     // -- Cache policy -------------------------------------------------------
 
     /// The number of events currently stored (O(1), from LMDB's statistics).
@@ -1002,6 +1061,19 @@ pub const Store = struct {
         var v = val(&ev.id);
         try check(c.mdb_put(txn, self.repl_dbi, &ck, &v, 0));
         return result;
+    }
+};
+
+/// A stored event reduced to what NIP-77 negentropy reconciles: its
+/// `created_at` and its id. See `Store.syncItems`.
+pub const SyncItem = struct {
+    created_at: u64,
+    id: [32]u8,
+
+    /// Orders by `created_at`, then by id bytes.
+    pub fn lessThan(_: void, a: SyncItem, b: SyncItem) bool {
+        if (a.created_at != b.created_at) return a.created_at < b.created_at;
+        return std.mem.order(u8, &a.id, &b.id) == .lt;
     }
 };
 
@@ -2970,6 +3042,51 @@ test "store: the heap merge picks in the same order as the linear scan" {
             fast_pos[g] += 1;
             fast[g] = if (fast_pos[g] < lists[g].len) lists[g][fast_pos[g]] else .{};
             heap.settleTop(fast);
+        }
+    }
+}
+
+test "store: syncItems lists (created_at, id) ascending for nip77" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var store = try openTempStore(&tmp, "sync.mdb", &buf);
+    defer store.deinit();
+
+    const gpa = std.testing.allocator;
+    // seed, author, kind, created_at
+    _ = try store.putEvent(gpa, qEvent(9, author_a, 1, 200, &.{}));
+    _ = try store.putEvent(gpa, qEvent(3, author_b, 7, 200, &.{}));
+    _ = try store.putEvent(gpa, qEvent(5, author_a, 1, 100, &.{}));
+    _ = try store.putEvent(gpa, qEvent(7, author_b, 1, 300, &.{}));
+    _ = try store.putEvent(gpa, qEvent(1, author_a, 1, -5, &.{}));
+
+    const Case = struct { filter: Filter, want: []const SyncItem };
+    const s = struct {
+        fn item(t: u64, seed: u8) SyncItem {
+            return .{ .created_at = t, .id = [_]u8{seed} ** 32 };
+        }
+    };
+    const cases = [_]Case{
+        // Everything, from the time index alone; the negative timestamp is dropped.
+        .{ .filter = .{}, .want = &.{ s.item(100, 5), s.item(200, 3), s.item(200, 9), s.item(300, 7) } },
+        // since/until are inclusive.
+        .{ .filter = .{ .since = 200, .until = 200 }, .want = &.{ s.item(200, 3), s.item(200, 9) } },
+        .{ .filter = .{ .since = 301 }, .want = &.{} },
+        .{ .filter = .{ .since = 300, .until = 100 }, .want = &.{} },
+        // A filter with other constraints goes through query and is sorted.
+        .{ .filter = .{ .kinds = &.{1} }, .want = &.{ s.item(100, 5), s.item(200, 9), s.item(300, 7) } },
+        .{ .filter = .{ .authors = &.{author_b} }, .want = &.{ s.item(200, 3), s.item(300, 7) } },
+        // limit keeps the newest matches, still returned ascending.
+        .{ .filter = .{ .limit = 2 }, .want = &.{ s.item(200, 9), s.item(300, 7) } },
+    };
+    for (cases) |case| {
+        const got = try store.syncItems(gpa, case.filter);
+        defer gpa.free(got);
+        try std.testing.expectEqual(case.want.len, got.len);
+        for (case.want, got) |w, g| {
+            try std.testing.expectEqual(w.created_at, g.created_at);
+            try std.testing.expectEqualSlices(u8, &w.id, &g.id);
         }
     }
 }
