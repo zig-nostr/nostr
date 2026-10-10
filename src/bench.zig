@@ -204,6 +204,10 @@ pub fn main() !void {
     };
     const by_id_best = try bestQuery(gpa, io, &store, by_id);
 
+    const parse_ns = try bestParse(io);
+    const pow_1 = try powRate(io, 1);
+    const pow_4 = try powRate(io, 4);
+
     std.debug.print(
         \\zig-nostr store benchmark
         \\  events ingested    : {d}
@@ -214,6 +218,8 @@ pub fn main() !void {
         \\  same feed by id    : {d} notes in {d:.1} us (best of {d}; {d} ids named, {d} entries examined)
         \\  warm timeline query: {d} events in {d:.1} us (best of {d}; 1 author, any kind)
         \\  warm profile query : {d} event in {d:.1} us (best of {d}; 1 author, kind 0, {d} entries examined)
+        \\  event.fromJson     : {d:.0} ns per event (best of {d} rounds of {d}; a note with 4 tags)
+        \\  nip13.mine         : {d} hashes/s on 1 thread, {d} hashes/s on 4
         \\
     , .{
         n,
@@ -241,7 +247,54 @@ pub fn main() !void {
         @as(f64, @floatFromInt(profile_best.ns)) / 1e3,
         query_reps,
         profile_best.examined,
+        @as(f64, @floatFromInt(parse_ns)) / @as(f64, @floatFromInt(parse_reps)),
+        parse_rounds,
+        parse_reps,
+        pow_1,
+        pow_4,
     });
+}
+
+const parse_rounds: usize = 5;
+const parse_reps: usize = 100_000;
+
+/// Times `event.fromJson` on one realistic note: a reply with `e`, `p` and `t`
+/// tags and a paragraph of content carrying an escape. It is the cost every
+/// event pays on its way in from a relay message held by a caller. Uses the
+/// general purpose allocator a client would, not the page allocator the store
+/// shapes above use, which would make every arena a fresh mapping.
+fn bestParse(io: std.Io) !u64 {
+    const gpa = std.heap.smp_allocator;
+    const tags = [_]nostr.event.Tag{
+        &[_][]const u8{ "e", "5c83da77af1dec6d7289834998ad7aafbd9e2191396d75ec3cc27f5a77226f36", "wss://relay.example.com", "root" },
+        &[_][]const u8{ "e", "d0a1d13aff1d1725d80305f74a3f8419674d726342773b06ddc6988cc5be3a40", "wss://relay.example.com", "reply" },
+        &[_][]const u8{ "p", "f7234bd4c1394dda46d09f35bd384dd30cc552ad5541990f98844fb06676e9ca" },
+        &[_][]const u8{ "t", "zig" },
+    };
+    const ev = Event{
+        .id = [_]u8{0x11} ** 32,
+        .pubkey = [_]u8{0x22} ** 32,
+        .created_at = 1_700_000_000,
+        .kind = 1,
+        .tags = &tags,
+        .content = "A reply long enough to look like one. It quotes \"something\" and runs on for a sentence or two more, about the length of a typical note on the network today.",
+        .sig = [_]u8{0x33} ** 64,
+    };
+    const text = try nostr.event.toJson(gpa, ev);
+    defer gpa.free(text);
+
+    var best: u64 = std.math.maxInt(u64);
+    for (0..parse_rounds) |_| {
+        const start = std.Io.Timestamp.now(io, .awake);
+        for (0..parse_reps) |_| {
+            var parsed = try nostr.event.fromJson(gpa, text);
+            std.mem.doNotOptimizeAway(parsed.value.content.ptr);
+            parsed.deinit();
+        }
+        const dt: u64 = @intCast(std.Io.Timestamp.now(io, .awake).nanoseconds - start.nanoseconds);
+        best = @min(best, dt);
+    }
+    return best;
 }
 
 /// Runs `f` once to warm the mmap/page cache, then `query_reps` times,
@@ -273,4 +326,22 @@ fn bestQuery(
         if (dt < best_ns) best_ns = dt;
     }
     return .{ .ns = best_ns, .notes = notes, .examined = examined };
+}
+
+/// NIP-13 hash rate: mines for half a second at a target nobody reaches and
+/// counts the attempts.
+fn powRate(io: std.Io, threads: u32) !u64 {
+    var count: std.atomic.Value(u64) = .init(0);
+    const t0 = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+    if (nostr.nip13.mine(std.heap.smp_allocator, io, .{
+        .pubkey = @splat(3),
+        .created_at = 1,
+        .kind = 1,
+        .content = "bench",
+    }, .{ .target = 200, .threads = threads, .timeout_ms = 500, .attempts = &count })) |mined| {
+        _ = mined;
+        return error.Unexpected;
+    } else |err| if (err != error.Timeout) return err;
+    const ms: u64 = @intCast(@max(1, std.Io.Timestamp.now(io, .awake).toMilliseconds() - t0));
+    return count.load(.monotonic) * 1000 / ms;
 }

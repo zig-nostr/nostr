@@ -104,6 +104,10 @@ pub const ConnectionError = error{
     /// opcode, or a continuation with no started message).
     UnexpectedFrame,
     RandomFailed,
+    /// A bounded write gave up partway through a frame, so the stream holds
+    /// part of one and nothing written after it can be read by the relay.
+    /// Every later write fails with this. Close the connection and dial again.
+    Broken,
 };
 
 /// A websocket connection to a relay over `Stream`. `Stream` must provide:
@@ -160,6 +164,9 @@ pub fn Connection(comptime Stream: type) type {
         /// when the relay is busy, 401 or 403 when it wants something first,
         /// 429 when it is rate limiting.
         handshake_status: u16,
+        /// Set when a bounded write gave up after it may have written part of
+        /// a frame. See `ConnectionError.Broken`.
+        broken: std.atomic.Value(bool),
 
         pub fn init(allocator: std.mem.Allocator, io: std.Io, stream: Stream) Self {
             return .{
@@ -172,6 +179,7 @@ pub fn Connection(comptime Stream: type) type {
                 .last_rx_ms = .init(0),
                 .unreadable = 0,
                 .handshake_status = 0,
+                .broken = .init(false),
             };
         }
 
@@ -220,6 +228,32 @@ pub fn Connection(comptime Stream: type) type {
             try self.sendText(text);
         }
 
+        /// `publish` that gives up at `timeout` and returns `error.Timeout`.
+        ///
+        /// A relay that has stopped reading fills the socket, and a write into
+        /// a full socket waits for room that never comes. `publish` waits with
+        /// it, holding the write lock, so every other write on the connection
+        /// waits too. This one runs the write as a task of its own with
+        /// `io.concurrent`, waits for it until the deadline, and cancels it
+        /// when the deadline passes, so it needs an `io` that can run a task
+        /// concurrently (`std.Io.Threaded` can).
+        ///
+        /// What a timeout leaves behind depends on how far the write got. If
+        /// it was still waiting for another write to finish, nothing was sent
+        /// and the connection is as it was. If it had started, the relay may
+        /// hold part of a frame, so the connection is marked broken and every
+        /// later write fails with `error.Broken`: close it and dial again. A
+        /// relay that did not drain a frame before the deadline is usually gone
+        /// anyway.
+        ///
+        /// Cancelling the caller cancels the write the same way and returns
+        /// `error.Canceled`.
+        pub fn publishTimeout(self: *Self, ev: Event, timeout: std.Io.Timeout) !void {
+            const text = try message.encodeEvent(self.allocator, ev);
+            defer self.allocator.free(text);
+            try self.sendFrameTimeout(.text, text, timeout);
+        }
+
         /// Opens a subscription: sends `["REQ", <id>, <filters>...]`.
         pub fn subscribe(self: *Self, subscription_id: []const u8, filters: []const Filter) !void {
             const text = try message.encodeReq(self.allocator, subscription_id, filters);
@@ -230,6 +264,38 @@ pub fn Connection(comptime Stream: type) type {
         /// Cancels a subscription: sends `["CLOSE", <id>]`.
         pub fn unsubscribe(self: *Self, subscription_id: []const u8) !void {
             const text = try message.encodeClose(self.allocator, subscription_id);
+            defer self.allocator.free(text);
+            try self.sendText(text);
+        }
+
+        /// Asks how many events match (NIP-45): sends
+        /// `["COUNT", <id>, <filters>...]`. The relay answers with a `count`
+        /// message for the same id.
+        pub fn count(self: *Self, subscription_id: []const u8, filters: []const Filter) !void {
+            const text = try message.encodeCount(self.allocator, subscription_id, filters);
+            defer self.allocator.free(text);
+            try self.sendText(text);
+        }
+
+        /// Opens a negentropy session (NIP-77): sends
+        /// `["NEG-OPEN", <id>, <filter>, <initial_hex>]`. `initial_hex` is the
+        /// hex of the first message, as `nip77.Initiator` produces it.
+        pub fn negOpen(self: *Self, subscription_id: []const u8, filter: Filter, initial_hex: []const u8) !void {
+            const text = try message.encodeNegOpen(self.allocator, subscription_id, filter, initial_hex);
+            defer self.allocator.free(text);
+            try self.sendText(text);
+        }
+
+        /// Continues a negentropy session: sends `["NEG-MSG", <id>, <hex>]`.
+        pub fn negMsg(self: *Self, subscription_id: []const u8, msg_hex: []const u8) !void {
+            const text = try message.encodeNegMsg(self.allocator, subscription_id, msg_hex);
+            defer self.allocator.free(text);
+            try self.sendText(text);
+        }
+
+        /// Ends a negentropy session: sends `["NEG-CLOSE", <id>]`.
+        pub fn negClose(self: *Self, subscription_id: []const u8) !void {
+            const text = try message.encodeNegClose(self.allocator, subscription_id);
             defer self.allocator.free(text);
             try self.sendText(text);
         }
@@ -415,7 +481,64 @@ pub fn Connection(comptime Stream: type) type {
             // anyway.
             self.write_lock.lockUncancelable(io);
             defer self.write_lock.unlock(io);
+            if (self.broken.load(.acquire)) return ConnectionError.Broken;
             try self.stream.writeAll(frame.items);
+        }
+
+        const WriteOutcome = enum { written, failed, broken, canceled };
+
+        /// `sendFrame` bounded by `timeout`: the write runs as its own task,
+        /// and the caller waits for it until the deadline and cancels it after.
+        /// A cancel is never swallowed: the caller's comes back as
+        /// `error.Canceled`, and the task's own ends the write it was in.
+        fn sendFrameTimeout(self: *Self, opcode: websocket.Opcode, payload: []const u8, timeout: std.Io.Timeout) !void {
+            const io = self.io;
+            const deadline = timeout.toTimestamp(io) orelse return self.sendFrame(io, opcode, payload);
+            var frame: std.ArrayList(u8) = .empty;
+            defer frame.deinit(self.allocator);
+            try self.buildFrame(io, &frame, opcode, payload);
+
+            var done: std.atomic.Value(u32) = .init(0);
+            var task = try io.concurrent(writeFrameTask, .{ self, frame.items, &done });
+            while (done.load(.acquire) == 0) {
+                io.futexWaitTimeout(u32, &done.raw, 0, .{ .deadline = deadline }) catch |err| {
+                    _ = task.cancel(io);
+                    return err;
+                };
+                if (done.load(.acquire) == 0 and self.passed(deadline)) {
+                    return switch (task.cancel(io)) {
+                        // Finished in the moment between the check and the cancel.
+                        .written => {},
+                        .broken => ConnectionError.Broken,
+                        .failed, .canceled => error.Timeout,
+                    };
+                }
+            }
+            return switch (task.await(io)) {
+                .written => {},
+                .broken => ConnectionError.Broken,
+                .failed, .canceled => error.WriteFailed,
+            };
+        }
+
+        /// The write `sendFrameTimeout` runs as a task. Takes the lock in a way
+        /// a cancel can end, so a write queued behind a stuck one can be given
+        /// up without having sent anything. Once it has started writing, any
+        /// failure, a cancel included, may have left part of the frame on the
+        /// wire, so it marks the connection broken.
+        fn writeFrameTask(self: *Self, frame: []const u8, done: *std.atomic.Value(u32)) WriteOutcome {
+            defer {
+                done.store(1, .release);
+                self.io.futexWake(u32, &done.raw, 1);
+            }
+            self.write_lock.lock(self.io) catch return .canceled;
+            defer self.write_lock.unlock(self.io);
+            if (self.broken.load(.acquire)) return .broken;
+            self.stream.writeAll(frame) catch {
+                self.broken.store(true, .release);
+                return .failed;
+            };
+            return .written;
         }
 
         fn buildFrame(self: *Self, io: std.Io, frame: *std.ArrayList(u8), opcode: websocket.Opcode, payload: []const u8) !void {
@@ -441,6 +564,7 @@ pub fn Connection(comptime Stream: type) type {
             try self.buildFrame(self.io, &frame, .pong, payload);
             if (!self.write_lock.tryLock()) return;
             defer self.write_lock.unlock(self.io);
+            if (self.broken.load(.acquire)) return;
             const StreamType = switch (@typeInfo(Stream)) {
                 .pointer => |ptr| ptr.child,
                 else => Stream,
@@ -760,6 +884,10 @@ pub const Relay = struct {
     pub fn publish(self: *Relay, ev: Event) !void {
         return self.conn.publish(ev);
     }
+    /// `publish` with a deadline. See `Connection.publishTimeout`.
+    pub fn publishTimeout(self: *Relay, ev: Event, timeout: std.Io.Timeout) !void {
+        return self.conn.publishTimeout(ev, timeout);
+    }
     pub fn subscribe(self: *Relay, subscription_id: []const u8, filters: []const Filter) !void {
         return self.conn.subscribe(subscription_id, filters);
     }
@@ -768,6 +896,18 @@ pub const Relay = struct {
     }
     pub fn authenticate(self: *Relay, ev: Event) !void {
         return self.conn.authenticate(ev);
+    }
+    pub fn count(self: *Relay, subscription_id: []const u8, filters: []const Filter) !void {
+        return self.conn.count(subscription_id, filters);
+    }
+    pub fn negOpen(self: *Relay, subscription_id: []const u8, filter: Filter, initial_hex: []const u8) !void {
+        return self.conn.negOpen(subscription_id, filter, initial_hex);
+    }
+    pub fn negMsg(self: *Relay, subscription_id: []const u8, msg_hex: []const u8) !void {
+        return self.conn.negMsg(subscription_id, msg_hex);
+    }
+    pub fn negClose(self: *Relay, subscription_id: []const u8) !void {
+        return self.conn.negClose(subscription_id);
     }
     pub fn receive(self: *Relay) !?message.ParsedRelayMessage {
         return self.conn.receive();
@@ -1245,6 +1385,43 @@ test "publish/subscribe/unsubscribe write correct client frames" {
         defer allocator.free(text);
         try std.testing.expectEqualStrings("[\"CLOSE\",\"s1\"]", text);
     }
+}
+
+test "count and the negentropy frames go out as one masked text frame each" {
+    const allocator = std.testing.allocator;
+    var written: std.ArrayList(u8) = .empty;
+    defer written.deinit(allocator);
+    var server = FakeStream{ .to_read = "", .written = &written, .allocator = allocator };
+    var conn = newConn(allocator, &server);
+    defer conn.deinit();
+
+    const cases = .{
+        .{ "[\"COUNT\",\"c1\",{\"kinds\":[1]}]", "count" },
+        .{ "[\"NEG-OPEN\",\"n1\",{\"kinds\":[1]},\"6100\"]", "negOpen" },
+        .{ "[\"NEG-MSG\",\"n1\",\"6101\"]", "negMsg" },
+        .{ "[\"NEG-CLOSE\",\"n1\"]", "negClose" },
+    };
+    inline for (cases) |case| {
+        written.clearRetainingCapacity();
+        const kinds = [_]u16{1};
+        if (comptime std.mem.eql(u8, case[1], "count")) {
+            try conn.count("c1", &.{.{ .kinds = &kinds }});
+        } else if (comptime std.mem.eql(u8, case[1], "negOpen")) {
+            try conn.negOpen("n1", .{ .kinds = &kinds }, "6100");
+        } else if (comptime std.mem.eql(u8, case[1], "negMsg")) {
+            try conn.negMsg("n1", "6101");
+        } else {
+            try conn.negClose("n1");
+        }
+        const text = try onlyWrittenText(allocator, written.items);
+        defer allocator.free(text);
+        try std.testing.expectEqualStrings(case[0], text);
+    }
+
+    // They share the write path, so a broken connection refuses them too.
+    conn.broken.store(true, .release);
+    try std.testing.expectError(ConnectionError.Broken, conn.count("c2", &.{.{}}));
+    try std.testing.expectError(ConnectionError.Broken, conn.negClose("n1"));
 }
 
 fn newConn(
@@ -2067,4 +2244,136 @@ fn unstickAfter(io: std.Io, served: std.Io.net.Stream, stuck: *std.atomic.Value(
     try io.sleep(.fromMilliseconds(3000), .awake);
     stuck.store(true, .release);
     served.shutdown(io, .both) catch {};
+}
+
+/// A client connection over loopback whose other end accepts and never reads.
+const DeafPeer = struct {
+    server: std.Io.net.Server,
+    client: std.Io.net.Stream,
+    served: std.Io.net.Stream,
+    read_buf: [4096]u8,
+    write_buf: [4096]u8,
+    reader: std.Io.net.Stream.Reader,
+    writer: std.Io.net.Stream.Writer,
+
+    fn init(self: *DeafPeer, io: std.Io) !void {
+        var listen_address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+        self.server = try listen_address.listen(io, .{ .reuse_address = true });
+        errdefer self.server.deinit(io);
+        var bound = self.server.socket.address;
+        self.client = try bound.connect(io, .{ .mode = .stream });
+        errdefer self.client.close(io);
+        self.served = try self.server.accept(io);
+        self.reader = self.client.reader(io, &self.read_buf);
+        self.writer = self.client.writer(io, &self.write_buf);
+    }
+
+    fn connection(self: *DeafPeer, allocator: std.mem.Allocator, io: std.Io) LiveConnection {
+        return LiveConnection.init(allocator, io, .{
+            .reader = &self.reader.interface,
+            .writer = &self.writer.interface,
+            .io = io,
+            .socket = self.client.socket,
+        });
+    }
+
+    fn deinit(self: *DeafPeer, io: std.Io) void {
+        self.served.close(io);
+        self.client.close(io);
+        self.server.deinit(io);
+    }
+};
+
+/// An event far larger than a loopback socket's buffers, so writing it to a
+/// peer that does not read can never finish.
+fn hugeEvent(allocator: std.mem.Allocator) !struct { ev: Event, content: []u8 } {
+    const content = try allocator.alloc(u8, 32 << 20);
+    @memset(content, 'a');
+    return .{ .content = content, .ev = .{
+        .id = [_]u8{1} ** 32,
+        .pubkey = [_]u8{2} ** 32,
+        .created_at = 1,
+        .kind = 1,
+        .tags = &.{},
+        .content = content,
+        .sig = [_]u8{3} ** 64,
+    } };
+}
+
+const small_event: Event = .{
+    .id = [_]u8{1} ** 32,
+    .pubkey = [_]u8{2} ** 32,
+    .created_at = 1,
+    .kind = 1,
+    .tags = &.{},
+    .content = "small",
+    .sig = [_]u8{3} ** 64,
+};
+
+test "a publish to a peer that stopped reading gives up at its deadline" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var peer: DeafPeer = undefined;
+    try peer.init(io);
+    defer peer.deinit(io);
+    var conn = peer.connection(allocator, io);
+    defer conn.deinit();
+
+    const huge = try hugeEvent(allocator);
+    defer allocator.free(huge.content);
+
+    const started = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+    try std.testing.expectError(error.Timeout, conn.publishTimeout(huge.ev, .{ .duration = .{ .raw = .fromMilliseconds(300), .clock = .awake } }));
+    const waited = std.Io.Timestamp.now(io, .awake).toMilliseconds() - started;
+    try std.testing.expect(waited >= 250);
+    try std.testing.expect(waited < 3000);
+
+    // Part of that frame is on the wire, so nothing after it can be read by
+    // the relay, and every later write says so instead of sending garbage.
+    try std.testing.expectError(ConnectionError.Broken, conn.publish(small_event));
+    try std.testing.expectError(ConnectionError.Broken, conn.publishTimeout(small_event, .{ .duration = .{ .raw = .fromMilliseconds(300), .clock = .awake } }));
+}
+
+test "a publish waiting behind another write times out and sends nothing" {
+    const allocator = std.testing.allocator;
+    var written: std.ArrayList(u8) = .empty;
+    defer written.deinit(allocator);
+    var server = FakeStream{ .to_read = "", .written = &written, .allocator = allocator };
+    var conn = newConn(allocator, &server);
+    defer conn.deinit();
+
+    // Another writer holds the lock and is not letting go.
+    try std.testing.expect(conn.write_lock.tryLock());
+    try std.testing.expectError(error.Timeout, conn.publishTimeout(small_event, .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } }));
+    conn.write_lock.unlock(std.testing.io);
+    try std.testing.expectEqual(@as(usize, 0), written.items.len);
+
+    // Nothing was sent, so the connection is as it was.
+    try conn.publishTimeout(small_event, .{ .duration = .{ .raw = .fromMilliseconds(5000), .clock = .awake } });
+    const text = try onlyWrittenText(allocator, written.items);
+    defer allocator.free(text);
+    try std.testing.expect(std.mem.startsWith(u8, text, "[\"EVENT\","));
+}
+
+test "a bounded publish stuck on a deaf peer ends when its caller is cancelled" {
+    // Without stack traces, for the reason in the cancelled dial's test.
+    var debug: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    defer if (debug.deinit() == .leak) @panic("the cancelled publish leaked");
+    const allocator = debug.allocator();
+    const io = std.testing.io;
+    var peer: DeafPeer = undefined;
+    try peer.init(io);
+    defer peer.deinit(io);
+    var conn = peer.connection(allocator, io);
+    defer conn.deinit();
+
+    const huge = try hugeEvent(allocator);
+    defer allocator.free(huge.content);
+
+    var pending = try io.concurrent(LiveConnection.publishTimeout, .{ &conn, huge.ev, .{ .duration = .{ .raw = .fromMilliseconds(60_000), .clock = .awake } } });
+    try io.sleep(.fromMilliseconds(200), .awake);
+    const started = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+    try std.testing.expectError(error.Canceled, pending.cancel(io));
+    const waited = std.Io.Timestamp.now(io, .awake).toMilliseconds() - started;
+    try std.testing.expect(waited < 2000);
 }

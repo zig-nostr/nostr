@@ -100,6 +100,8 @@ Giving up is `Relay.shutdown`, which half-closes the socket so a blocked `receiv
 
 A reader that wants to come up for air without being torn down uses `receiveTimeout`. The `std.Io.Timeout` is turned into an absolute deadline once, and the wait is a readiness check that reads nothing, so when it returns `error.Timeout` the socket, the buffers and any TLS record state are exactly as they were and the call can be repeated. `Timeout` is a different value from `null`, which means the relay is gone. When a deadline is set, a pong is skipped if another write holds the lock or the socket has no room, so a peer that stopped reading cannot wedge the connection. A reader started with `io.concurrent` can also be cancelled, in the wait or between waits: the read fails with `error.ReadFailed` and the reader should return rather than ask again.
 
+A write can be bounded the same way from the inside. `publishTimeout` runs the write as a task of its own with `io.concurrent`, waits for it until the deadline and cancels it after. Given up while it was still waiting for the lock, it sent nothing. Given up once it had started, the relay may hold part of a frame, so the connection is marked broken and every later write fails with `error.Broken`.
+
 `dial` has no deadline of its own. To bound it, start it with `io.concurrent` and cancel it: a cancelled dial stops where it is and frees what it allocated. The name lookup is the one step a cancel cannot cut short: on POSIX it is a libc call, and on Windows std waits for the OS query to finish before it reports the cancel.
 
 Shared signer state is small and locked. `SeenRequests` (replay defence) and the authorized-clients record are shared across the reader threads of every relay a signer serves, behind short spin locks.

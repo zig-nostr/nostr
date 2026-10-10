@@ -417,6 +417,8 @@ pub const max_filters = 64;
 pub const max_subscription_id_len = 64;
 
 /// The longest negentropy hex payload accepted, in hex characters.
+/// `nip77.default_frame_size_limit` is held below half of this at compile
+/// time, so a peer on default options never sends more.
 pub const max_neg_hex_len = 1 << 20;
 
 /// A message received from a client.
@@ -453,7 +455,8 @@ pub const ParsedClientMessage = struct {
 /// Parses one client message. The returned value owns an arena backing its
 /// borrowed fields; call `deinit` to free it. Subscription ids must be 1 to 64
 /// bytes, filters must carry full-length hex ids and pubkeys, and a `REQ`
-/// or `COUNT` may carry at most `max_filters` filters. Unknown filter keys
+/// or `COUNT` carries 1 to `max_filters` filters. A `limit` above `u32` is
+/// read as the largest `u32`. Unknown filter keys
 /// are skipped, as NIP-01 asks of a relay.
 pub fn parseClientMessage(gpa: std.mem.Allocator, json_text: []const u8) Error!ParsedClientMessage {
     const arena = try gpa.create(std.heap.ArenaAllocator);
@@ -523,7 +526,7 @@ fn eventFromValue(allocator: std.mem.Allocator, v: std.json.Value) Error!Event {
 }
 
 fn filtersFromValues(allocator: std.mem.Allocator, vals: []const std.json.Value) Error![]const Filter {
-    if (vals.len > max_filters) return Error.InvalidMessage;
+    if (vals.len == 0 or vals.len > max_filters) return Error.InvalidMessage;
     const out = try allocator.alloc(Filter, vals.len);
     for (vals, out) |v, *f| f.* = try filterFromValue(allocator, v);
     return out;
@@ -561,7 +564,8 @@ fn filterFromValue(allocator: std.mem.Allocator, v: std.json.Value) Error!Filter
             f.until = asInt(val) orelse return Error.InvalidMessage;
         } else if (std.mem.eql(u8, key, "limit")) {
             const n = asUint(val) orelse return Error.InvalidMessage;
-            f.limit = std.math.cast(u32, n) orelse return Error.InvalidMessage;
+            // Past u32 is still just "as many as you have".
+            f.limit = std.math.cast(u32, n) orelse std.math.maxInt(u32);
         } else if (std.mem.eql(u8, key, "search")) {
             f.search = asString(val) orelse return Error.InvalidMessage;
         } else if (key.len == 2 and key[0] == '#') {
@@ -1064,13 +1068,6 @@ test "parseClientMessage round trips EVENT, REQ, CLOSE and AUTH" {
         try expectSameFilter(filters[1], p.value.req.filters[1]);
     }
     {
-        const s = try encodeReq(allocator, "r", &[_]Filter{});
-        defer allocator.free(s);
-        var p = try parseClientMessage(allocator, s);
-        defer p.deinit();
-        try std.testing.expectEqual(@as(usize, 0), p.value.req.filters.len);
-    }
-    {
         const s = try encodeClose(allocator, "r");
         defer allocator.free(s);
         var p = try parseClientMessage(allocator, s);
@@ -1131,7 +1128,6 @@ test "parseClientMessage rejects malformed input" {
         "[\"REQ\",\"a\",{\"kinds\":[-1]}]",
         "[\"REQ\",\"a\",{\"kinds\":[1.5]}]",
         "[\"REQ\",\"a\",{\"kinds\":1}]",
-        "[\"REQ\",\"a\",{\"limit\":4294967296}]",
         "[\"REQ\",\"a\",{\"limit\":-1}]",
         "[\"REQ\",\"a\",{\"since\":\"1\"}]",
         "[\"REQ\",\"a\",{\"until\":1.5}]",
@@ -1187,4 +1183,18 @@ test "running out of memory while parsing a client message is reported as that" 
         }
     }.run;
     try std.testing.checkAllAllocationFailures(std.testing.allocator, f, .{@as([]const u8, text)});
+}
+
+test "a REQ or COUNT with no filter is refused, and a limit past u32 is clamped" {
+    const a = std.testing.allocator;
+    // A REQ with nothing to match is not a subscription: NIP-01 gives it at
+    // least one filter, and a relay that took it would have to guess.
+    try std.testing.expectError(Error.InvalidMessage, parseClientMessage(a, "[\"REQ\",\"s\"]"));
+    try std.testing.expectError(Error.InvalidMessage, parseClientMessage(a, "[\"COUNT\",\"s\"]"));
+
+    // A limit larger than anything a relay would return is a large limit, not
+    // a broken message.
+    var p = try parseClientMessage(a, "[\"REQ\",\"s\",{\"limit\":5000000000}]");
+    defer p.deinit();
+    try std.testing.expectEqual(@as(?u32, std.math.maxInt(u32)), p.value.req.filters[0].limit);
 }

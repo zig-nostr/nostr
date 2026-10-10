@@ -63,6 +63,9 @@ pub const max_pending = 32;
 /// How many relays one client can be attached to.
 pub const max_relays = 16;
 
+/// The default deadline on publishing a request to one relay, in milliseconds.
+pub const default_publish_timeout_ms: u32 = 5_000;
+
 /// The default deadline on a request, in milliseconds. A signer may be waiting
 /// on a person to approve, so this is generous.
 pub const default_timeout_ms: u32 = 30_000;
@@ -102,6 +105,10 @@ pub const Error = error{
 /// (to log in, or approve) before it answers request `request_id`. Called on
 /// the reader's thread, once per request, and must not block for long. The
 /// request keeps waiting meanwhile, under its original deadline.
+///
+/// `url` is whatever the signer wrote. Open it only if it is an `https://`
+/// URL, and show the user where it goes: any other scheme can launch a local
+/// handler with arguments the signer chose.
 pub const AuthUrlHandler = struct {
     context: ?*anyopaque = null,
     onAuthUrl: *const fn (context: ?*anyopaque, request_id: []const u8, url: []const u8) void,
@@ -110,6 +117,11 @@ pub const AuthUrlHandler = struct {
 pub const Options = struct {
     /// The deadline on each request, and on `awaitNostrConnect`.
     timeout_ms: u32 = default_timeout_ms,
+    /// The deadline on publishing a request to one relay, when `Conn` has
+    /// `publishTimeout` (`relay.Relay` and `relay.Connection` do). A relay
+    /// that has stopped reading then costs a request this long and no more
+    /// before the next relay gets it.
+    publish_timeout_ms: u32 = default_publish_timeout_ms,
     on_auth_url: ?AuthUrlHandler = null,
     /// A client key to reuse, so a signer that already knows this client does
     /// not have to approve it again. Null makes a fresh one.
@@ -150,6 +162,10 @@ pub const Reply = struct {
     }
 };
 
+fn isCanceled(err: anyerror) bool {
+    return err == error.Canceled;
+}
+
 /// A client over connections of type `Conn`: a pointer to a `relay.Relay` in
 /// production, or to an in-memory `relay.Connection` in tests. `Conn` must
 /// have `subscribe`, `publish`, `receive` and `authenticate`, which both do.
@@ -175,6 +191,7 @@ pub fn Client(comptime Conn: type) type {
         /// the signer to (nostrconnect). Owned.
         relays: [][]u8,
         timeout_ms: u32,
+        publish_timeout_ms: u32,
         on_auth_url: ?AuthUrlHandler,
 
         /// Guards everything below.
@@ -276,6 +293,7 @@ pub fn Client(comptime Conn: type) type {
                 .perms = null,
                 .relays = &.{},
                 .timeout_ms = options.timeout_ms,
+                .publish_timeout_ms = options.publish_timeout_ms,
                 .on_auth_url = options.on_auth_url,
                 .remote = null,
                 .id_prefix = std.fmt.bytesToHex(prefix_raw, .lower),
@@ -429,7 +447,9 @@ pub fn Client(comptime Conn: type) type {
 
             if (remote == null) return self.adopt(ev.pubkey, reply);
 
-            if (std.mem.eql(u8, reply.result, "auth_url")) return self.tellAuthUrl(reply);
+            // An auth_url challenge carries the URL in `error`. A result of
+            // "auth_url" with no error is an answer like any other.
+            if (std.mem.eql(u8, reply.result, "auth_url") and reply.err.len != 0) return self.tellAuthUrl(reply);
 
             self.lock.lockUncancelable(self.io);
             defer self.lock.unlock(self.io);
@@ -510,7 +530,12 @@ pub fn Client(comptime Conn: type) type {
             // signer may be listening on any of them.
             var sent: usize = 0;
             for (conns[0..count]) |conn| {
-                conn.publish(sealed.event) catch continue;
+                self.publishOne(conn, sealed.event) catch |err| {
+                    // One relay failing is the next relay's turn. A cancel is
+                    // the caller's, and ends the request.
+                    if (isCanceled(err)) return error.Canceled;
+                    continue;
+                };
                 sent += 1;
             }
             if (sent == 0) return Error.PublishFailed;
@@ -523,6 +548,27 @@ pub fn Client(comptime Conn: type) type {
             slot.result = null;
             slot.err = null;
             return reply;
+        }
+
+        /// Publishes to one relay, bounded by `publish_timeout_ms` when the
+        /// connection can bound a write.
+        fn publishOne(self: *Self, conn: Conn, ev: event.Event) !void {
+            const Target = switch (@typeInfo(Conn)) {
+                .pointer => |ptr| ptr.child,
+                else => Conn,
+            };
+            if (comptime @hasDecl(Target, "publishTimeout")) {
+                return conn.publishTimeout(ev, .{ .duration = .{
+                    .raw = .fromMilliseconds(self.publish_timeout_ms),
+                    .clock = .awake,
+                } }) catch |err| {
+                    // An io that cannot run the write as a task of its own
+                    // still gets the request out, unbounded, as before.
+                    if (@as(anyerror, err) == error.ConcurrencyUnavailable) return conn.publish(ev);
+                    return err;
+                };
+            }
+            return conn.publish(ev);
         }
 
         fn claimSlot(self: *Self) Error!usize {
@@ -751,6 +797,7 @@ const relay = @import("relay.zig");
 const signer_mod = @import("signer.zig");
 const websocket = @import("websocket.zig");
 const nip44 = @import("nip44.zig");
+const nip04 = @import("nip04.zig");
 
 test "nip46_client: compiles against a live relay" {
     std.testing.refAllDecls(Client(*relay.Relay));
@@ -1049,9 +1096,27 @@ test "nip46_client: nip44 encrypt and decrypt round trip through the signer" {
     const back = try f.client.?.nip44Decrypt(peer.public_key, ciphertext);
     defer testing.allocator.free(back);
     try testing.expectEqualStrings("for your eyes", back);
+}
 
-    // nip04 goes out the same way; this bunker does not speak it.
-    try testing.expectError(Error.Rejected, f.client.?.nip04Encrypt(peer.public_key, "x"));
+test "nip46_client: nip04 encrypt and decrypt round trip through the signer" {
+    var f: Fixture = undefined;
+    try f.init(testing.allocator, testing.io, null, null, .{ .timeout_ms = 5000 });
+    defer f.deinit();
+    try f.client.?.connect();
+
+    const peer = try testKeyPair(f.ctx, 12);
+    const ciphertext = try f.client.?.nip04Encrypt(peer.public_key, "an old style message");
+    defer testing.allocator.free(ciphertext);
+
+    const opened = try nip04.decrypt(testing.allocator, f.ctx, peer.secret_key, f.user.public_key, ciphertext);
+    defer testing.allocator.free(opened);
+    try testing.expectEqualStrings("an old style message", opened);
+
+    const back = try f.client.?.nip04Decrypt(peer.public_key, ciphertext);
+    defer testing.allocator.free(back);
+    try testing.expectEqualStrings("an old style message", back);
+
+    try testing.expectError(Error.Rejected, f.client.?.nip04Decrypt(peer.public_key, "not a payload"));
 }
 
 test "nip46_client: a request nobody answers times out instead of hanging" {
@@ -1334,4 +1399,126 @@ test "nip46_client: one request over two relays is answered once" {
     try serving_b.await(io);
     try reading_a.await(io);
     try reading_b.await(io);
+}
+
+/// A connection that only takes publishes, failing them the way it is told.
+const ScriptedConn = struct {
+    fail_with: ?anyerror = null,
+    publishes: usize = 0,
+    /// The last event published, as JSON, when `keep` is set. Freed by the test.
+    keep: ?std.mem.Allocator = null,
+    last_json: ?[]u8 = null,
+    published: std.atomic.Value(bool) = .init(false),
+
+    pub fn subscribe(_: *ScriptedConn, _: []const u8, _: []const filter.Filter) !void {}
+    pub fn publish(self: *ScriptedConn, ev: event.Event) !void {
+        self.publishes += 1;
+        if (self.fail_with) |e| return e;
+        if (self.keep) |gpa| {
+            self.last_json = try event.toJson(gpa, ev);
+            self.published.store(true, .release);
+        }
+    }
+};
+
+/// The same, with a bounded publish that reports a relay that never drained.
+const StalledConn = struct {
+    timeout_seen_ms: ?i64 = null,
+
+    pub fn subscribe(_: *StalledConn, _: []const u8, _: []const filter.Filter) !void {}
+    pub fn publish(_: *StalledConn, _: event.Event) !void {
+        return error.Unexpected;
+    }
+    pub fn publishTimeout(self: *StalledConn, _: event.Event, timeout: std.Io.Timeout) !void {
+        self.timeout_seen_ms = timeout.duration.raw.toMilliseconds();
+        return error.Timeout;
+    }
+};
+
+test "nip46_client: a cancel while publishing ends the request instead of trying the next relay" {
+    const gpa = testing.allocator;
+    var ctx = keys.Signer.init();
+    defer ctx.deinit();
+    const remote = try testKeyPair(ctx, 9);
+    const uri = try nip46.buildBunkerUri(gpa, remote.public_key, &.{"wss://hub.test"}, null);
+    defer gpa.free(uri);
+
+    const C = Client(*ScriptedConn);
+    const client = try C.initBunker(gpa, testing.io, ctx, uri, .{ .timeout_ms = 100 });
+    defer client.deinit();
+    var cancelled: ScriptedConn = .{ .fail_with = error.Canceled };
+    var next: ScriptedConn = .{};
+    try client.attach(&cancelled);
+    try client.attach(&next);
+    try testing.expectError(error.Canceled, client.call("ping", &.{}));
+    try testing.expectEqual(@as(usize, 0), next.publishes);
+}
+
+test "nip46_client: a relay that stops reading costs a request its publish deadline only" {
+    const gpa = testing.allocator;
+    var ctx = keys.Signer.init();
+    defer ctx.deinit();
+    const remote = try testKeyPair(ctx, 9);
+    const uri = try nip46.buildBunkerUri(gpa, remote.public_key, &.{"wss://hub.test"}, null);
+    defer gpa.free(uri);
+
+    const C = Client(*StalledConn);
+    const client = try C.initBunker(gpa, testing.io, ctx, uri, .{ .timeout_ms = 50, .publish_timeout_ms = 1234 });
+    defer client.deinit();
+    var stalled: StalledConn = .{};
+    try client.attach(&stalled);
+    // The publish was bounded by the option, and failing it is an ordinary
+    // failure to publish rather than a hang.
+    try testing.expectError(Error.PublishFailed, client.call("ping", &.{}));
+    try testing.expectEqual(@as(?i64, 1234), stalled.timeout_seen_ms);
+}
+
+test "nip46_client: a result of \"auth_url\" with no error is an answer, not a challenge" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var ctx = keys.Signer.init();
+    defer ctx.deinit();
+    const remote = try testKeyPair(ctx, 9);
+    const uri = try nip46.buildBunkerUri(gpa, remote.public_key, &.{"wss://hub.test"}, null);
+    defer gpa.free(uri);
+
+    var log: AuthLog = .{};
+    const C = Client(*ScriptedConn);
+    const client = try C.initBunker(gpa, io, ctx, uri, .{
+        .timeout_ms = 5000,
+        .on_auth_url = .{ .context = &log, .onAuthUrl = &AuthLog.record },
+    });
+    defer client.deinit();
+    var conn: ScriptedConn = .{ .keep = gpa };
+    defer if (conn.last_json) |j| gpa.free(j);
+    try client.attach(&conn);
+
+    var calling = try io.concurrent(C.call, .{ client, "ping", &.{} });
+    var awaited = false;
+    defer if (!awaited) {
+        if (calling.cancel(io)) |reply| {
+            var r = reply;
+            r.deinit();
+        } else |_| {}
+    };
+    while (!conn.published.load(.acquire)) try io.sleep(.fromMilliseconds(1), .awake);
+
+    // The signer's answer: the word, with an empty error.
+    var sent = try event.fromJson(gpa, conn.last_json.?);
+    defer sent.deinit();
+    const plaintext = try nip46.open(gpa, ctx, remote.secret_key, sent.value);
+    defer gpa.free(plaintext);
+    var req = try nip46.parseRequest(gpa, plaintext);
+    defer req.deinit();
+    const body = try (nip46.Response{ .id = req.value.id, .result = "auth_url" }).toJson(gpa);
+    defer gpa.free(body);
+    var sealed = try nip46.seal(gpa, io, ctx, remote, client.clientPubkey(), body, std.Io.Timestamp.now(io, .real).toSeconds());
+    defer sealed.deinit();
+    client.dispatch(sealed.event);
+
+    awaited = true;
+    var reply = try calling.await(io);
+    defer reply.deinit();
+    try testing.expectEqualStrings("auth_url", reply.result);
+    try testing.expectEqual(@as(u32, 0), log.count.load(.acquire));
 }

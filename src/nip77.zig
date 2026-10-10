@@ -29,6 +29,7 @@ const std = @import("std");
 const hex = @import("hex.zig");
 const store_mod = @import("store.zig");
 const Filter = @import("filter.zig").Filter;
+const message = @import("message.zig");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
@@ -40,6 +41,15 @@ pub const fingerprint_size = 16;
 pub const max_timestamp: u64 = std.math.maxInt(u64);
 /// The smallest non-zero frame size limit the reference accepts.
 pub const min_frame_size_limit: u64 = 4096;
+/// The frame size limit both sides use unless told otherwise. Tied to what
+/// the NIP-77 envelope parser accepts: a message is hex-encoded on the wire,
+/// so twice this has to stay under `message.max_neg_hex_len`, or a peer on
+/// default options would send a frame the other side refuses to read.
+pub const default_frame_size_limit: u64 = 500_000;
+
+comptime {
+    std.debug.assert(2 * default_frame_size_limit <= message.max_neg_hex_len);
+}
 /// How many sub-ranges a differing range is split into. A range with fewer
 /// than twice this many items is sent as an id list instead.
 const buckets: usize = 16;
@@ -78,12 +88,15 @@ pub const Mode = enum(u64) {
 
 pub const Options = struct {
     /// Upper bound on the size of each message this side produces, in bytes.
-    /// Zero means no limit. A non-zero value must be at least 4096. Work that
-    /// does not fit is handed back as a single fingerprint range and picked up
-    /// in a later round, exactly as the reference does. A responder facing
-    /// untrusted peers should set one: without it a reply can be several
-    /// times the size of the query that caused it.
-    frame_size_limit: u64 = 0,
+    /// A non-zero value must be at least 4096. Work that does not fit is
+    /// handed back as a single fingerprint range and picked up in a later
+    /// round, exactly as the reference does. The default keeps every message
+    /// small enough for `message.parseRelayMessage` and
+    /// `message.parseClientMessage` to read once hex-encoded, and keeps a
+    /// responder's reply from growing without bound on a query an untrusted
+    /// peer chose. Zero means no limit, for a peer that is not speaking
+    /// through those parsers.
+    frame_size_limit: u64 = default_frame_size_limit,
     /// The initiator gives up with `error.TooManyRounds` after this many
     /// replies. Without a frame size limit a reconciliation finishes in a
     /// handful of rounds; with a small limit and a large difference it can
@@ -204,9 +217,11 @@ pub const Storage = struct {
     }
 
     /// The items of every stored event matching `filter`, read through
-    /// `Store.syncItems`.
-    pub fn fromStore(gpa: std.mem.Allocator, s: *store_mod.Store, filter: Filter) (Error || store_mod.Error)!Storage {
-        const items = try s.syncItems(gpa, filter);
+    /// `Store.syncItems`. With `options.max_items` set, a filter matching more
+    /// fails early with `error.TooManyItems`; a relay answers that with
+    /// `NEG-ERR "blocked: too many records"`.
+    pub fn fromStore(gpa: std.mem.Allocator, s: *store_mod.Store, filter: Filter, options: store_mod.SyncOptions) (Error || store_mod.Error)!Storage {
+        const items = try s.syncItems(gpa, filter, options);
         errdefer gpa.free(items);
         return seal(gpa, items);
     }
@@ -1091,7 +1106,7 @@ test "nip77: storage built from the store reconciles against a slice" {
         if (i % 10 != 1) try local.append(gpa, .{ .created_at = @intCast(ev.created_at), .id = id });
     }
 
-    var from_store = try Storage.fromStore(gpa, &s, .{});
+    var from_store = try Storage.fromStore(gpa, &s, .{}, .{});
     defer from_store.deinit(gpa);
     try testing.expectEqual(@as(usize, 90), from_store.size());
     var from_slice = try Storage.fromSlice(gpa, local.items);
@@ -1103,6 +1118,44 @@ test "nip77: storage built from the store reconciles against a slice" {
     try testing.expectEqual(@as(usize, 10), out.need.len);
     for (out.have) |id| try testing.expectEqual(@as(u8, 0), id[0] % 10);
     for (out.need) |id| try testing.expectEqual(@as(u8, 1), id[0] % 10);
+}
+
+test "nip77: with default options no message is too large for the wire parser" {
+    // The NIP-77 envelope parser refuses a hex payload past
+    // `message.max_neg_hex_len`. A peer on default options must never produce
+    // one, whichever side holds the large set.
+    const gpa = testing.allocator;
+    const many = try gpa.alloc(Item, 20_000);
+    defer gpa.free(many);
+    for (many, 0..) |*it, i| {
+        it.* = .{ .created_at = i, .id = undefined };
+        Sha256.hash(std.mem.asBytes(&i), &it.id, .{});
+    }
+    var full = try Storage.fromSlice(gpa, many);
+    defer full.deinit(gpa);
+    var empty = try Storage.fromSlice(gpa, &.{});
+    defer empty.deinit(gpa);
+
+    for ([_][2]*const Storage{ .{ &full, &empty }, .{ &empty, &full } }) |pair| {
+        var client = try Initiator.init(pair[0], .{});
+        var server = try Responder.init(pair[1], .{});
+        var learned: usize = 0;
+        var q = try client.initiate(gpa);
+        while (true) {
+            const sent = q;
+            defer gpa.free(sent);
+            try testing.expect(2 * sent.len <= message.max_neg_hex_len);
+            const reply = try server.reconcile(gpa, sent);
+            defer gpa.free(reply);
+            try testing.expect(2 * reply.len <= message.max_neg_hex_len);
+            var r = try client.reconcile(gpa, reply);
+            defer r.deinit(gpa);
+            learned += r.have.len + r.need.len;
+            q = r.message orelse break;
+            r.message = null;
+        }
+        try testing.expect(learned >= many.len);
+    }
 }
 
 test "nip77: hex round trip" {

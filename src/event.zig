@@ -231,8 +231,9 @@ pub const Parsed = struct {
     }
 };
 
-/// Parses wire-format event JSON. The returned `Parsed` owns an arena
-/// backing `value.tags`/`value.content` — call `deinit` to free it.
+/// Parses wire-format event JSON. The returned `Parsed` owns every byte the
+/// event points at, in one arena, so `json_text` may be freed or reused as soon
+/// as this returns. Call `deinit` to free it.
 pub fn fromJson(gpa: std.mem.Allocator, json_text: []const u8) !Parsed {
     const arena = try gpa.create(std.heap.ArenaAllocator);
     arena.* = std.heap.ArenaAllocator.init(gpa);
@@ -242,7 +243,13 @@ pub fn fromJson(gpa: std.mem.Allocator, json_text: []const u8) !Parsed {
     }
     const allocator = arena.allocator();
 
-    const wire = try std.json.parseFromSliceLeaky(WireEvent, allocator, json_text, wire_options);
+    // std.json hands back a string with no escapes in it as a slice of the
+    // text it parsed, so parsing the caller's text would leave the event
+    // pointing into memory the caller owns. One copy of the whole text into
+    // the arena is cheaper than copying each string, and makes every slice
+    // the parser returns ours.
+    const owned_text = try allocator.dupe(u8, json_text);
+    const wire = try std.json.parseFromSliceLeaky(WireEvent, allocator, owned_text, wire_options);
 
     return Parsed{
         .arena = arena,
@@ -426,6 +433,43 @@ test "an event carrying a field NIP-01 does not name still parses and verifies" 
     try std.testing.expect(try verify(allocator, signer, parsed.value));
 
     // Written back out, it is the event that was signed, without the extra key.
+    const again = try toJson(allocator, parsed.value);
+    defer allocator.free(again);
+    try std.testing.expectEqualStrings(wire, again);
+}
+
+test "a parsed event outlives the text it was parsed from" {
+    const allocator = std.testing.allocator;
+    var signer = try keys.Signer.initRandomized(std.testing.io);
+    defer signer.deinit();
+    const kp = try signer.generateKeyPair(std.testing.io);
+
+    // Unescaped strings are the ones a parser can hand back as slices of its
+    // input, and the escaped content is the one it cannot, so both kinds are
+    // here.
+    const tags = [_]Tag{
+        &[_][]const u8{ "e", "5c83da77af1dec6d7289834998ad7aafbd9e2191396d75ec3cc27f5a77226f36", "wss://relay.example" },
+        &[_][]const u8{ "t", "zig" },
+    };
+    const ev = try create(allocator, signer, kp, 1700000000, 1, &tags, "plain words", null);
+    const wire = try toJson(allocator, ev);
+    defer allocator.free(wire);
+
+    const text = try allocator.dupe(u8, wire);
+    var parsed = parsed: {
+        // Overwrite the text before freeing it as well, so the test does not
+        // depend on what the allocator does with freed memory.
+        defer {
+            @memset(text, 'x');
+            allocator.free(text);
+        }
+        break :parsed try fromJson(allocator, text);
+    };
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("plain words", parsed.value.content);
+    try std.testing.expectEqualStrings("zig", parsed.value.tags[1][1]);
+    try std.testing.expect(try verify(allocator, signer, parsed.value));
     const again = try toJson(allocator, parsed.value);
     defer allocator.free(again);
     try std.testing.expectEqualStrings(wire, again);
