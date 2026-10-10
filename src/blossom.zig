@@ -4,6 +4,11 @@
 //! the `Authorization` header, sent as `Nostr <base64(event json)>` exactly
 //! like NIP-98. This module builds that event and header and parses the blob
 //! descriptor a server returns. There is no HTTP transport here.
+//!
+//! BUD-11 asks for the header in unpadded URL-safe base64. The header here is
+//! standard base64 with padding, as NIP-98's is, because that is what servers
+//! accept: khatru-based servers decode it with a strict standard decoder and
+//! refuse the URL-safe form, and Amethyst and Jumble both send standard.
 
 const std = @import("std");
 const event = @import("event.zig");
@@ -25,12 +30,24 @@ pub const Action = enum {
     pub fn name(self: Action) []const u8 {
         return @tagName(self);
     }
+
+    /// The content used when `AuthOptions.content` is null.
+    pub fn defaultContent(self: Action) []const u8 {
+        return switch (self) {
+            .get => "Get Blob",
+            .upload => "Upload Blob",
+            .list => "List Blobs",
+            .delete => "Delete Blob",
+            .media => "Upload Media",
+        };
+    }
 };
 
 pub const AuthOptions = struct {
     action: Action,
-    /// Human readable reason, the event content (for example "Upload Blob").
-    content: []const u8 = "",
+    /// Human readable reason, the event content. BUD-11 requires one, so
+    /// null takes `Action.defaultContent`.
+    content: ?[]const u8 = null,
     /// Unix seconds after which the server must refuse the event. Required
     /// by BUD-11.
     expiration: i64,
@@ -58,7 +75,8 @@ pub fn authEvent(
         try tags.append(allocator, try tag2(allocator, "x", try hex.encode(allocator, &h)));
     }
     if (opts.server) |s| try tags.append(allocator, try tag2(allocator, "server", s));
-    return event.create(allocator, signer, keypair, created_at, kind, tags.items, opts.content, aux_rand);
+    const content = opts.content orelse opts.action.defaultContent();
+    return event.create(allocator, signer, keypair, created_at, kind, tags.items, content, aux_rand);
 }
 
 fn tag2(allocator: std.mem.Allocator, name: []const u8, value: []const u8) std.mem.Allocator.Error!event.Tag {
@@ -89,14 +107,20 @@ pub fn buildAuthHeader(
 }
 
 /// A blob descriptor (BUD-02). Strings borrow from the `Parsed` arena.
+///
+/// BUD-02 lists every field as present, but only `url` is required here:
+/// servers in use leave out the others, and the address is what a note needs.
+/// A field that is present with the wrong shape is still refused. A caller
+/// that checks the server stored the right bytes compares `sha256`, and has
+/// to decide what a missing one means.
 pub const BlobDescriptor = struct {
     url: []const u8,
-    sha256: [32]u8,
-    size: u64,
+    sha256: ?[32]u8 = null,
+    size: ?u64 = null,
     /// MIME type. Older servers omit it.
     type: ?[]const u8 = null,
     /// Unix seconds the server stored the blob.
-    uploaded: i64,
+    uploaded: ?i64 = null,
     /// Optional NIP-94 tags (BUD-08).
     nip94: ?[]const event.Tag = null,
 };
@@ -157,15 +181,23 @@ fn descriptorFromValue(a: std.mem.Allocator, v: std.json.Value) ParseError!BlobD
     const o = v.object;
 
     const url = try strField(o, "url");
-    const sha = hex.decodeFixed(32, try strField(o, "sha256")) catch return error.InvalidDescriptor;
-    const size_v = o.get("size") orelse return error.InvalidDescriptor;
-    const uploaded_v = o.get("uploaded") orelse return error.InvalidDescriptor;
-    const size: u64 = switch (size_v) {
-        .integer => |n| std.math.cast(u64, n) orelse return error.InvalidDescriptor,
+    if (url.len == 0) return error.InvalidDescriptor;
+    var sha: ?[32]u8 = null;
+    if (o.get("sha256")) |v_sha| switch (v_sha) {
+        .string => |h| sha = hex.decodeFixed(32, h) catch return error.InvalidDescriptor,
+        .null => {},
         else => return error.InvalidDescriptor,
     };
-    const uploaded: i64 = switch (uploaded_v) {
-        .integer => |n| n,
+    var size: ?u64 = null;
+    if (o.get("size")) |v_size| switch (v_size) {
+        .integer => |n| size = std.math.cast(u64, n) orelse return error.InvalidDescriptor,
+        .null => {},
+        else => return error.InvalidDescriptor,
+    };
+    var uploaded: ?i64 = null;
+    if (o.get("uploaded")) |v_up| switch (v_up) {
+        .integer => |n| uploaded = n,
+        .null => {},
         else => return error.InvalidDescriptor,
     };
 
@@ -275,10 +307,10 @@ test "blossom: descriptor with optional fields" {
     );
     defer full.deinit();
     const d = full.value;
-    try testing.expectEqual(@as(u64, 184292), d.size);
-    try testing.expectEqual(@as(i64, 1725105921), d.uploaded);
+    try testing.expectEqual(@as(u64, 184292), d.size.?);
+    try testing.expectEqual(@as(i64, 1725105921), d.uploaded.?);
     try testing.expectEqualStrings("application/pdf", d.type.?);
-    try testing.expectEqualSlices(u8, &try hex.decodeFixed(32, sha), &d.sha256);
+    try testing.expectEqualSlices(u8, &try hex.decodeFixed(32, sha), &d.sha256.?);
     try testing.expectEqual(@as(usize, 2), d.nip94.?.len);
     try testing.expectEqualStrings("m", d.nip94.?[1][0]);
 
@@ -288,12 +320,32 @@ test "blossom: descriptor with optional fields" {
     defer min.deinit();
     try testing.expect(min.value.type == null);
     try testing.expect(min.value.nip94 == null);
+
+    // What some servers send: the address and nothing else.
+    var bare = try parseDescriptor(gpa, "{\"url\":\"https://cdn.example.com/a.png\"}");
+    defer bare.deinit();
+    try testing.expectEqualStrings("https://cdn.example.com/a.png", bare.value.url);
+    try testing.expect(bare.value.sha256 == null);
+    try testing.expect(bare.value.size == null);
+    try testing.expect(bare.value.uploaded == null);
+}
+
+test "blossom: a token always carries a human readable content" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var signer = keys.Signer.init();
+    defer signer.deinit();
+    const kp = try testKey(signer);
+    const h = [_][32]u8{[_]u8{7} ** 32};
+    const ev = try authEvent(arena_state.allocator(), signer, kp, 1_700_000_000, .{ .action = .delete, .expiration = 1_700_003_600, .hashes = &h }, null);
+    try testing.expectEqualStrings("Delete Blob", ev.content);
 }
 
 test "blossom: bad descriptors and lists" {
     const gpa = testing.allocator;
     try testing.expectError(error.InvalidDescriptor, parseDescriptor(gpa, "[]"));
-    try testing.expectError(error.InvalidDescriptor, parseDescriptor(gpa, "{\"url\":\"u\"}"));
+    try testing.expectError(error.InvalidDescriptor, parseDescriptor(gpa, "{\"sha256\":\"b1674191a88ec5cdd733e4240a81803105dc412d6c6708d53ab94fc248f4f553\"}"));
+    try testing.expectError(error.InvalidDescriptor, parseDescriptor(gpa, "{\"url\":\"u\",\"size\":\"1\"}"));
     try testing.expectError(error.InvalidDescriptor, parseDescriptor(gpa, "{\"url\":\"u\",\"sha256\":\"zz\",\"size\":1,\"uploaded\":2}"));
     try testing.expectError(error.InvalidDescriptor, parseDescriptor(gpa, "{\"url\":\"u\",\"sha256\":\"b1674191a88ec5cdd733e4240a81803105dc412d6c6708d53ab94fc248f4f553\",\"size\":-1,\"uploaded\":2}"));
     try testing.expectError(error.InvalidDescriptor, parseDescriptor(gpa, "nope"));
@@ -301,5 +353,5 @@ test "blossom: bad descriptors and lists" {
     var list = try parseDescriptorList(gpa, "[{\"url\":\"u\",\"sha256\":\"b1674191a88ec5cdd733e4240a81803105dc412d6c6708d53ab94fc248f4f553\",\"size\":3,\"uploaded\":4},{\"url\":\"v\",\"sha256\":\"b1674191a88ec5cdd733e4240a81803105dc412d6c6708d53ab94fc248f4f553\",\"size\":5,\"uploaded\":6}]");
     defer list.deinit();
     try testing.expectEqual(@as(usize, 2), list.value.len);
-    try testing.expectEqual(@as(u64, 5), list.value[1].size);
+    try testing.expectEqual(@as(u64, 5), list.value[1].size.?);
 }
