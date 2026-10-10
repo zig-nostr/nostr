@@ -268,6 +268,38 @@ pub fn Connection(comptime Stream: type) type {
             try self.sendText(text);
         }
 
+        /// Asks how many events match (NIP-45): sends
+        /// `["COUNT", <id>, <filters>...]`. The relay answers with a `count`
+        /// message for the same id.
+        pub fn count(self: *Self, subscription_id: []const u8, filters: []const Filter) !void {
+            const text = try message.encodeCount(self.allocator, subscription_id, filters);
+            defer self.allocator.free(text);
+            try self.sendText(text);
+        }
+
+        /// Opens a negentropy session (NIP-77): sends
+        /// `["NEG-OPEN", <id>, <filter>, <initial_hex>]`. `initial_hex` is the
+        /// hex of the first message, as `nip77.Initiator` produces it.
+        pub fn negOpen(self: *Self, subscription_id: []const u8, filter: Filter, initial_hex: []const u8) !void {
+            const text = try message.encodeNegOpen(self.allocator, subscription_id, filter, initial_hex);
+            defer self.allocator.free(text);
+            try self.sendText(text);
+        }
+
+        /// Continues a negentropy session: sends `["NEG-MSG", <id>, <hex>]`.
+        pub fn negMsg(self: *Self, subscription_id: []const u8, msg_hex: []const u8) !void {
+            const text = try message.encodeNegMsg(self.allocator, subscription_id, msg_hex);
+            defer self.allocator.free(text);
+            try self.sendText(text);
+        }
+
+        /// Ends a negentropy session: sends `["NEG-CLOSE", <id>]`.
+        pub fn negClose(self: *Self, subscription_id: []const u8) !void {
+            const text = try message.encodeNegClose(self.allocator, subscription_id);
+            defer self.allocator.free(text);
+            try self.sendText(text);
+        }
+
         /// Answers a NIP-42 challenge: sends `["AUTH", <event>]`. `ev` is a
         /// signed `kind:22242` event (build it with `nip42.authEvent`).
         pub fn authenticate(self: *Self, ev: Event) !void {
@@ -865,6 +897,18 @@ pub const Relay = struct {
     pub fn authenticate(self: *Relay, ev: Event) !void {
         return self.conn.authenticate(ev);
     }
+    pub fn count(self: *Relay, subscription_id: []const u8, filters: []const Filter) !void {
+        return self.conn.count(subscription_id, filters);
+    }
+    pub fn negOpen(self: *Relay, subscription_id: []const u8, filter: Filter, initial_hex: []const u8) !void {
+        return self.conn.negOpen(subscription_id, filter, initial_hex);
+    }
+    pub fn negMsg(self: *Relay, subscription_id: []const u8, msg_hex: []const u8) !void {
+        return self.conn.negMsg(subscription_id, msg_hex);
+    }
+    pub fn negClose(self: *Relay, subscription_id: []const u8) !void {
+        return self.conn.negClose(subscription_id);
+    }
     pub fn receive(self: *Relay) !?message.ParsedRelayMessage {
         return self.conn.receive();
     }
@@ -1341,6 +1385,43 @@ test "publish/subscribe/unsubscribe write correct client frames" {
         defer allocator.free(text);
         try std.testing.expectEqualStrings("[\"CLOSE\",\"s1\"]", text);
     }
+}
+
+test "count and the negentropy frames go out as one masked text frame each" {
+    const allocator = std.testing.allocator;
+    var written: std.ArrayList(u8) = .empty;
+    defer written.deinit(allocator);
+    var server = FakeStream{ .to_read = "", .written = &written, .allocator = allocator };
+    var conn = newConn(allocator, &server);
+    defer conn.deinit();
+
+    const cases = .{
+        .{ "[\"COUNT\",\"c1\",{\"kinds\":[1]}]", "count" },
+        .{ "[\"NEG-OPEN\",\"n1\",{\"kinds\":[1]},\"6100\"]", "negOpen" },
+        .{ "[\"NEG-MSG\",\"n1\",\"6101\"]", "negMsg" },
+        .{ "[\"NEG-CLOSE\",\"n1\"]", "negClose" },
+    };
+    inline for (cases) |case| {
+        written.clearRetainingCapacity();
+        const kinds = [_]u16{1};
+        if (comptime std.mem.eql(u8, case[1], "count")) {
+            try conn.count("c1", &.{.{ .kinds = &kinds }});
+        } else if (comptime std.mem.eql(u8, case[1], "negOpen")) {
+            try conn.negOpen("n1", .{ .kinds = &kinds }, "6100");
+        } else if (comptime std.mem.eql(u8, case[1], "negMsg")) {
+            try conn.negMsg("n1", "6101");
+        } else {
+            try conn.negClose("n1");
+        }
+        const text = try onlyWrittenText(allocator, written.items);
+        defer allocator.free(text);
+        try std.testing.expectEqualStrings(case[0], text);
+    }
+
+    // They share the write path, so a broken connection refuses them too.
+    conn.broken.store(true, .release);
+    try std.testing.expectError(ConnectionError.Broken, conn.count("c2", &.{.{}}));
+    try std.testing.expectError(ConnectionError.Broken, conn.negClose("n1"));
 }
 
 fn newConn(
