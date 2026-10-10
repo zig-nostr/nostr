@@ -164,9 +164,12 @@ pub fn verify(
     opts: VerifyOptions,
 ) VerifyError!void {
     if (ev.kind != kind) return error.WrongKind;
+    // Saturating, because `created_at` is whatever the sender wrote: a plain
+    // difference overflows on a value near either end of i64. And before the
+    // signature, which is the expensive check.
+    if (ev.created_at < opts.now -| opts.window_secs or ev.created_at > opts.now +| opts.window_secs)
+        return error.Expired;
     if (!try event.verify(allocator, signer, ev)) return error.BadSignature;
-    const delta = ev.created_at - opts.now;
-    if (delta > opts.window_secs or -delta > opts.window_secs) return error.Expired;
 
     const u = tagValue(ev, "u") orelse return error.MissingTag;
     if (!std.mem.eql(u8, u, opts.url)) return error.UrlMismatch;
@@ -303,4 +306,32 @@ test "nip98: malformed headers are refused" {
     try testing.expectError(error.MalformedHeader, decodeHeader(gpa, "Bearer abc"));
     try testing.expectError(error.MalformedHeader, decodeHeader(gpa, "Nostr !!!"));
     try testing.expectError(error.InvalidJson, decodeHeader(gpa, "Nostr aGVsbG8="));
+}
+
+test "nip98: a created_at at the ends of i64 is expired, not a crash" {
+    var signer = keys.Signer.init();
+    defer signer.deinit();
+    const kp = try testKey(signer);
+    for ([_]i64{ std.math.minInt(i64), std.math.maxInt(i64) }) |t| {
+        const h = try authHeader(testing.allocator, signer, kp, t, "https://x/a", "GET", null, null);
+        defer testing.allocator.free(h);
+        try testing.expectError(error.Expired, verifyHeader(testing.allocator, signer, h, .{ .url = "https://x/a", .method = "GET", .now = 1_760_000_000 }));
+    }
+    // A clock and a window at the ends of i64 do not overflow either.
+    const h = try authHeader(testing.allocator, signer, kp, std.math.minInt(i64) + 10, "https://x/a", "GET", null, null);
+    defer testing.allocator.free(h);
+    _ = try verifyHeader(testing.allocator, signer, h, .{ .url = "https://x/a", .method = "GET", .now = std.math.minInt(i64), .window_secs = std.math.maxInt(i64) });
+}
+
+test "nip98: a stale event is refused before its signature is checked" {
+    var signer = keys.Signer.init();
+    defer signer.deinit();
+    const kp = try testKey(signer);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var ev = try authEvent(arena_state.allocator(), signer, kp, 1, "https://x/a", "GET", null, null);
+    ev.sig[0] ^= 1;
+    // Freshness is a comparison; the signature is the expensive check, so a
+    // flood of old tokens costs the server nothing but the comparison.
+    try testing.expectError(error.Expired, verify(testing.allocator, signer, ev, .{ .url = "https://x/a", .method = "GET", .now = 1_760_000_000 }));
 }
