@@ -40,7 +40,10 @@ pub fn difficulty(id: [32]u8) u32 {
 pub fn committedTarget(ev: event.Event) ?u32 {
     for (ev.tags) |tag| {
         if (tag.len >= 3 and std.mem.eql(u8, tag[0], "nonce")) {
-            return std.fmt.parseInt(u32, tag[2], 10) catch null;
+            const digits = tag[2];
+            if (digits.len == 0) return null;
+            for (digits) |ch| if (!std.ascii.isDigit(ch)) return null;
+            return std.fmt.parseInt(u32, digits, 10) catch null;
         }
     }
     return null;
@@ -326,6 +329,14 @@ test "nip13: committedTarget reads the nonce tag" {
     try testing.expectEqual(@as(?u32, null), committedTarget(ev));
     ev.tags = &.{e_tag};
     try testing.expectEqual(@as(?u32, null), committedTarget(ev));
+
+    // Only ASCII digits are a target. Zig's integer parser takes a sign and
+    // underscores, which no other implementation reads as a number.
+    for ([_][]const u8{ "1_6", "+16", "-1", "", " 16", "16 ", "0x10" }) |bad| {
+        const t: event.Tag = &.{ "nonce", "1", bad };
+        ev.tags = &.{t};
+        try testing.expectEqual(@as(?u32, null), committedTarget(ev));
+    }
 }
 
 fn checkMined(m: Mined, target: u32) !void {
