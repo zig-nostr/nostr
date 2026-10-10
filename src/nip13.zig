@@ -108,22 +108,24 @@ const Shared = struct {
     timed_out: std.atomic.Value(bool) = .init(false),
     nonce: u64 = 0,
     mutex: std.atomic.Mutex = .unlocked,
-    oom: std.atomic.Value(bool) = .init(false),
 };
 
-fn worker(sh: *Shared, index: u32) void {
-    workerInner(sh, index) catch sh.oom.store(true, .release);
+/// The bytes a worker hashes after the midstate: what is left of the prefix
+/// past its last whole block, the nonce digits, and the suffix.
+fn tailLen(sh: *const Shared) usize {
+    return sh.prefix.len % 64 + nonce_digits + sh.suffix.len;
 }
 
-fn workerInner(sh: *Shared, index: u32) std.mem.Allocator.Error!void {
+/// Mines nonces `index`, `index + threads`, ... into its own `tail`, which
+/// `mine` allocated before any worker started. Nothing in here can fail, so
+/// a worker never stops on its own while the others carry on.
+fn worker(sh: *Shared, index: u32, tail: []u8) void {
     const full = sh.prefix.len / 64 * 64;
     var mid = Sha256.init(.{});
     mid.update(sh.prefix[0..full]);
     const rem = sh.prefix[full..];
 
-    const a = std.heap.page_allocator;
-    const tail = try a.alloc(u8, rem.len + nonce_digits + sh.suffix.len);
-    defer a.free(tail);
+    std.debug.assert(tail.len == tailLen(sh));
     @memcpy(tail[0..rem.len], rem);
     @memcpy(tail[rem.len + nonce_digits ..], sh.suffix);
     const digits = tail[rem.len..][0..nonce_digits];
@@ -236,19 +238,26 @@ pub fn mine(
 
     const handles = try allocator.alloc(std.Thread, threads - 1);
     defer allocator.free(handles);
+    // Every worker's buffer, allocated before the first one starts. A worker
+    // that allocated its own and ran out stopped alone, and the rest mined on
+    // with nobody to tell them.
+    const tail_len = tailLen(&sh);
+    const tails = try allocator.alloc(u8, tail_len * threads);
+    defer allocator.free(tails);
     var spawned: usize = 0;
     var spawn_failed = false;
     while (spawned < threads - 1) : (spawned += 1) {
-        handles[spawned] = std.Thread.spawn(.{}, worker, .{ &sh, @as(u32, @intCast(spawned + 1)) }) catch {
+        const index: u32 = @intCast(spawned + 1);
+        handles[spawned] = std.Thread.spawn(.{}, worker, .{ &sh, index, tails[index * tail_len ..][0..tail_len] }) catch {
             spawn_failed = true;
             break;
         };
     }
-    if (spawn_failed) sh.stop.store(true, .release) else worker(&sh, 0);
+    if (spawn_failed) sh.stop.store(true, .release) else worker(&sh, 0, tails[0..tail_len]);
     for (handles[0..spawned]) |h| h.join();
 
-    if (spawn_failed) return error.ThreadSpawnFailed;
-    if (sh.oom.load(.acquire)) return error.OutOfMemory;
+    // A nonce found is a result, whatever else happened.
+    if (spawn_failed and !sh.found.load(.acquire)) return error.ThreadSpawnFailed;
     if (!sh.found.load(.acquire)) {
         if (sh.timed_out.load(.acquire)) return error.Timeout;
         if (sh.cancel) |c| if (c.load(.acquire)) return error.Cancelled;
@@ -390,6 +399,19 @@ test "nip13: a timeout too long for the clock is no deadline, not a crash" {
     var m = try mine(testing.allocator, testing.io, .{ .pubkey = @splat(1), .created_at = 1, .kind = 1 }, .{ .target = 1, .timeout_ms = std.math.maxInt(u64) });
     defer m.deinit();
     try checkMined(m, 1);
+}
+
+test "nip13: running out of memory anywhere in mine is reported and leaks nothing" {
+    // On every thread count: each allocation that can fail fails once, and
+    // mine has to come back with OutOfMemory rather than mine on with some of
+    // its workers gone.
+    const run = struct {
+        fn f(a: std.mem.Allocator, threads: u32) !void {
+            var m = try mine(a, testing.io, .{ .pubkey = @splat(1), .created_at = 1, .kind = 1, .content = "x" ** 200 }, .{ .target = 1, .threads = threads });
+            m.deinit();
+        }
+    }.f;
+    for ([_]u32{ 1, 4 }) |threads| try testing.checkAllAllocationFailures(testing.allocator, run, .{threads});
 }
 
 test "nip13: mine rejects a target above 256" {
