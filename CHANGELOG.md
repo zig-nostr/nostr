@@ -24,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Connection.publishTimeout` and `Relay.publishTimeout`: a publish that gives up at a deadline when the relay has stopped reading. The write runs as a task of its own and is cancelled at the deadline. If it had started, the connection is marked broken and every later write fails with the new `ConnectionError.Broken`.
 - `count`, `negOpen`, `negMsg` and `negClose` on `Connection` and `Relay`, through the same locked write as `subscribe`.
 - `Store.remove(id)` and `Store.removeMatching(filter)`: take events out of the store with their index entries, in one write transaction. Neither records a tombstone.
+- `Store.OpenOptions.durability`: `.full` (the default, as before), `.no_meta_sync` or `.no_sync`, mapped to LMDB's `MDB_NOMETASYNC` and `MDB_NOSYNC`. The two lighter settings trade what survives a power loss for commits that do not wait for the disk, for a cache that can be rebuilt or a temporary store.
 - `Store.syncItems`: every matching event as a `(created_at, id)` pair in negentropy order, answered from index keys for filters of authors, kinds and time, with `SyncOptions.max_items` failing early with `error.TooManyItems`.
 - The bunker answers `nip04_encrypt` and `nip04_decrypt` under the same rules as the NIP-44 pair, and `nip46.Method` names them.
 - `zig build bench` reports the cost of `event.fromJson` and the NIP-13 hash rate.

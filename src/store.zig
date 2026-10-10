@@ -94,6 +94,38 @@ pub const Store = struct {
         map_size: usize = 1 << 30,
         /// Maximum number of named sub-databases. Defaults to 16.
         max_dbs: u32 = 16,
+        /// How much a commit waits for the disk. See `Durability`.
+        durability: Durability = .full,
+    };
+
+    /// What survives a crash, traded against what a commit costs. LMDB syncs
+    /// to disk on every commit by default, and a client ingesting events one
+    /// write at a time spends most of its time there.
+    ///
+    /// None of these can corrupt the database through a crash of the program
+    /// alone: the operating system still writes what it was handed. They
+    /// differ when the machine itself goes down before the disk caught up.
+    pub const Durability = enum {
+        /// Sync data and metadata on every commit. A committed write
+        /// survives a power loss.
+        full,
+        /// Sync data but not the meta page (`MDB_NOMETASYNC`). After a power
+        /// loss the last commit may be rolled back, and the database stays
+        /// consistent.
+        no_meta_sync,
+        /// Never sync (`MDB_NOSYNC`); the operating system writes when it
+        /// chooses. After a power loss any recent commits may be lost, and on
+        /// a filesystem that reorders writes the file can be left corrupt.
+        /// For a cache that can be rebuilt from relays, or a temporary store.
+        no_sync,
+
+        fn envFlags(self: Durability) c_uint {
+            return switch (self) {
+                .full => 0,
+                .no_meta_sync => @intCast(c.MDB_NOMETASYNC),
+                .no_sync => @intCast(c.MDB_NOSYNC),
+            };
+        }
     };
 
     /// Opens (creating if necessary) the LMDB environment at `path`. The path
@@ -106,7 +138,7 @@ pub const Store = struct {
         errdefer c.mdb_env_close(env);
         try check(c.mdb_env_set_mapsize(env, options.map_size));
         try check(c.mdb_env_set_maxdbs(env, @intCast(options.max_dbs)));
-        try check(c.mdb_env_open(env, path, @intCast(c.MDB_NOSUBDIR), 0o644));
+        try check(c.mdb_env_open(env, path, @as(c_uint, @intCast(c.MDB_NOSUBDIR)) | options.durability.envFlags(), 0o644));
 
         // Create/open the named sub-databases in a single write transaction.
         // The dbi handles remain valid for the life of the environment.
@@ -3374,5 +3406,36 @@ test "store: syncItems by author or kind reads index keys, not events" {
         defer gpa.free(got);
         try std.testing.expectEqual(@as(usize, 1), got.len);
         try std.testing.expectEqual(@as(u64, 400), got[0].created_at);
+    }
+}
+
+test "store: every durability opens, keeps what it commits, and sets its flag" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const gpa = std.testing.allocator;
+    const cases = [_]struct { d: Store.Durability, flag: c_uint }{
+        .{ .d = .full, .flag = 0 },
+        .{ .d = .no_meta_sync, .flag = @intCast(c.MDB_NOMETASYNC) },
+        .{ .d = .no_sync, .flag = @intCast(c.MDB_NOSYNC) },
+    };
+    for (cases, 0..) |case, i| {
+        var name_buf: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "durability-{d}.mdb", .{i});
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = testStorePath(&tmp, name, &buf);
+        {
+            var store = try Store.open(path.ptr, .{ .durability = case.d });
+            defer store.deinit();
+            var flags: c_uint = 0;
+            try check(c.mdb_env_get_flags(store.env, &flags));
+            const sync_bits: c_uint = @intCast(c.MDB_NOSYNC | c.MDB_NOMETASYNC);
+            try std.testing.expectEqual(case.flag, flags & sync_bits);
+            _ = try store.putEvent(gpa, qEvent(1, author_a, 1, 100, &.{}));
+        }
+        // Committed is committed as far as the next open is concerned; the
+        // setting only decides when the disk hears of it.
+        var again = try Store.open(path.ptr, .{});
+        defer again.deinit();
+        try std.testing.expect(try again.hasEvent([_]u8{1} ** 32));
     }
 }
