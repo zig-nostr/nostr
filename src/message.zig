@@ -417,6 +417,8 @@ pub const max_filters = 64;
 pub const max_subscription_id_len = 64;
 
 /// The longest negentropy hex payload accepted, in hex characters.
+/// `nip77.default_frame_size_limit` is held below half of this at compile
+/// time, so a peer on default options never sends more.
 pub const max_neg_hex_len = 1 << 20;
 
 /// A message received from a client.
