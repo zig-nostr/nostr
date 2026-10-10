@@ -38,6 +38,18 @@ pub const signer = @import("signer.zig");
 // local HTTP, so every product speaks the identical protocol without sharing
 // a server. Transport, ports, and authentication stay product concerns.
 pub const signer_ipc = @import("signer_ipc.zig");
+// Scaffolded NIPs and Blossom: empty modules that reserve their names and
+// test hooks. Each gains its API as the implementation lands.
+pub const nip04 = @import("nip04.zig");
+pub const nip05 = @import("nip05.zig");
+pub const nip11 = @import("nip11.zig");
+pub const nip13 = @import("nip13.zig");
+pub const nip46_client = @import("nip46_client.zig");
+pub const nip59 = @import("nip59.zig");
+pub const nip77 = @import("nip77.zig");
+pub const nip86 = @import("nip86.zig");
+pub const nip98 = @import("nip98.zig");
+pub const blossom = @import("blossom.zig");
 
 test "module compiles and version is set" {
     try std.testing.expect(version.len > 0);
