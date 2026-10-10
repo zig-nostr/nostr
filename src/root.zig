@@ -38,8 +38,8 @@ pub const signer = @import("signer.zig");
 // local HTTP, so every product speaks the identical protocol without sharing
 // a server. Transport, ports, and authentication stay product concerns.
 pub const signer_ipc = @import("signer_ipc.zig");
-// Scaffolded NIPs and Blossom: empty modules that reserve their names and
-// test hooks. Each gains its API as the implementation lands.
+// Legacy encryption, gift wrap, proof of work, negentropy, the remote signer
+// client, and the HTTP-side codecs (NIP-05, NIP-11, NIP-86, NIP-98, Blossom).
 pub const nip04 = @import("nip04.zig");
 pub const nip05 = @import("nip05.zig");
 pub const nip11 = @import("nip11.zig");

@@ -19,15 +19,27 @@ covered by tests:
 - **Transport**: RFC 6455 WebSocket, a relay connection state machine, a live
   TCP/TLS dialer, NIP-42 authentication, and the NIP-65 outbox model with no
   hardcoded relays. A read can carry a deadline, so a thread serving a quiet
-  relay can still notice that its pool changed, and a failed dial can report the
-  HTTP status the relay answered the upgrade with.
+  relay can still notice that its pool changed, a publish can carry a deadline
+  so a relay that stopped reading cannot hold a writer, and a failed dial can
+  report the HTTP status the relay answered the upgrade with.
 - **Store**: a memory-mapped LMDB event store with a bounded, newest-first query
   planner. A 500-note feed query is 0.28 ms at 100,000 stored events, and a
   profile read is 8 microseconds. A NIP-50 `search` on a filter is sent to relays
   as is, and the store applies it as a case-insensitive substring of the content.
+  An event, or every event a filter selects, can be removed with its indexes.
 - **Signing**: NIP-44 v2, and the NIP-46 bunker protocol as both client and
   server, so a signer is a shell over the library rather than its own
   implementation.
+- **Messaging**: NIP-59 gift wrap and NIP-17 private direct messages, and
+  NIP-04 for reading and writing older ones. A remote signer answers NIP-04
+  and NIP-44 requests alike.
+- **Sync**: NIP-77 negentropy, matching the reference implementation message
+  for message, with storage built straight from the local store's indexes, and
+  NIP-45 `COUNT`. The message codecs read every client frame too, so a
+  program can play the relay.
+- **HTTP-side NIPs**: NIP-05 identifiers, NIP-11 relay information, NIP-98
+  HTTP auth, NIP-86 relay management and Blossom upload tokens, as codecs
+  with no HTTP client in them. NIP-13 proof of work, mined on several threads.
 
 The library builds for macOS, Linux and Windows (x86_64 and aarch64 on each). CI builds and runs the tests on Linux, macOS and Windows. On Windows, hostnames resolve through std's resolver and both the wait for bytes before a read's deadline and the wait for room before a pong are a poll request to the AFD driver; the other platforms keep libc `getaddrinfo`, a timed peek and `poll`.
 
