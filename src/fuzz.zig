@@ -69,11 +69,13 @@ const hex = @import("hex.zig");
 const json = @import("json.zig");
 const keys = @import("keys.zig");
 const message = @import("message.zig");
+const nip13 = @import("nip13.zig");
 const nip19 = @import("nip19.zig");
 const nip44 = @import("nip44.zig");
 const nip46 = @import("nip46.zig");
 const nip49 = @import("nip49.zig");
 const nip65 = @import("nip65.zig");
+const nip77 = @import("nip77.zig");
 const relay = @import("relay.zig");
 const signer_ipc = @import("signer_ipc.zig");
 const websocket = @import("websocket.zig");
@@ -1258,4 +1260,116 @@ fn fuzzJsonString(_: void, smith: *testing.Smith) anyerror!void {
     const parsed = try std.json.parseFromSlice([]const u8, testing.allocator, list.items, .{});
     defer parsed.deinit();
     try testing.expectEqualStrings(buf[0..n], parsed.value);
+}
+
+// -- Negentropy messages and proof of work -------------------------------------
+
+/// A small fixed set to reconcile against, so the fuzzer's effort goes into the
+/// message and not into building storage.
+fn negStorage() !nip77.Storage {
+    var items: [40]nip77.Item = undefined;
+    for (&items, 0..) |*it, i| {
+        it.* = .{ .created_at = 1000 + i / 3, .id = [_]u8{@intCast(i)} ** 32 };
+    }
+    return nip77.Storage.fromSlice(testing.allocator, &items);
+}
+
+/// The frame size limit a target runs under: none, the smallest allowed, or
+/// the default.
+fn negLimit(smith: *testing.Smith) u64 {
+    return switch (smith.value(enum(u2) { none, smallest, default, other })) {
+        .none => 0,
+        .smallest => nip77.min_frame_size_limit,
+        .default, .other => nip77.default_frame_size_limit,
+    };
+}
+
+test "fuzz: a negentropy message a relay answers" {
+    try testing.fuzz({}, fuzzNegResponder, .{ .corpus = &.{
+        seed(&.{ .{ .int = 0 }, .{ .slice = "\x61" } }),
+        seed(&.{ .{ .int = 1 }, .{ .slice = "\x61\x00\x00" } }),
+        seed(&.{ .{ .int = 2 }, .{ .slice = "\x61\x00\x02\x00" } }),
+        seed(&.{ .{ .int = 0 }, .{ .slice = "\x61\x00\x01" ++ "\x00" ** 16 } }),
+        seed(&.{ .{ .int = 1 }, .{ .slice = "\x62" } }),
+        seed(&.{ .{ .int = 2 }, .{ .slice = "\x61\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x01" } }),
+    } });
+}
+
+/// What a relay does with a NEG-OPEN or NEG-MSG from anybody. It either
+/// answers or refuses, and an answer under a frame size limit fits it.
+fn fuzzNegResponder(_: void, smith: *testing.Smith) anyerror!void {
+    @disableInstrumentation();
+    const limit = negLimit(smith);
+    var buf: [4096]u8 = undefined;
+    const n = smith.slice(&buf);
+
+    var storage = try negStorage();
+    defer storage.deinit(testing.allocator);
+    var responder = try nip77.Responder.init(&storage, .{ .frame_size_limit = limit });
+    const out = responder.reconcile(testing.allocator, buf[0..n]) catch return;
+    defer testing.allocator.free(out);
+    if (limit != 0) try testing.expect(out.len <= limit);
+}
+
+test "fuzz: a negentropy reply a client reads" {
+    try testing.fuzz({}, fuzzNegInitiator, .{ .corpus = &.{
+        seed(&.{ .{ .int = 0 }, .{ .slice = "\x61" } }),
+        seed(&.{ .{ .int = 1 }, .{ .slice = "\x61\x00\x02\x01" ++ "\x07" ** 32 } }),
+        seed(&.{ .{ .int = 2 }, .{ .slice = "\x61\x00\x01" ++ "\x00" ** 16 } }),
+        seed(&.{ .{ .int = 0 }, .{ .slice = "\x60" } }),
+    } });
+}
+
+/// What a client does with a relay's answer after its first message. The ids
+/// it reports came out of that answer or out of its own set, and a next
+/// message under a frame size limit fits it.
+fn fuzzNegInitiator(_: void, smith: *testing.Smith) anyerror!void {
+    @disableInstrumentation();
+    const limit = negLimit(smith);
+    var buf: [4096]u8 = undefined;
+    const n = smith.slice(&buf);
+
+    var storage = try negStorage();
+    defer storage.deinit(testing.allocator);
+    var initiator = try nip77.Initiator.init(&storage, .{ .frame_size_limit = limit });
+    const first = try initiator.initiate(testing.allocator);
+    testing.allocator.free(first);
+    var r = initiator.reconcile(testing.allocator, buf[0..n]) catch return;
+    defer r.deinit(testing.allocator);
+    if (limit != 0) if (r.message) |m| try testing.expect(m.len <= limit);
+    try testing.expect(r.need.len <= n / 32 + 1);
+}
+
+test "fuzz: a NIP-13 committed target" {
+    try testing.fuzz({}, fuzzCommittedTarget, .{ .corpus = &.{
+        one("20"),
+        one("0"),
+        one("4294967295"),
+        one("4294967296"),
+        one("+16"),
+        one("1_6"),
+        one(""),
+    } });
+}
+
+/// A target is a number only when it is nothing but ASCII digits, and then it
+/// is that number.
+fn fuzzCommittedTarget(_: void, smith: *testing.Smith) anyerror!void {
+    @disableInstrumentation();
+    var buf: [64]u8 = undefined;
+    const n = smith.slice(&buf);
+    const tag: event.Tag = &.{ "nonce", "1", buf[0..n] };
+    const ev: event.Event = .{
+        .id = @splat(0),
+        .pubkey = @splat(0),
+        .created_at = 0,
+        .kind = 1,
+        .tags = &.{tag},
+        .content = "",
+        .sig = @splat(0),
+    };
+    const got = nip13.committedTarget(ev) orelse return;
+    try testing.expect(n > 0);
+    for (buf[0..n]) |ch| try testing.expect(std.ascii.isDigit(ch));
+    try testing.expectEqual(try std.fmt.parseInt(u32, buf[0..n], 10), got);
 }
