@@ -54,9 +54,38 @@ pub const AuthOptions = struct {
     /// One `x` tag per blob hash. Used for get, upload, media and delete;
     /// leave empty for list.
     hashes: []const [32]u8 = &.{},
-    /// An optional `server` tag (a domain) scoping the token to one server.
-    server: ?[]const u8 = null,
+    /// `server` tags scoping the token to these servers. Each is a lowercase
+    /// domain name and nothing else (`cdn.example.com`, not a URL). Empty
+    /// leaves the token valid on any server, which BUD-11 warns a leaked
+    /// delete token makes dangerous.
+    servers: []const []const u8 = &.{},
 };
+
+pub const AuthError = error{
+    /// A server is not a lowercase domain name.
+    InvalidServer,
+    /// An upload, delete or media token names no blob. BUD-11 requires an
+    /// `x` tag for each, and a token without one authorizes any blob.
+    MissingHash,
+    /// The token would expire at or before the moment it was made.
+    InvalidExpiration,
+};
+
+/// Whether `s` is what BUD-11 allows in a `server` tag: a lowercase domain
+/// name, dot separated labels of letters, digits and inner hyphens.
+pub fn isBareDomain(s: []const u8) bool {
+    if (s.len == 0 or s.len > 253) return false;
+    var labels = std.mem.splitScalar(u8, s, '.');
+    while (labels.next()) |label| {
+        if (label.len == 0 or label.len > 63) return false;
+        if (label[0] == '-' or label[label.len - 1] == '-') return false;
+        for (label) |ch| switch (ch) {
+            'a'...'z', '0'...'9', '-' => {},
+            else => return false,
+        };
+    }
+    return true;
+}
 
 /// Builds and signs the `kind:24242` event. The event borrows `opts` strings
 /// and owns its tag slices, allocated from `allocator`; build it in an arena.
@@ -67,14 +96,21 @@ pub fn authEvent(
     created_at: i64,
     opts: AuthOptions,
     aux_rand: ?[32]u8,
-) (std.mem.Allocator.Error || keys.Error)!event.Event {
+) (std.mem.Allocator.Error || keys.Error || AuthError)!event.Event {
+    if (opts.expiration <= created_at) return error.InvalidExpiration;
+    switch (opts.action) {
+        .upload, .delete, .media => if (opts.hashes.len == 0) return error.MissingHash,
+        .get, .list => {},
+    }
+    for (opts.servers) |srv| if (!isBareDomain(srv)) return error.InvalidServer;
+
     var tags: std.ArrayList(event.Tag) = .empty;
     try tags.append(allocator, try tag2(allocator, "t", opts.action.name()));
     try tags.append(allocator, try tag2(allocator, "expiration", try std.fmt.allocPrint(allocator, "{d}", .{opts.expiration})));
     for (opts.hashes) |h| {
         try tags.append(allocator, try tag2(allocator, "x", try hex.encode(allocator, &h)));
     }
-    if (opts.server) |s| try tags.append(allocator, try tag2(allocator, "server", s));
+    for (opts.servers) |srv| try tags.append(allocator, try tag2(allocator, "server", srv));
     const content = opts.content orelse opts.action.defaultContent();
     return event.create(allocator, signer, keypair, created_at, kind, tags.items, content, aux_rand);
 }
@@ -99,7 +135,7 @@ pub fn buildAuthHeader(
     created_at: i64,
     opts: AuthOptions,
     aux_rand: ?[32]u8,
-) (std.mem.Allocator.Error || keys.Error)![]u8 {
+) (std.mem.Allocator.Error || keys.Error || AuthError)![]u8 {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const ev = try authEvent(arena_state.allocator(), signer, keypair, created_at, opts, aux_rand);
@@ -262,7 +298,7 @@ test "blossom: upload auth header round trips" {
         .content = "Upload Blob",
         .expiration = 1_700_003_600,
         .hashes = &hashes,
-        .server = "cdn.example.com",
+        .servers = &.{"cdn.example.com"},
     }, null);
     defer gpa.free(header);
 
@@ -354,4 +390,38 @@ test "blossom: bad descriptors and lists" {
     defer list.deinit();
     try testing.expectEqual(@as(usize, 2), list.value.len);
     try testing.expectEqual(@as(u64, 5), list.value[1].size.?);
+}
+
+test "blossom: a token is refused when it would authorize more than it says" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var signer = keys.Signer.init();
+    defer signer.deinit();
+    const kp = try testKey(signer);
+    const h = [_][32]u8{[_]u8{7} ** 32};
+    const t0: i64 = 1_700_000_000;
+
+    // Upload, delete and media without a hash authorize any blob.
+    for ([_]Action{ .upload, .delete, .media }) |action| {
+        try testing.expectError(error.MissingHash, authEvent(a, signer, kp, t0, .{ .action = action, .expiration = t0 + 60 }, null));
+    }
+    _ = try authEvent(a, signer, kp, t0, .{ .action = .get, .expiration = t0 + 60 }, null);
+
+    // Expired from the start.
+    try testing.expectError(error.InvalidExpiration, authEvent(a, signer, kp, t0, .{ .action = .list, .expiration = t0 }, null));
+    try testing.expectError(error.InvalidExpiration, authEvent(a, signer, kp, t0, .{ .action = .list, .expiration = t0 - 1 }, null));
+
+    // A server is a lowercase domain, never a URL.
+    for ([_][]const u8{ "https://cdn.example.com", "CDN.example.com", "cdn.example.com:443", "cdn.example.com/", "", "-a.com", "a..com" }) |bad| {
+        try testing.expectError(error.InvalidServer, authEvent(a, signer, kp, t0, .{ .action = .list, .expiration = t0 + 60, .servers = &.{bad} }, null));
+    }
+
+    // Several servers, one tag each.
+    const ev = try authEvent(a, signer, kp, t0, .{ .action = .upload, .expiration = t0 + 60, .hashes = &h, .servers = &.{ "cdn.example.com", "blossom.example.org" } }, null);
+    var servers: usize = 0;
+    for (ev.tags) |t| {
+        if (std.mem.eql(u8, t[0], "server")) servers += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), servers);
 }
