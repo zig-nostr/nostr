@@ -63,6 +63,9 @@ pub const max_pending = 32;
 /// How many relays one client can be attached to.
 pub const max_relays = 16;
 
+/// The default deadline on publishing a request to one relay, in milliseconds.
+pub const default_publish_timeout_ms: u32 = 5_000;
+
 /// The default deadline on a request, in milliseconds. A signer may be waiting
 /// on a person to approve, so this is generous.
 pub const default_timeout_ms: u32 = 30_000;
@@ -110,6 +113,11 @@ pub const AuthUrlHandler = struct {
 pub const Options = struct {
     /// The deadline on each request, and on `awaitNostrConnect`.
     timeout_ms: u32 = default_timeout_ms,
+    /// The deadline on publishing a request to one relay, when `Conn` has
+    /// `publishTimeout` (`relay.Relay` and `relay.Connection` do). A relay
+    /// that has stopped reading then costs a request this long and no more
+    /// before the next relay gets it.
+    publish_timeout_ms: u32 = default_publish_timeout_ms,
     on_auth_url: ?AuthUrlHandler = null,
     /// A client key to reuse, so a signer that already knows this client does
     /// not have to approve it again. Null makes a fresh one.
@@ -150,6 +158,10 @@ pub const Reply = struct {
     }
 };
 
+fn isCanceled(err: anyerror) bool {
+    return err == error.Canceled;
+}
+
 /// A client over connections of type `Conn`: a pointer to a `relay.Relay` in
 /// production, or to an in-memory `relay.Connection` in tests. `Conn` must
 /// have `subscribe`, `publish`, `receive` and `authenticate`, which both do.
@@ -175,6 +187,7 @@ pub fn Client(comptime Conn: type) type {
         /// the signer to (nostrconnect). Owned.
         relays: [][]u8,
         timeout_ms: u32,
+        publish_timeout_ms: u32,
         on_auth_url: ?AuthUrlHandler,
 
         /// Guards everything below.
@@ -276,6 +289,7 @@ pub fn Client(comptime Conn: type) type {
                 .perms = null,
                 .relays = &.{},
                 .timeout_ms = options.timeout_ms,
+                .publish_timeout_ms = options.publish_timeout_ms,
                 .on_auth_url = options.on_auth_url,
                 .remote = null,
                 .id_prefix = std.fmt.bytesToHex(prefix_raw, .lower),
@@ -510,7 +524,12 @@ pub fn Client(comptime Conn: type) type {
             // signer may be listening on any of them.
             var sent: usize = 0;
             for (conns[0..count]) |conn| {
-                conn.publish(sealed.event) catch continue;
+                self.publishOne(conn, sealed.event) catch |err| {
+                    // One relay failing is the next relay's turn. A cancel is
+                    // the caller's, and ends the request.
+                    if (isCanceled(err)) return error.Canceled;
+                    continue;
+                };
                 sent += 1;
             }
             if (sent == 0) return Error.PublishFailed;
@@ -523,6 +542,27 @@ pub fn Client(comptime Conn: type) type {
             slot.result = null;
             slot.err = null;
             return reply;
+        }
+
+        /// Publishes to one relay, bounded by `publish_timeout_ms` when the
+        /// connection can bound a write.
+        fn publishOne(self: *Self, conn: Conn, ev: event.Event) !void {
+            const Target = switch (@typeInfo(Conn)) {
+                .pointer => |ptr| ptr.child,
+                else => Conn,
+            };
+            if (comptime @hasDecl(Target, "publishTimeout")) {
+                return conn.publishTimeout(ev, .{ .duration = .{
+                    .raw = .fromMilliseconds(self.publish_timeout_ms),
+                    .clock = .awake,
+                } }) catch |err| {
+                    // An io that cannot run the write as a task of its own
+                    // still gets the request out, unbounded, as before.
+                    if (@as(anyerror, err) == error.ConcurrencyUnavailable) return conn.publish(ev);
+                    return err;
+                };
+            }
+            return conn.publish(ev);
         }
 
         fn claimSlot(self: *Self) Error!usize {
@@ -1353,4 +1393,68 @@ test "nip46_client: one request over two relays is answered once" {
     try serving_b.await(io);
     try reading_a.await(io);
     try reading_b.await(io);
+}
+
+/// A connection that only takes publishes, failing them the way it is told.
+const ScriptedConn = struct {
+    fail_with: ?anyerror = null,
+    publishes: usize = 0,
+
+    pub fn subscribe(_: *ScriptedConn, _: []const u8, _: []const filter.Filter) !void {}
+    pub fn publish(self: *ScriptedConn, _: event.Event) !void {
+        self.publishes += 1;
+        if (self.fail_with) |e| return e;
+    }
+};
+
+/// The same, with a bounded publish that reports a relay that never drained.
+const StalledConn = struct {
+    timeout_seen_ms: ?i64 = null,
+
+    pub fn subscribe(_: *StalledConn, _: []const u8, _: []const filter.Filter) !void {}
+    pub fn publish(_: *StalledConn, _: event.Event) !void {
+        return error.Unexpected;
+    }
+    pub fn publishTimeout(self: *StalledConn, _: event.Event, timeout: std.Io.Timeout) !void {
+        self.timeout_seen_ms = timeout.duration.raw.toMilliseconds();
+        return error.Timeout;
+    }
+};
+
+test "nip46_client: a cancel while publishing ends the request instead of trying the next relay" {
+    const gpa = testing.allocator;
+    var ctx = keys.Signer.init();
+    defer ctx.deinit();
+    const remote = try testKeyPair(ctx, 9);
+    const uri = try nip46.buildBunkerUri(gpa, remote.public_key, &.{"wss://hub.test"}, null);
+    defer gpa.free(uri);
+
+    const C = Client(*ScriptedConn);
+    const client = try C.initBunker(gpa, testing.io, ctx, uri, .{ .timeout_ms = 100 });
+    defer client.deinit();
+    var cancelled: ScriptedConn = .{ .fail_with = error.Canceled };
+    var next: ScriptedConn = .{};
+    try client.attach(&cancelled);
+    try client.attach(&next);
+    try testing.expectError(error.Canceled, client.call("ping", &.{}));
+    try testing.expectEqual(@as(usize, 0), next.publishes);
+}
+
+test "nip46_client: a relay that stops reading costs a request its publish deadline only" {
+    const gpa = testing.allocator;
+    var ctx = keys.Signer.init();
+    defer ctx.deinit();
+    const remote = try testKeyPair(ctx, 9);
+    const uri = try nip46.buildBunkerUri(gpa, remote.public_key, &.{"wss://hub.test"}, null);
+    defer gpa.free(uri);
+
+    const C = Client(*StalledConn);
+    const client = try C.initBunker(gpa, testing.io, ctx, uri, .{ .timeout_ms = 50, .publish_timeout_ms = 1234 });
+    defer client.deinit();
+    var stalled: StalledConn = .{};
+    try client.attach(&stalled);
+    // The publish was bounded by the option, and failing it is an ordinary
+    // failure to publish rather than a hang.
+    try testing.expectError(Error.PublishFailed, client.call("ping", &.{}));
+    try testing.expectEqual(@as(?i64, 1234), stalled.timeout_seen_ms);
 }
