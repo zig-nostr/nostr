@@ -65,7 +65,8 @@ pub const Options = struct {
     threads: u32 = 1,
     /// Set to true from any thread to stop the search.
     cancel: ?*const std.atomic.Value(bool) = null,
-    /// Stop with `error.Timeout` once this much time has passed.
+    /// Stop with `error.Timeout` once this much time has passed. A value
+    /// too large for the clock means no deadline.
     timeout_ms: ?u64 = null,
     /// When set, workers add the hashes they computed (flushed in batches).
     attempts: ?*std.atomic.Value(u64) = null,
@@ -224,8 +225,9 @@ pub fn mine(
         .target = opts.target,
         .threads = threads,
         .cancel = opts.cancel,
+        // A timeout past what the clock can count is no deadline at all.
         .deadline_ms = if (opts.timeout_ms) |t|
-            std.Io.Timestamp.now(io, .awake).toMilliseconds() + @as(i64, @intCast(t))
+            std.Io.Timestamp.now(io, .awake).toMilliseconds() +| (std.math.cast(i64, t) orelse std.math.maxInt(i64))
         else
             null,
         .io = io,
@@ -382,6 +384,12 @@ test "nip13: mine stops at the deadline" {
         .created_at = 1,
         .kind = 1,
     }, .{ .target = 200, .threads = 2, .timeout_ms = 30 }));
+}
+
+test "nip13: a timeout too long for the clock is no deadline, not a crash" {
+    var m = try mine(testing.allocator, testing.io, .{ .pubkey = @splat(1), .created_at = 1, .kind = 1 }, .{ .target = 1, .timeout_ms = std.math.maxInt(u64) });
+    defer m.deinit();
+    try checkMined(m, 1);
 }
 
 test "nip13: mine rejects a target above 256" {
