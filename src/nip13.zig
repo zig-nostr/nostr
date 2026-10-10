@@ -391,19 +391,3 @@ test "nip13: mine rejects a target above 256" {
         .kind = 1,
     }, .{ .target = 257 }));
 }
-
-test "nip13: hash rate bench" {
-    // Prints hashes per second for 1 and 4 threads. Meaningful in ReleaseFast.
-    for ([_]u32{ 1, 4 }) |threads| {
-        var count: std.atomic.Value(u64) = .init(0);
-        const t0 = std.Io.Timestamp.now(testing.io, .awake).toMilliseconds();
-        try testing.expectError(error.Timeout, mine(testing.allocator, testing.io, .{
-            .pubkey = @splat(3),
-            .created_at = 1,
-            .kind = 1,
-            .content = "bench",
-        }, .{ .target = 200, .threads = threads, .timeout_ms = 500, .attempts = &count }));
-        const ms: u64 = @intCast(@max(1, std.Io.Timestamp.now(testing.io, .awake).toMilliseconds() - t0));
-        std.debug.print("nip13 bench: {d} thread(s): {d} hashes/s\n", .{ threads, count.load(.monotonic) * 1000 / ms });
-    }
-}

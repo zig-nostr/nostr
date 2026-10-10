@@ -205,6 +205,8 @@ pub fn main() !void {
     const by_id_best = try bestQuery(gpa, io, &store, by_id);
 
     const parse_ns = try bestParse(io);
+    const pow_1 = try powRate(io, 1);
+    const pow_4 = try powRate(io, 4);
 
     std.debug.print(
         \\zig-nostr store benchmark
@@ -217,6 +219,7 @@ pub fn main() !void {
         \\  warm timeline query: {d} events in {d:.1} us (best of {d}; 1 author, any kind)
         \\  warm profile query : {d} event in {d:.1} us (best of {d}; 1 author, kind 0, {d} entries examined)
         \\  event.fromJson     : {d:.0} ns per event (best of {d} rounds of {d}; a note with 4 tags)
+        \\  nip13.mine         : {d} hashes/s on 1 thread, {d} hashes/s on 4
         \\
     , .{
         n,
@@ -247,6 +250,8 @@ pub fn main() !void {
         @as(f64, @floatFromInt(parse_ns)) / @as(f64, @floatFromInt(parse_reps)),
         parse_rounds,
         parse_reps,
+        pow_1,
+        pow_4,
     });
 }
 
@@ -321,4 +326,22 @@ fn bestQuery(
         if (dt < best_ns) best_ns = dt;
     }
     return .{ .ns = best_ns, .notes = notes, .examined = examined };
+}
+
+/// NIP-13 hash rate: mines for half a second at a target nobody reaches and
+/// counts the attempts.
+fn powRate(io: std.Io, threads: u32) !u64 {
+    var count: std.atomic.Value(u64) = .init(0);
+    const t0 = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+    if (nostr.nip13.mine(std.heap.smp_allocator, io, .{
+        .pubkey = @splat(3),
+        .created_at = 1,
+        .kind = 1,
+        .content = "bench",
+    }, .{ .target = 200, .threads = threads, .timeout_ms = 500, .attempts = &count })) |mined| {
+        _ = mined;
+        return error.Unexpected;
+    } else |err| if (err != error.Timeout) return err;
+    const ms: u64 = @intCast(@max(1, std.Io.Timestamp.now(io, .awake).toMilliseconds() - t0));
+    return count.load(.monotonic) * 1000 / ms;
 }
