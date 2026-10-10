@@ -841,6 +841,59 @@ pub const Store = struct {
         return evicted;
     }
 
+    /// Removes the event `id` and every index entry that points at it, in one
+    /// write transaction. Returns whether it was stored.
+    ///
+    /// This is a local removal, not a NIP-09 deletion: no tombstone is
+    /// recorded, so the same event can be ingested again later. If it was the
+    /// current event of a replaceable coordinate, the coordinate is cleared,
+    /// so an older version that arrives afterwards is taken as the current one.
+    pub fn remove(self: *Store, gpa: std.mem.Allocator, id: [32]u8) Error!bool {
+        var txn: ?*c.MDB_txn = null;
+        try check(c.mdb_txn_begin(self.env, null, 0, &txn));
+        errdefer c.mdb_txn_abort(txn);
+        var scratch = std.heap.ArenaAllocator.init(gpa);
+        defer scratch.deinit();
+        const removed = try self.removeIn(gpa, txn, scratch.allocator(), id);
+        try check(c.mdb_txn_commit(txn));
+        return removed;
+    }
+
+    /// Removes every event `query(filter)` returns, in one write transaction,
+    /// and returns how many. A `limit` on the filter bounds it the way it
+    /// bounds the query. Like `remove`, records no tombstones.
+    pub fn removeMatching(self: *Store, gpa: std.mem.Allocator, filter: Filter) Error!usize {
+        var found = try self.query(gpa, filter);
+        defer found.deinit();
+
+        var txn: ?*c.MDB_txn = null;
+        try check(c.mdb_txn_begin(self.env, null, 0, &txn));
+        errdefer c.mdb_txn_abort(txn);
+        var scratch = std.heap.ArenaAllocator.init(gpa);
+        defer scratch.deinit();
+        var removed: usize = 0;
+        for (found.events) |ev| {
+            _ = scratch.reset(.retain_capacity);
+            if (try self.removeIn(gpa, txn, scratch.allocator(), ev.id)) removed += 1;
+        }
+        try check(c.mdb_txn_commit(txn));
+        return removed;
+    }
+
+    /// Removes `id` within `txn`, decoding the stored record into `scratch`
+    /// so the index keys it wrote can be rebuilt and deleted.
+    fn removeIn(self: *Store, gpa: std.mem.Allocator, txn: ?*c.MDB_txn, scratch: std.mem.Allocator, id: [32]u8) Error!bool {
+        var k = val(&id);
+        var v: c.MDB_val = undefined;
+        const rc = c.mdb_get(txn, self.events_dbi, &k, &v);
+        if (rc == c.MDB_NOTFOUND) return false;
+        try check(rc);
+        const stored = try decodeEvent(scratch, valBytes(v));
+        try self.removeEvent(gpa, txn, stored);
+        try self.clearReplCoordinate(gpa, txn, stored);
+        return true;
+    }
+
     // -- Ingestion ----------------------------------------------------------
 
     /// Ingests `ev`, applying NIP-01 protocol semantics on top of raw storage:
@@ -2564,6 +2617,91 @@ test "store: evictToCap removes the oldest events and their indexes" {
 
     // Already under the cap: nothing to do.
     try std.testing.expectEqual(@as(usize, 0), try store.evictToCap(gpa, 10));
+}
+
+test "store: remove takes one event and every index entry that points at it" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var store = try openTempStore(&tmp, "remove.mdb", &buf);
+    defer store.deinit();
+
+    const a = [_]u8{0xA1} ** 32;
+    const t_tag = [_]Tag{&[_][]const u8{ "t", "zig" }};
+    for (1..4) |i| {
+        const seed: u8 = @intCast(i);
+        _ = try store.putEvent(gpa, qEvent(seed, a, 1, @as(i64, @intCast(i)) * 100, &t_tag));
+    }
+
+    try std.testing.expect(try store.remove(gpa, [_]u8{2} ** 32));
+    try std.testing.expect(!try store.remove(gpa, [_]u8{2} ** 32));
+    try std.testing.expect(!try store.hasEvent([_]u8{2} ** 32));
+    try std.testing.expectEqual(@as(usize, 2), try store.eventCount());
+
+    // Every index that could have produced it no longer does.
+    const t_values = [_][]const u8{"zig"};
+    const t_filter = [_]filter_mod.TagFilter{.{ .letter = 't', .values = &t_values }};
+    const filters = [_]Filter{
+        .{ .authors = &[_][32]u8{a} },
+        .{ .authors = &[_][32]u8{a}, .kinds = &[_]u16{1} },
+        .{ .kinds = &[_]u16{1} },
+        .{ .tags = &t_filter },
+        .{},
+    };
+    for (filters) |f| {
+        var r = try store.query(gpa, f);
+        defer r.deinit();
+        try std.testing.expectEqual(@as(usize, 2), r.events.len);
+        try std.testing.expectEqual(@as(u8, 3), r.events[0].id[0]);
+        try std.testing.expectEqual(@as(u8, 1), r.events[1].id[0]);
+    }
+
+    // Not a deletion: the same event can come back.
+    try std.testing.expectEqual(IngestResult.added, try store.ingest(gpa, qEvent(2, a, 1, 200, &t_tag), .{}));
+}
+
+test "store: removing the current replaceable event lets an older one take its place" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var store = try openTempStore(&tmp, "remove-repl.mdb", &buf);
+    defer store.deinit();
+
+    const a = [_]u8{0xA2} ** 32;
+    try std.testing.expectEqual(IngestResult.added, try store.ingest(gpa, qEvent(9, a, 0, 900, &[_]Tag{}), .{}));
+    try std.testing.expect(try store.remove(gpa, [_]u8{9} ** 32));
+    try std.testing.expectEqual(IngestResult.added, try store.ingest(gpa, qEvent(8, a, 0, 800, &[_]Tag{}), .{}));
+    var r = try store.query(gpa, .{ .authors = &[_][32]u8{a}, .kinds = &[_]u16{0} });
+    defer r.deinit();
+    try std.testing.expectEqual(@as(usize, 1), r.events.len);
+    try std.testing.expectEqual(@as(u8, 8), r.events[0].id[0]);
+}
+
+test "store: removeMatching removes what the filter selects and nothing else" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var store = try openTempStore(&tmp, "remove-matching.mdb", &buf);
+    defer store.deinit();
+
+    const a = [_]u8{0xA3} ** 32;
+    const b = [_]u8{0xB3} ** 32;
+    for (1..5) |i| {
+        const seed: u8 = @intCast(i);
+        _ = try store.putEvent(gpa, qEvent(seed, if (i % 2 == 0) a else b, 1, @as(i64, @intCast(i)) * 100, &[_]Tag{}));
+    }
+    try std.testing.expectEqual(@as(usize, 2), try store.removeMatching(gpa, .{ .authors = &[_][32]u8{a} }));
+    try std.testing.expectEqual(@as(usize, 2), try store.eventCount());
+    try std.testing.expect(try store.hasEvent([_]u8{1} ** 32));
+    try std.testing.expect(try store.hasEvent([_]u8{3} ** 32));
+
+    // A limit bounds it like a query: the newest one only.
+    try std.testing.expectEqual(@as(usize, 1), try store.removeMatching(gpa, .{ .authors = &[_][32]u8{b}, .limit = 1 }));
+    try std.testing.expect(!try store.hasEvent([_]u8{3} ** 32));
+    try std.testing.expect(try store.hasEvent([_]u8{1} ** 32));
 }
 
 test "store: a profile is found without reading the notes written since" {
