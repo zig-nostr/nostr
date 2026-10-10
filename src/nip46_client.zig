@@ -398,7 +398,7 @@ pub fn Client(comptime Conn: type) type {
                     // "auth-required" waits for the OK above. Any other close
                     // ends this relay's part; the others carry on.
                     .closed => |c| if (!std.mem.startsWith(u8, c.message, "auth-required")) return,
-                    .eose, .notice => {},
+                    .eose, .notice, .count, .neg_msg, .neg_err => {},
                 }
             }
         }
