@@ -46,7 +46,7 @@ pub const Error = error{
     InvalidWrapSignature,
     /// The seal's id or signature does not check out.
     InvalidSealSignature,
-    /// The decrypted seal is not a well-formed event.
+    /// The decrypted seal is not a well-formed event, or carries tags.
     InvalidSeal,
     /// The decrypted rumor is not a well-formed unsigned event.
     InvalidRumor,
@@ -188,7 +188,7 @@ pub const Unwrapped = struct {
 ///
 ///   1. the wrap is kind 1059 (or 21059), and its id and signature verify;
 ///   2. its content decrypts (NIP-44, MAC checked) to a well-formed event;
-///   3. that event is kind 13, and its id and signature verify;
+///   3. that event is kind 13 with no tags, and its id and signature verify;
 ///   4. the seal's content decrypts to a well-formed unsigned event;
 ///   5. the rumor's id is the hash of its fields;
 ///   6. the rumor's pubkey is the seal's signer.
@@ -217,6 +217,9 @@ pub fn unwrap(
         else => return Error.InvalidSeal,
     };
     if (seal_event.kind != seal_kind) return Error.WrongKind;
+    // A seal's tags must be empty: whatever is there sits outside the
+    // encryption and is nothing the sender's rumor said.
+    if (seal_event.tags.len != 0) return Error.InvalidSeal;
     if (!try event.verify(a, signer, seal_event)) return Error.InvalidSealSignature;
 
     const rumor_json = try nip44.decrypt(a, signer, recipient_sk, seal_event.pubkey, seal_event.content);
@@ -804,4 +807,24 @@ test "nip59: a sender who lists themselves is wrapped to once" {
     var dm = try privateDirectMessage(testing.allocator, testing.io, signer, alice, &.{ alice.public_key, bob.public_key }, "note to self and Bob", null, null);
     defer dm.deinit();
     try testing.expectEqual(@as(usize, 2), dm.wraps.len);
+}
+
+test "nip59: a seal that carries tags is refused" {
+    var signer = try keys.Signer.initRandomized(testing.io);
+    defer signer.deinit();
+    const alice = try signer.generateKeyPair(testing.io);
+    const bob = try signer.generateKeyPair(testing.io);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const rumor = try Rumor.init(a, alice.public_key, 1700000000, 14, &.{}, "hi");
+    const ciphertext = try nip44.encrypt(a, testing.io, signer, alice.secret_key, bob.public_key, try rumorToJson(a, rumor));
+    // NIP-59: a seal's tags MUST be empty. Anything there is outside the
+    // encryption, readable by whoever unwraps it, and was never part of what
+    // the sender wrote.
+    const tags = [_]event.Tag{&.{ "p", "f7234bd4c1394dda46d09f35bd384dd30cc552ad5541990f98844fb06676e9ca" }};
+    const tagged = try event.create(a, signer, alice, 1700000000, seal_kind, &tags, ciphertext, null);
+    const w = try wrapLeaky(a, testing.io, signer, tagged, bob.public_key, &.{});
+    try testing.expectError(Error.InvalidSeal, unwrap(testing.allocator, signer, bob.secret_key, w));
 }
