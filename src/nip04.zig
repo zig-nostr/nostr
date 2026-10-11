@@ -30,6 +30,8 @@ pub const Error = error{
     InvalidPadding,
     /// The randomness source failed while generating the iv.
     RandomFailed,
+    /// The caller was cancelled while waiting for randomness.
+    Canceled,
     OutOfMemory,
 };
 
@@ -93,7 +95,10 @@ pub fn encrypt(
     var key = try sharedKey(signer, secret_key, peer_pubkey);
     defer std.crypto.secureZero(u8, &key);
     var iv: [block]u8 = undefined;
-    io.randomSecure(&iv) catch return Error.RandomFailed;
+    io.randomSecure(&iv) catch |err| switch (err) {
+        error.Canceled => |e| return e,
+        error.EntropyUnavailable => return Error.RandomFailed,
+    };
     return encryptWithIv(gpa, key, iv, plaintext);
 }
 
@@ -272,4 +277,24 @@ test "nip04: tampered ciphertext and bad padding fail" {
     const payload = try std.fmt.allocPrint(a, "{s}?iv=AAAAAAAAAAAAAAAAAAAAAA==", .{b64});
     defer a.free(payload);
     try testing.expectError(Error.InvalidPadding, decryptWithKey(a, key, payload));
+}
+
+fn encryptAfterCancel(io: std.Io, signer: keys.Signer) Error!void {
+    // Waits to be cancelled, then carries the cancel into the call.
+    io.sleep(.fromMilliseconds(60_000), .awake) catch |err| switch (err) {
+        error.Canceled => io.recancel(),
+    };
+    const payload = try encrypt(testing.allocator, io, signer, sk1, pk2, "hello");
+    testing.allocator.free(payload);
+}
+
+test "nip04: encrypt while cancelled reports the cancel" {
+    const io = testing.io;
+    var signer = keys.Signer.init();
+    defer signer.deinit();
+    var pending = try io.concurrent(encryptAfterCancel, .{ io, signer });
+    // Where a cancel lands depends on the system: on Linux the read of
+    // randomness takes it, elsewhere randomness never blocks and the call
+    // completes. Either is fine. A cancel turned into another error is not.
+    pending.cancel(io) catch |err| try testing.expectEqual(error.Canceled, err);
 }

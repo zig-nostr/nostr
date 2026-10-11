@@ -8,9 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking
+
+- `keys.Error`, `nip44.Error` and `nip04.Error` gained `Canceled` (and `nip59.Error` with them), and `websocket.generateKey` can now return `error.Canceled`. A switch over any of them that has no `else` needs the new case.
+
 ### Fixed
 
-- A publish cancelled before its frame was written returned `error.RandomFailed` on Linux instead of `error.Canceled`, because the read of entropy for the frame's mask took the cancel and the library reported it as a failure to get randomness. It now returns `error.Canceled`.
+- A call cancelled while it waited for randomness reported a failure instead of the cancel on Linux, where reading randomness is a point a cancel can land. A publish or a websocket handshake returned `error.RandomFailed`, `nip44.encrypt`, `nip04.encrypt` and `nip59.seal` and `wrap` returned `error.RandomFailed`, `Signer.generateKeyPair` returned `error.InvalidSecretKey`, `Signer.initRandomized` returned `error.ContextRandomizationFailed`, a dial over TLS returned `error.RandomFailed`, and a NIP-46 client that generates its own key returned `error.EntropyUnavailable`. Each now returns `error.Canceled`. The other errors still mean what they did: the system had no randomness to give.
 
 ## [0.15.1] - 2026-10-11
 

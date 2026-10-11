@@ -331,7 +331,10 @@ fn tag2(a: std.mem.Allocator, name: []const u8, bytes: []const u8) std.mem.Alloc
 /// made.
 fn randomPastTimestamp(io: std.Io) Error!i64 {
     var buf: [8]u8 = undefined;
-    io.randomSecure(&buf) catch return Error.RandomFailed;
+    io.randomSecure(&buf) catch |err| switch (err) {
+        error.Canceled => |e| return e,
+        error.EntropyUnavailable => return Error.RandomFailed,
+    };
     const r = std.mem.readInt(u64, &buf, .little);
     const offset: i64 = 1 + @as(i64, @intCast(r % @as(u64, @intCast(max_timestamp_tweak))));
     return std.Io.Timestamp.now(io, .real).toSeconds() - offset;
@@ -339,7 +342,10 @@ fn randomPastTimestamp(io: std.Io) Error!i64 {
 
 fn auxRand(io: std.Io) Error![32]u8 {
     var aux: [32]u8 = undefined;
-    io.randomSecure(&aux) catch return Error.RandomFailed;
+    io.randomSecure(&aux) catch |err| switch (err) {
+        error.Canceled => |e| return e,
+        error.EntropyUnavailable => return Error.RandomFailed,
+    };
     return aux;
 }
 
@@ -827,4 +833,27 @@ test "nip59: a seal that carries tags is refused" {
     const tagged = try event.create(a, signer, alice, 1700000000, seal_kind, &tags, ciphertext, null);
     const w = try wrapLeaky(a, testing.io, signer, tagged, bob.public_key, &.{});
     try testing.expectError(Error.InvalidSeal, unwrap(testing.allocator, signer, bob.secret_key, w));
+}
+
+fn sealAfterCancel(io: std.Io, signer: keys.Signer, sender: keys.KeyPair, recipient: keys.PublicKey, rumor: Rumor) Error!void {
+    // Waits to be cancelled, then carries the cancel into the call.
+    io.sleep(.fromMilliseconds(60_000), .awake) catch |err| switch (err) {
+        error.Canceled => io.recancel(),
+    };
+    var sealed = try seal(testing.allocator, io, signer, sender, recipient, rumor);
+    sealed.deinit();
+}
+
+test "nip59: sealing while cancelled reports the cancel" {
+    const io = testing.io;
+    var signer = keys.Signer.init();
+    defer signer.deinit();
+    const alice = try signer.keyPairFromSecretKey([_]u8{1} ** 32);
+    const bob = try signer.keyPairFromSecretKey([_]u8{2} ** 32);
+    const rumor = try Rumor.init(testing.allocator, alice.public_key, 1700000000, 14, &.{}, "hi");
+    var pending = try io.concurrent(sealAfterCancel, .{ io, signer, alice, bob.public_key, rumor });
+    // Where a cancel lands depends on the system: on Linux the read of
+    // randomness takes it, elsewhere randomness never blocks and the call
+    // completes. Either is fine. A cancel turned into another error is not.
+    pending.cancel(io) catch |err| try testing.expectEqual(error.Canceled, err);
 }

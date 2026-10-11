@@ -20,6 +20,8 @@ pub const Error = error{
     InvalidPublicKey,
     SigningFailed,
     ContextRandomizationFailed,
+    /// The caller was cancelled while waiting for randomness.
+    Canceled,
 };
 
 pub const KeyPair = struct {
@@ -48,7 +50,10 @@ pub const Signer = struct {
         var self = init();
         errdefer self.deinit();
         var seed: [32]u8 = undefined;
-        io.randomSecure(&seed) catch return Error.ContextRandomizationFailed;
+        io.randomSecure(&seed) catch |err| switch (err) {
+            error.Canceled => |e| return e,
+            error.EntropyUnavailable => return Error.ContextRandomizationFailed,
+        };
         if (c.secp256k1_context_randomize(self.ctx, &seed) != 1) {
             return Error.ContextRandomizationFailed;
         }
@@ -80,7 +85,10 @@ pub const Signer = struct {
     pub fn generateKeyPair(self: Signer, io: std.Io) Error!KeyPair {
         while (true) {
             var secret_key: SecretKey = undefined;
-            io.randomSecure(&secret_key) catch return Error.InvalidSecretKey;
+            io.randomSecure(&secret_key) catch |err| switch (err) {
+                error.Canceled => |e| return e,
+                error.EntropyUnavailable => return Error.InvalidSecretKey,
+            };
             // Reject the negligibly-rare out-of-range key and retry.
             if (c.secp256k1_ec_seckey_verify(self.ctx, &secret_key) != 1) continue;
             return self.keyPairFromSecretKey(secret_key);
@@ -299,4 +307,25 @@ test "BIP-340 official test-vector suite" {
         // Verification half: applies to every vector.
         try std.testing.expectEqual(v.valid, signer.verify(sig, message, public_key));
     }
+}
+
+fn generateAfterCancel(io: std.Io, signer: Signer) Error!void {
+    // Waits to be cancelled, then carries the cancel into the call.
+    io.sleep(.fromMilliseconds(60_000), .awake) catch |err| switch (err) {
+        error.Canceled => io.recancel(),
+    };
+    _ = try signer.generateKeyPair(io);
+    var randomized = try Signer.initRandomized(io);
+    randomized.deinit();
+}
+
+test "generating a key while cancelled reports the cancel" {
+    const io = std.testing.io;
+    var signer = Signer.init();
+    defer signer.deinit();
+    var pending = try io.concurrent(generateAfterCancel, .{ io, signer });
+    // Where a cancel lands depends on the system: on Linux the read of
+    // randomness takes it, elsewhere randomness never blocks and the call
+    // completes. Either is fine. A cancel turned into another error is not.
+    pending.cancel(io) catch |err| try std.testing.expectEqual(error.Canceled, err);
 }

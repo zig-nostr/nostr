@@ -157,10 +157,14 @@ pub fn acceptKey(sec_key: []const u8) [28]u8 {
 }
 
 /// Generates a fresh base64 `Sec-WebSocket-Key` (16 random bytes → 24 chars)
-/// using `io` for randomness.
-pub fn generateKey(io: std.Io) error{RandomFailed}![24]u8 {
+/// using `io` for randomness. A cancel while waiting for randomness returns
+/// `error.Canceled`.
+pub fn generateKey(io: std.Io) error{ RandomFailed, Canceled }![24]u8 {
     var raw: [16]u8 = undefined;
-    io.randomSecure(&raw) catch return error.RandomFailed;
+    io.randomSecure(&raw) catch |err| switch (err) {
+        error.Canceled => |e| return e,
+        error.EntropyUnavailable => return error.RandomFailed,
+    };
     var out: [24]u8 = undefined;
     _ = std.base64.standard.Encoder.encode(&out, &raw);
     return out;
@@ -392,4 +396,21 @@ test "checkHandshakeResponse rejects bad status, missing, and mismatched accept"
         "HTTP/1.1 101 Switching Protocols\r\nSec-WebSocket-Accept: wrong\r\n\r\n",
         good_accept,
     ));
+}
+
+fn generateKeyAfterCancel(io: std.Io) error{ RandomFailed, Canceled }!void {
+    // Waits to be cancelled, then carries the cancel into the call.
+    io.sleep(.fromMilliseconds(60_000), .awake) catch |err| switch (err) {
+        error.Canceled => io.recancel(),
+    };
+    _ = try generateKey(io);
+}
+
+test "generateKey while cancelled reports the cancel" {
+    const io = std.testing.io;
+    var pending = try io.concurrent(generateKeyAfterCancel, .{io});
+    // Where a cancel lands depends on the system: on Linux the read of
+    // randomness takes it, elsewhere randomness never blocks and the call
+    // completes. Either is fine. A cancel turned into another error is not.
+    pending.cancel(io) catch |err| try std.testing.expectEqual(error.Canceled, err);
 }

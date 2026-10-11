@@ -196,7 +196,10 @@ pub fn Connection(comptime Stream: type) type {
         /// `HandshakeFailed`, and the status it answered with is left in
         /// `handshake_status`.
         pub fn handshake(self: *Self, host: []const u8, path: []const u8) !void {
-            const key = websocket.generateKey(self.io) catch return ConnectionError.RandomFailed;
+            const key = websocket.generateKey(self.io) catch |err| switch (err) {
+                error.Canceled => |e| return e,
+                error.RandomFailed => return ConnectionError.RandomFailed,
+            };
 
             var req: std.ArrayList(u8) = .empty;
             defer req.deinit(self.allocator);
@@ -1164,7 +1167,10 @@ fn upgrade(gpa: std.mem.Allocator, io: std.Io, parsed: Url, tcp: net.Stream, dia
         try ca_bundle.rescan(gpa, io, std.Io.Timestamp.now(io, .real));
 
         var entropy: [tls.Client.Options.entropy_len]u8 = undefined;
-        io.randomSecure(&entropy) catch return error.RandomFailed;
+        io.randomSecure(&entropy) catch |err| switch (err) {
+            error.Canceled => |e| return e,
+            error.EntropyUnavailable => return error.RandomFailed,
+        };
 
         ts.client = try tls.Client.init(
             &transport.tcp_reader.interface,
@@ -2689,6 +2695,32 @@ test "a publish that is cancelled reports the cancel, not a failure" {
     // to this stream does and the publish completes. Either is fine. A cancel
     // turned into some other error is not.
     pending.cancel(io) catch |err| try std.testing.expectEqual(error.Canceled, err);
+}
+
+fn handshakeAfterCancel(io: std.Io, conn: *TestConn) !void {
+    io.sleep(.fromMilliseconds(60_000), .awake) catch |err| switch (err) {
+        error.Canceled => io.recancel(),
+    };
+    return conn.handshake("relay.example.com", "/");
+}
+
+test "a handshake that is cancelled reports the cancel, not a failure" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var written: std.ArrayList(u8) = .empty;
+    defer written.deinit(allocator);
+    var server = FakeStream{ .to_read = "", .written = &written, .allocator = allocator };
+    var conn = newConn(allocator, &server);
+    defer conn.deinit();
+
+    var pending = try io.concurrent(handshakeAfterCancel, .{ io, &conn });
+    // As for the publish: on Linux the key's randomness takes the cancel.
+    // Elsewhere the handshake runs on and this relay, which answers
+    // nothing, fails it.
+    pending.cancel(io) catch |err| {
+        const e: anyerror = err;
+        if (e != error.Canceled and e != ConnectionError.HandshakeFailed) return err;
+    };
 }
 
 test "a bounded publish stuck on a deaf peer ends when its caller is cancelled" {
