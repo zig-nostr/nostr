@@ -2610,6 +2610,12 @@ const small_event: Event = .{
 };
 
 test "a publish to a peer that stopped reading gives up at its deadline" {
+    // Windows completes a large send on a loopback socket without waiting
+    // for the peer to read, whatever the buffer sizes, so this cannot block
+    // there. The deadline logic itself is the same code on every system and
+    // is covered by "a publish waiting behind another write times out and
+    // sends nothing", which uses no real socket.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var peer: DeafPeer = undefined;
@@ -2655,6 +2661,12 @@ test "a publish waiting behind another write times out and sends nothing" {
 }
 
 test "a bounded publish stuck on a deaf peer ends when its caller is cancelled" {
+    // Windows completes a large send on a loopback socket without waiting
+    // for the peer to read, whatever the buffer sizes, so this cannot block
+    // there. The deadline logic itself is the same code on every system and
+    // is covered by "a publish waiting behind another write times out and
+    // sends nothing", which uses no real socket.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     // Without stack traces, for the reason in the cancelled dial's test.
     var debug: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
     defer if (debug.deinit() == .leak) @panic("the cancelled publish leaked");
