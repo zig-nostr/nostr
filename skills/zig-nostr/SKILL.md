@@ -86,6 +86,13 @@ try relay.publish(note); // then read for the .ok message with that event's id
 - **`dial` takes no deadline.** To bound it, run it with `io.concurrent` and cancel it at the deadline; a cancelled dial stops and frees what it allocated. The name lookup is the one step a cancel cannot interrupt.
 - A message the parser cannot read is skipped and counted (`relay.unreadable()`), and the connection carries on.
 - A relay that answers the upgrade with anything but 101 (503 when busy, 401 or 403, 429) fails `dial` with `HandshakeFailed`. `nostr.relay.dialDiagnosed(allocator, io, url, &diagnostic)` is `dial` that also fills `diagnostic.status` (a `relay.DialDiagnostic`) with the status the relay answered, or 0 if it never got that far.
+- To reach a relay through a proxy or tunnel, connect the TCP stream yourself (to the relay's host and port, through the HTTP CONNECT or SOCKS5 exchange) and hand it to `dialOver`. It does the TLS handshake for `wss://` with the URL's host, then the upgrade, and owns the stream from then on: it closes it on every error, and `deinit` closes it after a success. `dialOverDiagnosed` reports the status like `dialDiagnosed`. Bound it the same way as `dial`.
+
+```zig
+// `tcp` is a std.Io.net.Stream already connected through the proxy to relay.example:443.
+const relay = try nostr.relay.dialOver(allocator, io, "wss://relay.example", tcp);
+defer relay.deinit(); // closes tcp too
+```
 - `Filter.search` is NIP-50 full-text search, sent to the relay as `"search"`. The relay does the matching, so `Filter.matches` ignores it.
 
 ## The local store

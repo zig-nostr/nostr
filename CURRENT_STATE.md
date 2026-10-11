@@ -21,7 +21,9 @@ covered by tests:
   hardcoded relays. A read can carry a deadline, so a thread serving a quiet
   relay can still notice that its pool changed, a publish can carry a deadline
   so a relay that stopped reading cannot hold a writer, and a failed dial can
-  report the HTTP status the relay answered the upgrade with.
+  report the HTTP status the relay answered the upgrade with. A dial can also
+  start from a TCP stream the caller connected itself, such as one through a
+  proxy.
 - **Store**: a memory-mapped LMDB event store with a bounded, newest-first query
   planner. A 500-note feed query is 0.28 ms at 100,000 stored events, and a
   profile read is 8 microseconds. A NIP-50 `search` on a filter is sent to relays

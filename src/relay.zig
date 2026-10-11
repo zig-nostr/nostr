@@ -1092,13 +1092,49 @@ pub const DialDiagnostic = struct {
 pub fn dialDiagnosed(gpa: std.mem.Allocator, io: std.Io, url: []const u8, diagnostic: *DialDiagnostic) !*Relay {
     diagnostic.* = .{};
     const parsed = try parseUrl(url);
+    const tcp = try resolveAndConnect(gpa, io, parsed.host, parsed.port);
+    return upgrade(gpa, io, parsed, tcp, diagnostic);
+}
+
+/// `dial` over a TCP stream the caller already connected, for example one
+/// tunnelled through an HTTP CONNECT or SOCKS5 proxy to the relay's host and
+/// port. Everything after the connect is the same as `dial`: the TLS handshake
+/// for `wss://`, using the host in `url` for SNI and to verify the
+/// certificate, then the websocket upgrade. `ws://` skips TLS.
+///
+/// Takes ownership of `tcp`. It is closed on every error, including a `url`
+/// that does not parse, and by `Relay.deinit` after a success.
+///
+/// Like `dial`, it takes no deadline. To bound it, run it with `io.concurrent`
+/// and cancel it: the cancel ends a TLS handshake or an upgrade the peer never
+/// answers, closes `tcp` and frees what the dial allocated. There is no name
+/// lookup here, so nothing in it outlasts a cancel.
+pub fn dialOver(gpa: std.mem.Allocator, io: std.Io, url: []const u8, tcp: net.Stream) !*Relay {
+    var diagnostic: DialDiagnostic = .{};
+    return dialOverDiagnosed(gpa, io, url, tcp, &diagnostic);
+}
+
+/// `dialOver`, which also records in `diagnostic` what the relay answered the
+/// upgrade with, as `dialDiagnosed` does.
+pub fn dialOverDiagnosed(gpa: std.mem.Allocator, io: std.Io, url: []const u8, tcp: net.Stream, diagnostic: *DialDiagnostic) !*Relay {
+    diagnostic.* = .{};
+    const parsed = parseUrl(url) catch |err| {
+        tcp.close(io);
+        return err;
+    };
+    return upgrade(gpa, io, parsed, tcp, diagnostic);
+}
+
+/// Everything a dial does once it has a connected stream: TLS for `wss://`,
+/// then the websocket upgrade. Owns `tcp` from the first line, so every error
+/// closes it.
+fn upgrade(gpa: std.mem.Allocator, io: std.Io, parsed: Url, tcp: net.Stream, diagnostic: *DialDiagnostic) !*Relay {
+    errdefer tcp.close(io);
 
     const transport = try gpa.create(Transport);
     errdefer gpa.destroy(transport);
     transport.tls_state = null;
-
-    transport.tcp = try resolveAndConnect(gpa, io, parsed.host, parsed.port);
-    errdefer transport.tcp.close(io);
+    transport.tcp = tcp;
 
     transport.tcp_read_buffer = try gpa.alloc(u8, 64 * 1024);
     errdefer gpa.free(transport.tcp_read_buffer);
@@ -1900,6 +1936,7 @@ test "live dialer is semantically analyzed" {
     // the `Relay` methods) forces full type-checking so the live TCP/TLS path
     // is kept compiling by CI even though it is exercised only by hand.
     _ = &dial;
+    _ = &dialOver;
     _ = &resolveAndConnect;
     _ = &Relay.publish;
     _ = &Relay.subscribe;
@@ -2112,6 +2149,246 @@ fn refuseUpgrade(io: std.Io, server: *std.Io.net.Server) !void {
     var writer = served.writer(io, &write_buf);
     try writer.interface.writeAll("HTTP/1.1 503 Service Unavailable\r\nRetry-After: 5\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
     try writer.interface.flush();
+}
+
+/// A loopback listener and the URL that names it.
+const Loopback = struct {
+    server: std.Io.net.Server,
+    url_buf: [64]u8,
+    url_len: usize,
+
+    fn init(self: *Loopback, io: std.Io, scheme: []const u8) !void {
+        var listen_address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+        self.server = try listen_address.listen(io, .{ .reuse_address = true });
+        const text = try std.fmt.bufPrint(&self.url_buf, "{s}://127.0.0.1:{d}", .{ scheme, self.server.socket.address.ip4.port });
+        self.url_len = text.len;
+    }
+
+    fn url(self: *const Loopback) []const u8 {
+        return self.url_buf[0..self.url_len];
+    }
+
+    /// Connects a stream the way a caller with its own tunnel would.
+    fn connect(self: *Loopback, io: std.Io) !std.Io.net.Stream {
+        var bound = self.server.socket.address;
+        return bound.connect(io, .{ .mode = .stream });
+    }
+};
+
+/// Whether the peer of `served` has closed its end: reads and drops whatever
+/// is left until end of stream, and gives up after two seconds, so a stream
+/// that was left open fails the test instead of hanging it.
+fn peerClosed(io: std.Io, served: std.Io.net.Stream) !bool {
+    var read_buf: [4096]u8 = undefined;
+    var write_buf: [16]u8 = undefined;
+    var reader = served.reader(io, &read_buf);
+    var writer = served.writer(io, &write_buf);
+    const stream: IoStream = .{
+        .reader = &reader.interface,
+        .writer = &writer.interface,
+        .io = io,
+        .socket = served.socket,
+    };
+    const deadline = std.Io.Clock.Timestamp.fromNow(io, .{ .raw = .fromMilliseconds(2000), .clock = .awake });
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = stream.read(&buf, deadline) catch |err| switch (err) {
+            error.Timeout => return false,
+            // A reset is the peer closing too.
+            else => return true,
+        };
+        if (n == 0) return true;
+    }
+}
+
+/// Plays a relay for one connection: answers the upgrade, reads the REQ for
+/// `s1`, and sends one event and EOSE.
+fn serveOneSubscription(io: std.Io, server: *std.Io.net.Server) !void {
+    const served = try server.accept(io);
+    defer served.close(io);
+    var read_buf: [4096]u8 = undefined;
+    var reader = served.reader(io, &read_buf);
+    var write_buf: [4096]u8 = undefined;
+    var writer = served.writer(io, &write_buf);
+
+    var key: ?[24]u8 = null;
+    while (true) {
+        const line = try reader.interface.takeDelimiterInclusive('\n');
+        if (line.len <= 2) break;
+        const prefix = "Sec-WebSocket-Key: ";
+        if (std.mem.startsWith(u8, line, prefix)) {
+            const value = std.mem.trimEnd(u8, line[prefix.len..], "\r\n");
+            if (value.len != 24) return error.BadKey;
+            key = value[0..24].*;
+        }
+    }
+    const accept = websocket.acceptKey(&(key orelse return error.NoKey));
+    try writer.interface.writeAll("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ");
+    try writer.interface.writeAll(&accept);
+    try writer.interface.writeAll("\r\n\r\n");
+    try writer.interface.flush();
+
+    // One masked client text frame, short enough for a 16-bit length.
+    const head = try reader.interface.takeArray(2);
+    if (head[0] != 0x81 or head[1] & 0x80 == 0) return error.NotAMaskedTextFrame;
+    const len: usize = switch (head[1] & 0x7f) {
+        126 => std.mem.readInt(u16, try reader.interface.takeArray(2), .big),
+        127 => return error.FrameTooLong,
+        else => |n| n,
+    };
+    const mask = (try reader.interface.takeArray(4)).*;
+    const payload = try reader.interface.take(len);
+    for (payload, 0..) |*b, i| b.* ^= mask[i % 4];
+    if (!std.mem.startsWith(u8, payload, "[\"REQ\",\"s1\"")) return error.NotTheReq;
+
+    const ev_json =
+        "[\"EVENT\",\"s1\",{\"id\":\"" ++ "d0a1d13aff1d1725d80305f74a3f8419674d726342773b06ddc6988cc5be3a40" ++
+        "\",\"pubkey\":\"" ++ "f7234bd4c1394dda46d09f35bd384dd30cc552ad5541990f98844fb06676e9ca" ++
+        "\",\"created_at\":1700000000,\"kind\":1,\"tags\":[],\"content\":\"over\",\"sig\":\"" ++ "ab" ** 64 ++ "\"}]";
+    var frames: [512]u8 = undefined;
+    var out: std.ArrayList(u8) = .initBuffer(&frames);
+    try appendServerTextBounded(&out, ev_json);
+    try appendServerTextBounded(&out, "[\"EOSE\",\"s1\"]");
+    try writer.interface.writeAll(out.items);
+    try writer.interface.flush();
+
+    // Wait for the client to go away, so the frames are read before the close.
+    while (true) _ = reader.interface.takeByte() catch return;
+}
+
+/// `appendServerText` into a fixed buffer, for frames under 64 KiB.
+fn appendServerTextBounded(list: *std.ArrayList(u8), text: []const u8) !void {
+    if (text.len <= 125) {
+        try list.appendSliceBounded(&.{ 0x81, @intCast(text.len) });
+    } else {
+        var ext: [2]u8 = undefined;
+        std.mem.writeInt(u16, &ext, @intCast(text.len), .big);
+        try list.appendSliceBounded(&.{ 0x81, 126 });
+        try list.appendSliceBounded(&ext);
+    }
+    try list.appendSliceBounded(text);
+}
+
+test "dialOver upgrades a stream the caller connected and carries a subscription" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var loopback: Loopback = undefined;
+    try loopback.init(io, "ws");
+    defer loopback.server.deinit(io);
+
+    var serving = try io.concurrent(serveOneSubscription, .{ io, &loopback.server });
+    defer serving.cancel(io) catch {};
+
+    const tcp = try loopback.connect(io);
+    const relay = try dialOver(allocator, io, loopback.url(), tcp);
+    {
+        defer relay.deinit();
+        try relay.subscribe("s1", &.{.{ .kinds = &.{1} }});
+
+        var m1 = (try relay.receiveTimeout(.{ .duration = .{ .raw = .fromMilliseconds(5000), .clock = .awake } })).?;
+        defer m1.deinit();
+        try std.testing.expectEqualStrings("s1", m1.value.event.subscription_id);
+        try std.testing.expectEqualStrings("over", m1.value.event.event.content);
+
+        var m2 = (try relay.receiveTimeout(.{ .duration = .{ .raw = .fromMilliseconds(5000), .clock = .awake } })).?;
+        defer m2.deinit();
+        try std.testing.expectEqualStrings("s1", m2.value.eose.subscription_id);
+    }
+    try serving.await(io);
+}
+
+test "dialOver closes the stream it was given when the URL does not parse" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var loopback: Loopback = undefined;
+    try loopback.init(io, "ws");
+    defer loopback.server.deinit(io);
+
+    const tcp = try loopback.connect(io);
+    const served = try loopback.server.accept(io);
+    defer served.close(io);
+
+    var diagnostic: DialDiagnostic = .{ .status = 999 };
+    try std.testing.expectError(UrlError.UnsupportedScheme, dialOverDiagnosed(allocator, io, "http://127.0.0.1/", tcp, &diagnostic));
+    try std.testing.expectEqual(@as(u16, 0), diagnostic.status);
+    try std.testing.expect(try peerClosed(io, served));
+}
+
+test "dialOver closes the stream and reports the status when the upgrade is refused" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var loopback: Loopback = undefined;
+    try loopback.init(io, "ws");
+    defer loopback.server.deinit(io);
+
+    var pending = try io.concurrent(refuseUpgrade, .{ io, &loopback.server });
+    defer pending.cancel(io) catch {};
+
+    const tcp = try loopback.connect(io);
+    var diagnostic: DialDiagnostic = .{};
+    try std.testing.expectError(ConnectionError.HandshakeFailed, dialOverDiagnosed(allocator, io, loopback.url(), tcp, &diagnostic));
+    try pending.await(io);
+    try std.testing.expectEqual(@as(u16, 503), diagnostic.status);
+}
+
+test "a wss dialOver to a peer that does not speak TLS closes the stream and frees the TLS state" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var loopback: Loopback = undefined;
+    try loopback.init(io, "wss");
+    defer loopback.server.deinit(io);
+
+    const tcp = try loopback.connect(io);
+    const served = try loopback.server.accept(io);
+    defer served.close(io);
+    // Plain HTTP where a TLS server hello belongs.
+    var write_buf: [128]u8 = undefined;
+    var writer = served.writer(io, &write_buf);
+    try writer.interface.writeAll("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
+    try writer.interface.flush();
+
+    if (dialOver(allocator, io, loopback.url(), tcp)) |relay| {
+        relay.deinit();
+        return error.TestUnexpectedResult;
+    } else |_| {}
+    try std.testing.expect(try peerClosed(io, served));
+}
+
+test "a dialOver waiting on a deaf peer ends at its deadline and closes the stream" {
+    // The peer takes the connection and never answers the upgrade. A dial has
+    // no deadline of its own: running it concurrently, waiting out the
+    // deadline and cancelling it is how it is bounded, and the cancel has to
+    // close the stream the caller handed over as well as free the rest.
+    //
+    // Without stack traces, for the reason in the cancelled dial's test.
+    var debug: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    defer if (debug.deinit() == .leak) @panic("the cancelled dialOver leaked");
+    const allocator = debug.allocator();
+    const io = std.testing.io;
+
+    var loopback: Loopback = undefined;
+    try loopback.init(io, "ws");
+    defer loopback.server.deinit(io);
+
+    const tcp = try loopback.connect(io);
+    const served = try loopback.server.accept(io);
+    defer served.close(io);
+
+    const started = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+    var pending = try io.concurrent(dialOver, .{ allocator, io, loopback.url(), tcp });
+    try io.sleep(.fromMilliseconds(200), .awake);
+    if (pending.cancel(io)) |relay| {
+        relay.deinit();
+        return error.TestUnexpectedResult; // the peer never answered
+    } else |_| {} // the upgrade's read reports the cancel as ReadFailed
+    const waited = std.Io.Timestamp.now(io, .awake).toMilliseconds() - started;
+    try std.testing.expect(waited >= 200);
+    try std.testing.expect(waited < 5000);
+    try std.testing.expect(try peerClosed(io, served));
 }
 
 test "a deadline fires on a quiet socket and leaves the connection usable" {
