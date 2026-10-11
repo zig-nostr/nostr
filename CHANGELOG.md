@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.1] - 2026-10-11
+
+### Added
+
+- `relay.dialOver` and `relay.dialOverDiagnosed`: dial a relay over a TCP stream the caller already connected, for example through an HTTP CONNECT or SOCKS5 proxy. They take ownership of the stream, do the TLS handshake for `wss://` with the URL's host for SNI and certificate verification, then the websocket upgrade, and close the stream on every error. They share that code with `dial`, and are bounded and cancelled the same way.
+
 ## [0.15.0] - 2026-10-11
 
 ### Breaking

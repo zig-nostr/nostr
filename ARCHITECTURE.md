@@ -37,7 +37,7 @@ Events and messages
 Transport
 
 - `websocket.zig`: RFC 6455 handshake and frame codec. No I/O.
-- `relay.zig`: a relay connection. `Connection` is the protocol state machine, generic over a byte stream. `IoStream`, `dial` and `Relay` bind it to a TCP or TLS socket. `dialDiagnosed` is `dial` that also records the HTTP status a relay answered the upgrade with.
+- `relay.zig`: a relay connection. `Connection` is the protocol state machine, generic over a byte stream. `IoStream`, `dial` and `Relay` bind it to a TCP or TLS socket. `dialDiagnosed` is `dial` that also records the HTTP status a relay answered the upgrade with. `dialOver` and `dialOverDiagnosed` start from a TCP stream the caller already connected, for example through a proxy, and share everything after the connect with `dial`: TLS for `wss://` with the URL's host for SNI and the certificate, then the upgrade.
 - `liveness.zig`: the policy for when a quiet connection should be pinged or given up on. Pure functions over two measurements.
 - `nip65.zig`: relay lists, and the read and write routing of the outbox model.
 
@@ -102,7 +102,7 @@ A reader that wants to come up for air without being torn down uses `receiveTime
 
 A write can be bounded the same way from the inside. `publishTimeout` runs the write as a task of its own with `io.concurrent`, waits for it until the deadline and cancels it after. Given up while it was still waiting for the lock, it sent nothing. Given up once it had started, the relay may hold part of a frame, so the connection is marked broken and every later write fails with `error.Broken`.
 
-`dial` has no deadline of its own. To bound it, start it with `io.concurrent` and cancel it: a cancelled dial stops where it is and frees what it allocated. The name lookup is the one step a cancel cannot cut short: on POSIX it is a libc call, and on Windows std waits for the OS query to finish before it reports the cancel.
+`dial` has no deadline of its own. To bound it, start it with `io.concurrent` and cancel it: a cancelled dial stops where it is and frees what it allocated. The name lookup is the one step a cancel cannot cut short: on POSIX it is a libc call, and on Windows std waits for the OS query to finish before it reports the cancel. `dialOver` has no lookup, so a cancel ends it in the TLS handshake or the upgrade, and it closes the stream it was handed on that path as on every other error.
 
 Shared signer state is small and locked. `SeenRequests` (replay defence) and the authorized-clients record are shared across the reader threads of every relay a signer serves, behind short spin locks.
 
