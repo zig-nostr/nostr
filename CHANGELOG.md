@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A publish cancelled before its frame was written returned `error.RandomFailed` on Linux instead of `error.Canceled`, because the read of entropy for the frame's mask took the cancel and the library reported it as a failure to get randomness. It now returns `error.Canceled`.
+
 ## [0.15.1] - 2026-10-11
 
 ### Added

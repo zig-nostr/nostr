@@ -543,7 +543,13 @@ pub fn Connection(comptime Stream: type) type {
 
         fn buildFrame(self: *Self, io: std.Io, frame: *std.ArrayList(u8), opcode: websocket.Opcode, payload: []const u8) !void {
             var mask: [4]u8 = undefined;
-            io.randomSecure(&mask) catch return ConnectionError.RandomFailed;
+            // A cancel is not a failure to find entropy. On Linux the read of
+            // entropy is a point where a cancel lands, and reported as
+            // RandomFailed it would reach a cancelled caller as a write error.
+            io.randomSecure(&mask) catch |err| switch (err) {
+                error.Canceled => |e| return e,
+                error.EntropyUnavailable => return ConnectionError.RandomFailed,
+            };
             try websocket.appendClientFrame(frame, self.allocator, opcode, payload, mask);
         }
 
@@ -2660,6 +2666,31 @@ test "a publish waiting behind another write times out and sends nothing" {
     try std.testing.expect(std.mem.startsWith(u8, text, "[\"EVENT\","));
 }
 
+fn publishAfterCancel(io: std.Io, conn: *TestConn) !void {
+    // Waits to be cancelled, then carries the cancel into the publish.
+    io.sleep(.fromMilliseconds(60_000), .awake) catch |err| switch (err) {
+        error.Canceled => io.recancel(),
+    };
+    return conn.publish(small_event);
+}
+
+test "a publish that is cancelled reports the cancel, not a failure" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var written: std.ArrayList(u8) = .empty;
+    defer written.deinit(allocator);
+    var server = FakeStream{ .to_read = "", .written = &written, .allocator = allocator };
+    var conn = newConn(allocator, &server);
+    defer conn.deinit();
+
+    var pending = try io.concurrent(publishAfterCancel, .{ io, &conn });
+    // Where a cancel lands depends on the system: on Linux the read of
+    // entropy for the frame's mask takes it, elsewhere nothing in a write
+    // to this stream does and the publish completes. Either is fine. A cancel
+    // turned into some other error is not.
+    pending.cancel(io) catch |err| try std.testing.expectEqual(error.Canceled, err);
+}
+
 test "a bounded publish stuck on a deaf peer ends when its caller is cancelled" {
     // Windows completes a large send on a loopback socket without waiting
     // for the peer to read, whatever the buffer sizes, so this cannot block
@@ -2682,7 +2713,16 @@ test "a bounded publish stuck on a deaf peer ends when its caller is cancelled" 
     defer allocator.free(huge.content);
 
     var pending = try io.concurrent(LiveConnection.publishTimeout, .{ &conn, huge.ev, .{ .duration = .{ .raw = .fromMilliseconds(60_000), .clock = .awake } } });
-    try io.sleep(.fromMilliseconds(200), .awake);
+    // Cancelled only once the write is blocked in the kernel. Encoding and
+    // masking 32 MB comes first and is plain computation that no cancel can
+    // interrupt, and a slow runner spends seconds on it in a Debug build.
+    // A socket with no room left is the sign the write has started and is
+    // stuck.
+    const give_up = std.Io.Timestamp.now(io, .awake).toMilliseconds() + 30_000;
+    while (socketWritable(io, peer.client.socket.handle, 0)) {
+        if (std.Io.Timestamp.now(io, .awake).toMilliseconds() > give_up) return error.TestUnexpectedResult;
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
     const started = std.Io.Timestamp.now(io, .awake).toMilliseconds();
     try std.testing.expectError(error.Canceled, pending.cancel(io));
     const waited = std.Io.Timestamp.now(io, .awake).toMilliseconds() - started;
