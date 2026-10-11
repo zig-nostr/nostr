@@ -24,8 +24,75 @@ pub const Event = struct {
     sig: [64]u8,
 };
 
-/// Escapes a string for the id serialization and for the wire JSON, which
-/// want the same bytes.
+// -- Serialization ------------------------------------------------------------
+//
+// Every serializer below writes through a `std.Io.Writer`, so the same code
+// fills a caller's buffer (`Writer.fixed`), an exactly sized allocation, or a
+// SHA-256 state with a small stack buffer in front of it, which is how
+// `computeId` hashes an event without allocating. The `...Len` functions
+// return the exact byte count the matching writer produces, so a caller can
+// size a buffer before writing into it.
+
+const Writer = std.Io.Writer;
+
+const Lane = @Vector(16, u8);
+
+/// Index of the first byte at or after `from` that a JSON string cannot carry
+/// raw: a quote, a backslash or a control byte. `s.len` when there is none.
+fn nextSpecial(s: []const u8, from: usize) usize {
+    var i = from;
+    while (i + 16 <= s.len) : (i += 16) {
+        const v: Lane = s[i..][0..16].*;
+        const m: u16 = @as(u16, @bitCast(v < @as(Lane, @splat(0x20)))) |
+            @as(u16, @bitCast(v == @as(Lane, @splat('"')))) |
+            @as(u16, @bitCast(v == @as(Lane, @splat('\\'))));
+        if (m != 0) return i + @ctz(m);
+    }
+    while (i < s.len) : (i += 1) {
+        const c = s[i];
+        if (c < 0x20 or c == '"' or c == '\\') return i;
+    }
+    return s.len;
+}
+
+/// The escape for a byte `nextSpecial` stopped at. A six-byte buffer holds
+/// the longest, `\u00XX`.
+fn escapeFor(c: u8, buf: *[6]u8) []const u8 {
+    const short: u8 = switch (c) {
+        '\n' => 'n',
+        '"' => '"',
+        '\\' => '\\',
+        '\r' => 'r',
+        '\t' => 't',
+        0x08 => 'b',
+        0x0C => 'f',
+        else => 0,
+    };
+    buf[0] = '\\';
+    if (short != 0) {
+        buf[1] = short;
+        return buf[0..2];
+    }
+    buf[1..4].* = "u00".*;
+    buf[4] = hex_digits[c >> 4];
+    buf[5] = hex_digits[c & 0xf];
+    return buf[0..6];
+}
+
+fn escapedLen(s: []const u8) usize {
+    var n: usize = s.len + 2;
+    var i = nextSpecial(s, 0);
+    while (i < s.len) : (i = nextSpecial(s, i + 1)) {
+        n += switch (s[i]) {
+            '\n', '"', '\\', '\r', '\t', 0x08, 0x0C => 1,
+            else => 5,
+        };
+    }
+    return n;
+}
+
+/// Writes `s` as a quoted JSON string, escaped the way the id serialization
+/// needs.
 ///
 /// NIP-01 names seven escapes (`\n \" \\ \r \t \b \f`) and says all other
 /// characters must be included verbatim. Read literally that leaves a byte
@@ -43,48 +110,110 @@ pub const Event = struct {
 /// So the remaining control bytes are escaped as `\u00XX`. Everything from
 /// 0x20 up, raw UTF-8 included, is still copied verbatim, which is where the
 /// warning against a general-purpose encoder still holds: escaping non-ASCII
-/// would change the id.
-fn appendJsonString(list: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) std.mem.Allocator.Error!void {
-    try list.append(allocator, '"');
-    for (s) |c| {
-        switch (c) {
-            '\n' => try list.appendSlice(allocator, "\\n"),
-            '"' => try list.appendSlice(allocator, "\\\""),
-            '\\' => try list.appendSlice(allocator, "\\\\"),
-            '\r' => try list.appendSlice(allocator, "\\r"),
-            '\t' => try list.appendSlice(allocator, "\\t"),
-            0x08 => try list.appendSlice(allocator, "\\b"),
-            0x0C => try list.appendSlice(allocator, "\\f"),
-            else => |b| {
-                if (b < 0x20) {
-                    try list.print(allocator, "\\u{x:0>4}", .{b});
-                } else {
-                    try list.append(allocator, b);
-                }
-            },
-        }
+/// would change the id. The wire JSON wants the same bytes.
+fn writeJsonString(w: *Writer, s: []const u8) Writer.Error!void {
+    try w.writeByte('"');
+    var start: usize = 0;
+    var i = nextSpecial(s, 0);
+    var esc: [6]u8 = undefined;
+    while (i < s.len) : (i = nextSpecial(s, start)) {
+        try w.writeAll(s[start..i]);
+        try w.writeAll(escapeFor(s[i], &esc));
+        start = i + 1;
     }
-    try list.append(allocator, '"');
+    try w.writeAll(s[start..]);
+    try w.writeByte('"');
 }
 
-fn appendInt(list: *std.ArrayList(u8), allocator: std.mem.Allocator, v: anytype) std.mem.Allocator.Error!void {
-    var buf: [32]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, "{d}", .{v}) catch unreachable;
-    try list.appendSlice(allocator, s);
+const hex_digits = "0123456789abcdef";
+
+fn writeHex(w: *Writer, comptime n: usize, bytes: *const [n]u8) Writer.Error!void {
+    var out: [n * 2]u8 = undefined;
+    for (bytes, 0..) |b, i| {
+        out[2 * i] = hex_digits[b >> 4];
+        out[2 * i + 1] = hex_digits[b & 0xf];
+    }
+    try w.writeAll(&out);
 }
 
-fn appendTags(list: *std.ArrayList(u8), allocator: std.mem.Allocator, tags: []const Tag) std.mem.Allocator.Error!void {
-    try list.append(allocator, '[');
+/// Decimal digits of `v`, written from the back of `buf`.
+fn intDigits(v: i64, buf: *[20]u8) []const u8 {
+    var mag: u64 = @abs(v);
+    var i: usize = buf.len;
+    while (true) {
+        i -= 1;
+        buf[i] = '0' + @as(u8, @intCast(mag % 10));
+        mag /= 10;
+        if (mag == 0) break;
+    }
+    if (v < 0) {
+        i -= 1;
+        buf[i] = '-';
+    }
+    return buf[i..];
+}
+
+fn intLen(v: i64) usize {
+    var buf: [20]u8 = undefined;
+    return intDigits(v, &buf).len;
+}
+
+fn writeInt(w: *Writer, v: i64) Writer.Error!void {
+    var buf: [20]u8 = undefined;
+    try w.writeAll(intDigits(v, &buf));
+}
+
+fn tagsLen(tags: []const Tag) usize {
+    var n: usize = 2;
     for (tags, 0..) |tag, ti| {
-        if (ti != 0) try list.append(allocator, ',');
-        try list.append(allocator, '[');
-        for (tag, 0..) |field, fi| {
-            if (fi != 0) try list.append(allocator, ',');
-            try appendJsonString(list, allocator, field);
-        }
-        try list.append(allocator, ']');
+        n += @as(usize, @intFromBool(ti != 0)) + 2;
+        for (tag, 0..) |field, fi| n += @as(usize, @intFromBool(fi != 0)) + escapedLen(field);
     }
-    try list.append(allocator, ']');
+    return n;
+}
+
+fn writeTags(w: *Writer, tags: []const Tag) Writer.Error!void {
+    try w.writeByte('[');
+    for (tags, 0..) |tag, ti| {
+        if (ti != 0) try w.writeByte(',');
+        try w.writeByte('[');
+        for (tag, 0..) |field, fi| {
+            if (fi != 0) try w.writeByte(',');
+            try writeJsonString(w, field);
+        }
+        try w.writeByte(']');
+    }
+    try w.writeByte(']');
+}
+
+/// The exact length of the canonical serialization `writeCanonical` writes.
+pub fn canonicalLen(created_at: i64, kind: u16, tags: []const Tag, content: []const u8) usize {
+    // `[0,"` + 64 hex + `",` + created_at + `,` + kind + `,` + tags + `,` + content + `]`
+    return 4 + 64 + 2 + intLen(created_at) + 1 + intLen(kind) + 1 + tagsLen(tags) + 1 + escapedLen(content) + 1;
+}
+
+/// Writes the canonical `[0,pubkey,created_at,kind,tags,content]`
+/// serialization (used only for id hashing, per NIP-01) to `w`. With
+/// `Writer.fixed` over a buffer of `canonicalLen` bytes it allocates nothing.
+pub fn writeCanonical(
+    w: *Writer,
+    pubkey: [32]u8,
+    created_at: i64,
+    kind: u16,
+    tags: []const Tag,
+    content: []const u8,
+) Writer.Error!void {
+    try w.writeAll("[0,\"");
+    try writeHex(w, 32, &pubkey);
+    try w.writeAll("\",");
+    try writeInt(w, created_at);
+    try w.writeByte(',');
+    try writeInt(w, kind);
+    try w.writeByte(',');
+    try writeTags(w, tags);
+    try w.writeByte(',');
+    try writeJsonString(w, content);
+    try w.writeByte(']');
 }
 
 /// Appends the canonical `[0,pubkey,created_at,kind,tags,content]`
@@ -98,17 +227,11 @@ pub fn appendCanonical(
     tags: []const Tag,
     content: []const u8,
 ) std.mem.Allocator.Error!void {
-    try list.appendSlice(allocator, "[0,\"");
-    try hex.appendHex(list, allocator, &pubkey);
-    try list.appendSlice(allocator, "\",");
-    try appendInt(list, allocator, created_at);
-    try list.append(allocator, ',');
-    try appendInt(list, allocator, kind);
-    try list.append(allocator, ',');
-    try appendTags(list, allocator, tags);
-    try list.append(allocator, ',');
-    try appendJsonString(list, allocator, content);
-    try list.append(allocator, ']');
+    const len = canonicalLen(created_at, kind, tags, content);
+    try list.ensureUnusedCapacity(allocator, len);
+    var w: Writer = .fixed(list.unusedCapacitySlice()[0..len]);
+    writeCanonical(&w, pubkey, created_at, kind, tags, content) catch unreachable;
+    list.items.len += len;
 }
 
 /// Returns the owned canonical serialization bytes (for inspection/testing).
@@ -120,13 +243,17 @@ pub fn serializeCanonical(
     tags: []const Tag,
     content: []const u8,
 ) std.mem.Allocator.Error![]u8 {
-    var list: std.ArrayList(u8) = .empty;
-    errdefer list.deinit(allocator);
-    try appendCanonical(&list, allocator, pubkey, created_at, kind, tags, content);
-    return list.toOwnedSlice(allocator);
+    const out = try allocator.alloc(u8, canonicalLen(created_at, kind, tags, content));
+    var w: Writer = .fixed(out);
+    writeCanonical(&w, pubkey, created_at, kind, tags, content) catch unreachable;
+    return out;
 }
 
 /// Computes the NIP-01 event id: sha256 of the canonical serialization.
+///
+/// The serialization streams through a stack buffer into the hash, so this
+/// allocates nothing; `allocator` is kept for the signature callers already
+/// use, and the error set with it.
 pub fn computeId(
     allocator: std.mem.Allocator,
     pubkey: [32]u8,
@@ -135,11 +262,18 @@ pub fn computeId(
     tags: []const Tag,
     content: []const u8,
 ) std.mem.Allocator.Error![32]u8 {
-    var list: std.ArrayList(u8) = .empty;
-    defer list.deinit(allocator);
-    try appendCanonical(&list, allocator, pubkey, created_at, kind, tags, content);
+    _ = allocator;
+    return idOf(pubkey, created_at, kind, tags, content);
+}
+
+fn idOf(pubkey: [32]u8, created_at: i64, kind: u16, tags: []const Tag, content: []const u8) [32]u8 {
+    var buf: [1024]u8 = undefined;
+    var hashing: Writer.Hashing(std.crypto.hash.sha2.Sha256) = .init(&buf);
+    // The hashing writer's drain cannot fail.
+    writeCanonical(&hashing.writer, pubkey, created_at, kind, tags, content) catch unreachable;
+    hashing.writer.flush() catch unreachable;
     var id: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(list.items, &id, .{});
+    hashing.hasher.final(&id);
     return id;
 }
 
@@ -179,28 +313,49 @@ pub fn verify(allocator: std.mem.Allocator, signer: keys.Signer, ev: Event) std.
     return signer.verifyId(ev.sig, ev.id, ev.pubkey);
 }
 
-/// Serializes a full `Event` to wire-format JSON (`{"id":...,...}`).
+const json_id = "{\"id\":\"";
+const json_pubkey = "\",\"pubkey\":\"";
+const json_created_at = "\",\"created_at\":";
+const json_kind = ",\"kind\":";
+const json_tags = ",\"tags\":";
+const json_content = ",\"content\":";
+const json_sig = ",\"sig\":\"";
+const json_end = "\"}";
+
+/// The exact length of the wire JSON `writeJson` writes.
+pub fn jsonLen(event: Event) usize {
+    return json_id.len + 64 + json_pubkey.len + 64 + json_created_at.len + intLen(event.created_at) +
+        json_kind.len + intLen(event.kind) + json_tags.len + tagsLen(event.tags) +
+        json_content.len + escapedLen(event.content) + json_sig.len + 128 + json_end.len;
+}
+
+/// Writes a full `Event` as wire-format JSON (`{"id":...,...}`) to `w`. With
+/// `Writer.fixed` over a buffer of `jsonLen` bytes it allocates nothing.
+pub fn writeJson(w: *Writer, event: Event) Writer.Error!void {
+    try w.writeAll(json_id);
+    try writeHex(w, 32, &event.id);
+    try w.writeAll(json_pubkey);
+    try writeHex(w, 32, &event.pubkey);
+    try w.writeAll(json_created_at);
+    try writeInt(w, event.created_at);
+    try w.writeAll(json_kind);
+    try writeInt(w, event.kind);
+    try w.writeAll(json_tags);
+    try writeTags(w, event.tags);
+    try w.writeAll(json_content);
+    try writeJsonString(w, event.content);
+    try w.writeAll(json_sig);
+    try writeHex(w, 64, &event.sig);
+    try w.writeAll(json_end);
+}
+
+/// Serializes a full `Event` to wire-format JSON (`{"id":...,...}`), in one
+/// allocation of exactly the right size.
 pub fn toJson(allocator: std.mem.Allocator, event: Event) std.mem.Allocator.Error![]u8 {
-    var list: std.ArrayList(u8) = .empty;
-    errdefer list.deinit(allocator);
-
-    try list.appendSlice(allocator, "{\"id\":\"");
-    try hex.appendHex(&list, allocator, &event.id);
-    try list.appendSlice(allocator, "\",\"pubkey\":\"");
-    try hex.appendHex(&list, allocator, &event.pubkey);
-    try list.appendSlice(allocator, "\",\"created_at\":");
-    try appendInt(&list, allocator, event.created_at);
-    try list.appendSlice(allocator, ",\"kind\":");
-    try appendInt(&list, allocator, event.kind);
-    try list.appendSlice(allocator, ",\"tags\":");
-    try appendTags(&list, allocator, event.tags);
-    try list.appendSlice(allocator, ",\"content\":");
-    try appendJsonString(&list, allocator, event.content);
-    try list.appendSlice(allocator, ",\"sig\":\"");
-    try hex.appendHex(&list, allocator, &event.sig);
-    try list.appendSlice(allocator, "\"}");
-
-    return list.toOwnedSlice(allocator);
+    const out = try allocator.alloc(u8, jsonLen(event));
+    var w: Writer = .fixed(out);
+    writeJson(&w, event) catch unreachable;
+    return out;
 }
 
 /// The seven fields NIP-01 names. An event object may carry other keys beside
@@ -232,8 +387,16 @@ pub const Parsed = struct {
 };
 
 /// Parses wire-format event JSON. The returned `Parsed` owns every byte the
+/// Parses wire-format event JSON. The returned `Parsed` owns every byte the
 /// event points at, in one arena, so `json_text` may be freed or reused as soon
 /// as this returns. Call `deinit` to free it.
+///
+/// The text is copied into the arena once and read by `scanEvent`, which
+/// decodes each string in place in that copy and builds the event without a
+/// JSON tree. Anything it does not take on the first pass (a missing or
+/// repeated field, a number written as `1e3`, bad hex, malformed JSON) is
+/// parsed again by `std.json`, so what is accepted and every error returned
+/// are exactly what the `std.json` path alone gives.
 pub fn fromJson(gpa: std.mem.Allocator, json_text: []const u8) !Parsed {
     const arena = try gpa.create(std.heap.ArenaAllocator);
     arena.* = std.heap.ArenaAllocator.init(gpa);
@@ -243,18 +406,526 @@ pub fn fromJson(gpa: std.mem.Allocator, json_text: []const u8) !Parsed {
     }
     const allocator = arena.allocator();
 
-    // std.json hands back a string with no escapes in it as a slice of the
-    // text it parsed, so parsing the caller's text would leave the event
-    // pointing into memory the caller owns. One copy of the whole text into
-    // the arena is cheaper than copying each string, and makes every slice
-    // the parser returns ours.
     const owned_text = try allocator.dupe(u8, json_text);
-    const wire = try std.json.parseFromSliceLeaky(WireEvent, allocator, owned_text, wire_options);
+    if (scanEvent(allocator, owned_text)) |ev| {
+        return .{ .arena = arena, .value = ev };
+    } else |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Unsupported => {},
+    }
 
-    return Parsed{
-        .arena = arena,
-        .value = try fromWire(wire),
+    // The scan decoded strings in place, so the copy is no longer the text.
+    _ = arena.reset(.retain_capacity);
+    const fresh = try allocator.dupe(u8, json_text);
+    const wire = try std.json.parseFromSliceLeaky(WireEvent, allocator, fresh, wire_options);
+    return .{ .arena = arena, .value = try fromWire(wire) };
+}
+
+/// `Unsupported` means only "not on the fast path": the caller parses the
+/// same text with `std.json`, which decides whether it is an event.
+const ScanError = error{Unsupported} || std.mem.Allocator.Error;
+
+/// Reads one NIP-01 event object out of `buf`, which it owns and may write.
+///
+/// Strings are decoded in place: an escape is never shorter than what it
+/// decodes to, so the decoded bytes always fit behind the read position. Every
+/// slice in the returned event points into `buf` or into `allocator`.
+///
+/// The contract that matters is one way: whatever this accepts, `std.json`
+/// accepts too, with the same result. It holds itself to the same grammar
+/// (whitespace, number syntax, escapes, surrogate pairs, UTF-8, nothing after
+/// the object) and hands everything else back as `Unsupported`, including
+/// forms `std.json` would take but that no event in practice uses: a
+/// number in a string or with a fraction, a
+/// string spelled as an array of bytes. The differential tests in this file
+/// and in `fuzz.zig` hold it to that.
+fn scanEvent(allocator: std.mem.Allocator, buf: []u8) ScanError!Event {
+    var s: Scanner = .{ .buf = buf };
+    var ev: Event = undefined;
+    var seen: u7 = 0;
+
+    s.skipWs();
+    try s.expect('{');
+    s.skipWs();
+    if (s.peek() != '"') return error.Unsupported;
+    while (true) {
+        if (s.peek() != '"') return error.Unsupported;
+        const key = try s.string();
+        s.skipWs();
+        try s.expect(':');
+        s.skipWs();
+        const field: u7 = fieldBit(key);
+        if (field != 0) {
+            if (seen & field != 0) return error.Unsupported;
+            seen |= field;
+        }
+        switch (field) {
+            0 => try s.skipValue(0),
+            bit_id => ev.id = try s.hexString(32),
+            bit_pubkey => ev.pubkey = try s.hexString(32),
+            bit_sig => ev.sig = try s.hexString(64),
+            bit_created_at => ev.created_at = try s.int(i64),
+            bit_kind => ev.kind = try s.int(u16),
+            bit_content => {
+                if (s.peek() != '"') return error.Unsupported;
+                ev.content = try s.string();
+            },
+            bit_tags => ev.tags = try s.tags(allocator),
+            else => unreachable,
+        }
+        s.skipWs();
+        switch (s.peek()) {
+            ',' => {
+                s.i += 1;
+                s.skipWs();
+            },
+            '}' => {
+                s.i += 1;
+                break;
+            },
+            else => return error.Unsupported,
+        }
+    }
+    s.skipWs();
+    if (s.i != buf.len) return error.Unsupported;
+    if (seen != all_fields) return error.Unsupported;
+    return ev;
+}
+
+const bit_id: u7 = 1;
+const bit_pubkey: u7 = 2;
+const bit_created_at: u7 = 4;
+const bit_kind: u7 = 8;
+const bit_tags: u7 = 16;
+const bit_content: u7 = 32;
+const bit_sig: u7 = 64;
+const all_fields: u7 = 127;
+
+fn fieldBit(key: []const u8) u7 {
+    const eql = std.mem.eql;
+    return switch (key.len) {
+        2 => if (eql(u8, key, "id")) bit_id else 0,
+        3 => if (eql(u8, key, "sig")) bit_sig else 0,
+        4 => if (eql(u8, key, "kind")) bit_kind else if (eql(u8, key, "tags")) bit_tags else 0,
+        6 => if (eql(u8, key, "pubkey")) bit_pubkey else 0,
+        7 => if (eql(u8, key, "content")) bit_content else 0,
+        10 => if (eql(u8, key, "created_at")) bit_created_at else 0,
+        else => 0,
     };
+}
+
+/// How deep a skipped value may nest before the fast path gives it to
+/// `std.json`, which has no limit of its own beyond memory.
+const max_skip_depth = 64;
+
+const Scanner = struct {
+    buf: []u8,
+    i: usize = 0,
+
+    /// The byte at the cursor, or 0 at the end, which no branch takes.
+    inline fn peek(s: *const Scanner) u8 {
+        return if (s.i < s.buf.len) s.buf[s.i] else 0;
+    }
+
+    inline fn expect(s: *Scanner, c: u8) error{Unsupported}!void {
+        if (s.peek() != c) return error.Unsupported;
+        s.i += 1;
+    }
+
+    /// JSON whitespace is these four bytes and nothing else.
+    inline fn skipWs(s: *Scanner) void {
+        while (s.i < s.buf.len) : (s.i += 1) {
+            switch (s.buf[s.i]) {
+                ' ', '\t', '\n', '\r' => {},
+                else => return,
+            }
+        }
+    }
+
+    /// Reads the string whose opening quote is at the cursor and returns it
+    /// decoded, in place.
+    fn string(s: *Scanner) error{Unsupported}![]u8 {
+        const buf = s.buf;
+        const start = s.i + 1;
+        var i = start;
+        var high: u8 = 0;
+        var lanes: Lane = @splat(0);
+
+        // The common case: a run with no escape, ended by its quote, which is
+        // a slice of the text as it stands.
+        while (i + 16 <= buf.len) {
+            const v: Lane = buf[i..][0..16].*;
+            const m = specialMask(v);
+            lanes |= v;
+            if (m != 0) {
+                i += @ctz(m);
+                break;
+            }
+            i += 16;
+        } else {
+            while (i < buf.len) : (i += 1) {
+                const c = buf[i];
+                if (c < 0x20 or c == '"' or c == '\\') break;
+                high |= c;
+            }
+        }
+        if (i >= buf.len) return error.Unsupported;
+        high |= @reduce(.Or, lanes);
+
+        var end = i;
+        switch (buf[i]) {
+            '"' => {},
+            '\\' => {
+                // From the first escape on, bytes move down to `w` as they are
+                // decoded.
+                var w = i;
+                while (true) {
+                    if (i >= buf.len) return error.Unsupported;
+                    switch (buf[i]) {
+                        '"' => break,
+                        '\\' => {
+                            if (i + 1 >= buf.len) return error.Unsupported;
+                            const e = buf[i + 1];
+                            i += 2;
+                            switch (e) {
+                                '"', '\\', '/' => {
+                                    buf[w] = e;
+                                    w += 1;
+                                },
+                                'b' => {
+                                    buf[w] = 0x08;
+                                    w += 1;
+                                },
+                                'f' => {
+                                    buf[w] = 0x0C;
+                                    w += 1;
+                                },
+                                'n' => {
+                                    buf[w] = '\n';
+                                    w += 1;
+                                },
+                                'r' => {
+                                    buf[w] = '\r';
+                                    w += 1;
+                                },
+                                't' => {
+                                    buf[w] = '\t';
+                                    w += 1;
+                                },
+                                'u' => {
+                                    var cp: u21 = try hex4(buf, i);
+                                    i += 4;
+                                    if (cp >= 0xD800 and cp <= 0xDBFF) {
+                                        // A high surrogate must be followed at
+                                        // once by an escaped low one.
+                                        if (i + 2 > buf.len or buf[i] != '\\' or buf[i + 1] != 'u') return error.Unsupported;
+                                        const lo = try hex4(buf, i + 2);
+                                        if (lo < 0xDC00 or lo > 0xDFFF) return error.Unsupported;
+                                        i += 6;
+                                        cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                                    } else if (cp >= 0xDC00 and cp <= 0xDFFF) {
+                                        return error.Unsupported;
+                                    }
+                                    w += encodeUtf8(cp, buf[w..]);
+                                },
+                                else => return error.Unsupported,
+                            }
+                        },
+                        else => {
+                            const run_end = nextSpecial(buf, i);
+                            if (run_end >= buf.len or buf[run_end] < 0x20) return error.Unsupported;
+                            for (buf[i..run_end]) |c| high |= c;
+                            std.mem.copyForwards(u8, buf[w..], buf[i..run_end]);
+                            w += run_end - i;
+                            i = run_end;
+                        },
+                    }
+                }
+                end = w;
+            },
+            else => return error.Unsupported,
+        }
+        const out = buf[start..end];
+        // Raw bytes from 0x80 up have to be well formed UTF-8, as `std.json`
+        // requires. A decoded `\u` escape is always well formed and never
+        // completes or continues a raw sequence, so checking the decoded bytes
+        // checks the raw ones.
+        if (high >= 0x80 and !std.unicode.utf8ValidateSlice(out)) return error.Unsupported;
+        s.i = i + 1;
+        return out;
+    }
+
+    /// A string of exactly `n * 2` hex digits, decoded. Upper case is
+    /// accepted, as `hex.decodeFixed` accepts it.
+    fn hexString(s: *Scanner, comptime n: usize) error{Unsupported}![n]u8 {
+        const buf = s.buf;
+        if (s.peek() != '"') return error.Unsupported;
+        const start = s.i + 1;
+        if (start + n * 2 >= buf.len or buf[start + n * 2] != '"') return error.Unsupported;
+        var out: [n]u8 = undefined;
+        var bad: u8 = 0;
+        for (&out, 0..) |*b, k| {
+            const hi = hex_values[buf[start + 2 * k]];
+            const lo = hex_values[buf[start + 2 * k + 1]];
+            bad |= hi | lo;
+            b.* = (hi << 4) | (lo & 0xf);
+        }
+        if (bad & 0x80 != 0) return error.Unsupported;
+        s.i = start + n * 2 + 1;
+        return out;
+    }
+
+    /// A number written as a plain integer, in range for `T`. A fraction or
+    /// an exponent, even one that comes out whole, is left to `std.json`.
+    fn int(s: *Scanner, comptime T: type) error{Unsupported}!T {
+        const buf = s.buf;
+        var i = s.i;
+        const neg = i < buf.len and buf[i] == '-';
+        if (neg) {
+            if (@typeInfo(T).int.signedness == .unsigned) return error.Unsupported;
+            i += 1;
+        }
+        if (i >= buf.len or buf[i] < '0' or buf[i] > '9') return error.Unsupported;
+        var mag: u64 = 0;
+        if (buf[i] == '0') {
+            i += 1;
+        } else {
+            while (i < buf.len and buf[i] >= '0' and buf[i] <= '9') : (i += 1) {
+                const m = @mulWithOverflow(mag, 10);
+                const a = @addWithOverflow(m[0], buf[i] - '0');
+                if (m[1] != 0 or a[1] != 0) return error.Unsupported;
+                mag = a[0];
+            }
+        }
+        if (i < buf.len) switch (buf[i]) {
+            '.', 'e', 'E', '0'...'9' => return error.Unsupported,
+            else => {},
+        };
+        s.i = i;
+        if (neg) {
+            if (mag > @as(u64, std.math.maxInt(T)) + 1) return error.Unsupported;
+            return @intCast(-@as(i128, mag));
+        }
+        if (mag > std.math.maxInt(T)) return error.Unsupported;
+        return @intCast(mag);
+    }
+
+    /// `[[string, ...], ...]`, into one array of tags over one array of
+    /// strings, both in `allocator`. Most events have few enough that the
+    /// work lists stay on the stack.
+    fn tags(s: *Scanner, allocator: std.mem.Allocator) ScanError![]const Tag {
+        try s.expect('[');
+        s.skipWs();
+        if (s.peek() == ']') {
+            s.i += 1;
+            return &.{};
+        }
+        var field_stack: [64][]const u8 = undefined;
+        var end_stack: [32]u32 = undefined;
+        var fields: std.ArrayList([]const u8) = .initBuffer(&field_stack);
+        var ends: std.ArrayList(u32) = .initBuffer(&end_stack);
+        while (true) {
+            try s.expect('[');
+            s.skipWs();
+            if (s.peek() == ']') {
+                s.i += 1;
+            } else while (true) {
+                if (s.peek() != '"') return error.Unsupported;
+                const str = try s.string();
+                if (fields.items.len == fields.capacity) try spill([]const u8, allocator, &fields);
+                fields.appendAssumeCapacity(str);
+                s.skipWs();
+                switch (s.peek()) {
+                    ',' => {
+                        s.i += 1;
+                        s.skipWs();
+                    },
+                    ']' => {
+                        s.i += 1;
+                        break;
+                    },
+                    else => return error.Unsupported,
+                }
+            }
+            if (ends.items.len == ends.capacity) try spill(u32, allocator, &ends);
+            ends.appendAssumeCapacity(@intCast(fields.items.len));
+            s.skipWs();
+            switch (s.peek()) {
+                ',' => {
+                    s.i += 1;
+                    s.skipWs();
+                },
+                ']' => {
+                    s.i += 1;
+                    break;
+                },
+                else => return error.Unsupported,
+            }
+        }
+        const flat = try allocator.dupe([]const u8, fields.items);
+        const out = try allocator.alloc(Tag, ends.items.len);
+        var from: usize = 0;
+        for (out, ends.items) |*tag, to| {
+            tag.* = flat[from..to];
+            from = to;
+        }
+        return out;
+    }
+
+    /// Steps over any JSON value, checking it the way `std.json` would.
+    fn skipValue(s: *Scanner, depth: usize) error{Unsupported}!void {
+        if (depth > max_skip_depth) return error.Unsupported;
+        switch (s.peek()) {
+            '"' => _ = try s.string(),
+            '{' => {
+                s.i += 1;
+                s.skipWs();
+                if (s.peek() == '}') {
+                    s.i += 1;
+                    return;
+                }
+                while (true) {
+                    if (s.peek() != '"') return error.Unsupported;
+                    _ = try s.string();
+                    s.skipWs();
+                    try s.expect(':');
+                    s.skipWs();
+                    try s.skipValue(depth + 1);
+                    s.skipWs();
+                    switch (s.peek()) {
+                        ',' => {
+                            s.i += 1;
+                            s.skipWs();
+                        },
+                        '}' => {
+                            s.i += 1;
+                            return;
+                        },
+                        else => return error.Unsupported,
+                    }
+                }
+            },
+            '[' => {
+                s.i += 1;
+                s.skipWs();
+                if (s.peek() == ']') {
+                    s.i += 1;
+                    return;
+                }
+                while (true) {
+                    try s.skipValue(depth + 1);
+                    s.skipWs();
+                    switch (s.peek()) {
+                        ',' => {
+                            s.i += 1;
+                            s.skipWs();
+                        },
+                        ']' => {
+                            s.i += 1;
+                            return;
+                        },
+                        else => return error.Unsupported,
+                    }
+                }
+            },
+            't' => try s.literal("true"),
+            'f' => try s.literal("false"),
+            'n' => try s.literal("null"),
+            '-', '0'...'9' => try s.number(),
+            else => return error.Unsupported,
+        }
+    }
+
+    fn literal(s: *Scanner, comptime word: []const u8) error{Unsupported}!void {
+        if (!std.mem.startsWith(u8, s.buf[s.i..], word)) return error.Unsupported;
+        s.i += word.len;
+    }
+
+    /// `-? (0 | [1-9][0-9]*) (. [0-9]+)? ([eE] [+-]? [0-9]+)?`
+    fn number(s: *Scanner) error{Unsupported}!void {
+        if (s.peek() == '-') s.i += 1;
+        switch (s.peek()) {
+            '0' => s.i += 1,
+            '1'...'9' => s.digits(),
+            else => return error.Unsupported,
+        }
+        if (s.peek() == '.') {
+            s.i += 1;
+            if (!isDigit(s.peek())) return error.Unsupported;
+            s.digits();
+        }
+        if (s.peek() == 'e' or s.peek() == 'E') {
+            s.i += 1;
+            if (s.peek() == '+' or s.peek() == '-') s.i += 1;
+            if (!isDigit(s.peek())) return error.Unsupported;
+            s.digits();
+        }
+    }
+
+    fn digits(s: *Scanner) void {
+        while (isDigit(s.peek())) s.i += 1;
+    }
+};
+
+fn isDigit(c: u8) bool {
+    return c >= '0' and c <= '9';
+}
+
+/// Moves a full work list off the stack, or doubles one already moved.
+fn spill(comptime T: type, allocator: std.mem.Allocator, list: *std.ArrayList(T)) std.mem.Allocator.Error!void {
+    const bigger = try allocator.alloc(T, list.capacity * 2);
+    @memcpy(bigger[0..list.items.len], list.items);
+    list.* = .{ .items = bigger[0..list.items.len], .capacity = bigger.len };
+}
+
+fn specialMask(v: Lane) u16 {
+    return @as(u16, @bitCast(v < @as(Lane, @splat(0x20)))) |
+        @as(u16, @bitCast(v == @as(Lane, @splat('"')))) |
+        @as(u16, @bitCast(v == @as(Lane, @splat('\\'))));
+}
+
+/// Hex digit values, with the top bit set for anything that is not one.
+const hex_values: [256]u8 = blk: {
+    var t = [_]u8{0x80} ** 256;
+    for ('0'..'9' + 1) |c| t[c] = c - '0';
+    for ('a'..'f' + 1) |c| t[c] = c - 'a' + 10;
+    for ('A'..'F' + 1) |c| t[c] = c - 'A' + 10;
+    break :blk t;
+};
+
+fn hex4(buf: []const u8, at: usize) error{Unsupported}!u21 {
+    if (at + 4 > buf.len) return error.Unsupported;
+    var v: u21 = 0;
+    for (buf[at..][0..4]) |c| {
+        const d = hex_values[c];
+        if (d & 0x80 != 0) return error.Unsupported;
+        v = (v << 4) | d;
+    }
+    return v;
+}
+
+/// UTF-8 for a code point that is not a surrogate. Returns the byte count.
+fn encodeUtf8(cp: u21, out: []u8) usize {
+    if (cp < 0x80) {
+        out[0] = @intCast(cp);
+        return 1;
+    }
+    if (cp < 0x800) {
+        out[0] = @intCast(0xC0 | (cp >> 6));
+        out[1] = @intCast(0x80 | (cp & 0x3F));
+        return 2;
+    }
+    if (cp < 0x10000) {
+        out[0] = @intCast(0xE0 | (cp >> 12));
+        out[1] = @intCast(0x80 | ((cp >> 6) & 0x3F));
+        out[2] = @intCast(0x80 | (cp & 0x3F));
+        return 3;
+    }
+    out[0] = @intCast(0xF0 | (cp >> 18));
+    out[1] = @intCast(0x80 | ((cp >> 12) & 0x3F));
+    out[2] = @intCast(0x80 | ((cp >> 6) & 0x3F));
+    out[3] = @intCast(0x80 | (cp & 0x3F));
+    return 4;
 }
 
 /// Builds an `Event` from an already-parsed `std.json.Value` (which must be a
@@ -520,4 +1191,319 @@ test "verify rejects a signature from the wrong key" {
     var ev = try create(allocator, signer, kp_a, 1700000000, 1, &[_]Tag{}, "hello", null);
     ev.sig = try signer.signId(ev.id, kp_b, null); // sign the same id, wrong key
     try std.testing.expect(!(try verify(allocator, signer, ev)));
+}
+
+// -- The scanner and the serializers against the code they replaced ----------
+
+const reference = @import("event_reference.zig");
+
+/// Random events, written out with every spelling JSON allows for them, then
+/// broken in small ways, for the differential test below.
+const Generator = struct {
+    rand: std.Random,
+    arena: std.mem.Allocator,
+
+    /// A code point, weighted towards the ones that need care: the escaped
+    /// ASCII bytes, other control bytes, and multi-byte UTF-8 of every length.
+    fn codePoint(g: Generator) u21 {
+        const r = g.rand;
+        return switch (r.uintLessThan(u8, 12)) {
+            0, 1, 2, 3 => r.intRangeAtMost(u21, 0x20, 0x7e),
+            4 => "\"\\/\n\r\t\x08\x0c"[r.uintLessThan(usize, 8)],
+            5 => r.uintLessThan(u21, 0x20),
+            6 => 0x7f,
+            7 => r.intRangeAtMost(u21, 0x80, 0x7ff),
+            8 => r.intRangeAtMost(u21, 0x800, 0xd7ff),
+            9 => r.intRangeAtMost(u21, 0xe000, 0xffff),
+            else => r.intRangeAtMost(u21, 0x10000, 0x10ffff),
+        };
+    }
+
+    fn string(g: Generator) ![]const u8 {
+        const r = g.rand;
+        const n: usize = switch (r.uintLessThan(u8, 8)) {
+            0 => 0,
+            1, 2, 3 => r.uintLessThan(usize, 8),
+            4, 5 => r.uintLessThan(usize, 40),
+            6 => r.uintLessThan(usize, 300),
+            else => 64,
+        };
+        var out: std.ArrayList(u8) = .empty;
+        const plain = r.boolean();
+        for (0..n) |_| {
+            const cp: u21 = if (plain) r.intRangeAtMost(u21, 'a', 'z') else g.codePoint();
+            var buf: [4]u8 = undefined;
+            const len = std.unicode.utf8Encode(cp, &buf) catch unreachable;
+            try out.appendSlice(g.arena, buf[0..len]);
+        }
+        return out.items;
+    }
+
+    fn event(g: Generator) !Event {
+        const r = g.rand;
+        const tag_count: usize = switch (r.uintLessThan(u8, 6)) {
+            0 => 0,
+            1, 2, 3 => r.uintLessThan(usize, 6),
+            4 => r.uintLessThan(usize, 40),
+            else => r.uintLessThan(usize, 400),
+        };
+        const tags = try g.arena.alloc(Tag, tag_count);
+        for (tags) |*tag| {
+            const fields = try g.arena.alloc([]const u8, r.uintLessThan(usize, 6));
+            for (fields) |*f| f.* = try g.string();
+            tag.* = fields;
+        }
+        var ev: Event = .{
+            .id = undefined,
+            .pubkey = undefined,
+            .created_at = switch (r.uintLessThan(u8, 6)) {
+                0 => 0,
+                1 => std.math.maxInt(i64),
+                2 => std.math.minInt(i64),
+                3 => -r.intRangeAtMost(i64, 1, 1000),
+                else => r.int(i64),
+            },
+            .kind = switch (r.uintLessThan(u8, 4)) {
+                0 => 0,
+                1 => std.math.maxInt(u16),
+                else => r.int(u16),
+            },
+            .tags = tags,
+            .content = try g.string(),
+            .sig = undefined,
+        };
+        r.bytes(&ev.id);
+        r.bytes(&ev.pubkey);
+        r.bytes(&ev.sig);
+        return ev;
+    }
+
+    fn ws(g: Generator, out: *std.ArrayList(u8)) !void {
+        if (g.rand.uintLessThan(u8, 4) != 0) return;
+        for (0..g.rand.intRangeAtMost(usize, 1, 3)) |_| try out.append(g.arena, " \t\n\r"[g.rand.uintLessThan(usize, 4)]);
+    }
+
+    /// `s` as a JSON string, each code point spelled raw, with its short
+    /// escape, or as `\u` (a surrogate pair above the BMP), at random.
+    fn writeString(g: Generator, out: *std.ArrayList(u8), s: []const u8) !void {
+        const r = g.rand;
+        try out.append(g.arena, '"');
+        var it = std.unicode.Utf8View.initUnchecked(s).iterator();
+        while (it.nextCodepointSlice()) |slice| {
+            const cp = std.unicode.utf8Decode(slice) catch unreachable;
+            const must = cp < 0x20 or cp == '"' or cp == '\\';
+            const choice = r.uintLessThan(u8, 4);
+            if (choice == 0 or (must and choice == 1)) {
+                if (cp >= 0x10000) {
+                    const v = cp - 0x10000;
+                    try out.print(g.arena, "\\u{X:0>4}\\u{x:0>4}", .{ 0xD800 + (v >> 10), 0xDC00 + (v & 0x3ff) });
+                } else {
+                    try out.print(g.arena, "\\u{x:0>4}", .{cp});
+                }
+            } else if (must or (cp == '/' and choice == 1)) {
+                var esc: [6]u8 = undefined;
+                try out.appendSlice(g.arena, if (cp == '/') "\\/" else escapeFor(@intCast(cp), &esc));
+            } else {
+                try out.appendSlice(g.arena, slice);
+            }
+        }
+        try out.append(g.arena, '"');
+    }
+
+    fn writeHexString(g: Generator, out: *std.ArrayList(u8), bytes: []const u8) !void {
+        const digits = if (g.rand.uintLessThan(u8, 8) == 0) "0123456789ABCDEF" else hex_digits;
+        try out.append(g.arena, '"');
+        for (bytes) |b| try out.appendSlice(g.arena, &.{ digits[b >> 4], digits[b & 0xf] });
+        try out.append(g.arena, '"');
+    }
+
+    /// An event object with its fields in a random order, random whitespace,
+    /// sometimes an extra key, and numbers sometimes in a form only `std.json`
+    /// takes.
+    fn text(g: Generator, ev: Event) ![]u8 {
+        const r = g.rand;
+        var out: std.ArrayList(u8) = .empty;
+        var order = [_]u8{ 0, 1, 2, 3, 4, 5, 6, 7 };
+        r.shuffle(u8, &order);
+        const with_extra = r.uintLessThan(u8, 4) == 0;
+        try g.ws(&out);
+        try out.append(g.arena, '{');
+        var first = true;
+        for (order) |field| {
+            if (field == 7 and !with_extra) continue;
+            if (!first) try out.append(g.arena, ',');
+            first = false;
+            try g.ws(&out);
+            const name = switch (field) {
+                0 => "id",
+                1 => "pubkey",
+                2 => "created_at",
+                3 => "kind",
+                4 => "tags",
+                5 => "content",
+                6 => "sig",
+                else => "extra",
+            };
+            try g.writeString(&out, name);
+            try g.ws(&out);
+            try out.append(g.arena, ':');
+            try g.ws(&out);
+            switch (field) {
+                0 => try g.writeHexString(&out, &ev.id),
+                1 => try g.writeHexString(&out, &ev.pubkey),
+                2 => try g.writeNumber(&out, ev.created_at),
+                3 => try g.writeNumber(&out, ev.kind),
+                4 => {
+                    try out.append(g.arena, '[');
+                    for (ev.tags, 0..) |tag, ti| {
+                        if (ti != 0) try out.append(g.arena, ',');
+                        try g.ws(&out);
+                        try out.append(g.arena, '[');
+                        for (tag, 0..) |f, fi| {
+                            if (fi != 0) try out.append(g.arena, ',');
+                            try g.ws(&out);
+                            try g.writeString(&out, f);
+                            try g.ws(&out);
+                        }
+                        try out.append(g.arena, ']');
+                        try g.ws(&out);
+                    }
+                    try out.append(g.arena, ']');
+                },
+                5 => try g.writeString(&out, ev.content),
+                6 => try g.writeHexString(&out, &ev.sig),
+                else => try out.appendSlice(g.arena, switch (r.uintLessThan(u8, 6)) {
+                    0 => "null",
+                    1 => "[true,false,{\"a\":[1.5e-3,-0,0.25E+2]}]",
+                    2 => "{\"nested\":{\"deeper\":[[[]]]}}",
+                    3 => "\"\\u00e9\\ud83d\\ude00\"",
+                    4 => "-12.5e10",
+                    else => "{}",
+                }),
+            }
+            try g.ws(&out);
+        }
+        try out.append(g.arena, '}');
+        try g.ws(&out);
+        return out.items;
+    }
+
+    fn writeNumber(g: Generator, out: *std.ArrayList(u8), v: i64) !void {
+        switch (g.rand.uintLessThan(u8, 16)) {
+            0 => try out.print(g.arena, "{d}.0", .{v}),
+            1 => try out.print(g.arena, "\"{d}\"", .{v}),
+            2 => try out.print(g.arena, "{d}e0", .{v}),
+            3 => if (v == 0) try out.appendSlice(g.arena, "-0") else try out.print(g.arena, "{d}", .{v}),
+            else => try out.print(g.arena, "{d}", .{v}),
+        }
+    }
+
+    /// Breaks `text` the way a bad sender would: a byte changed, dropped,
+    /// duplicated, or a slice of the text repeated or cut off.
+    fn mutate(g: Generator, text_in: []u8) ![]u8 {
+        const touchy = "\"\\{}[],:0-9eu \x00\x80\xc3\xed\xf4";
+        const r = g.rand;
+        var out: std.ArrayList(u8) = .empty;
+        try out.appendSlice(g.arena, text_in);
+        for (0..r.intRangeAtMost(usize, 1, 3)) |_| {
+            if (out.items.len == 0) break;
+            const at = r.uintLessThan(usize, out.items.len);
+            switch (r.uintLessThan(u8, 6)) {
+                0 => out.items[at] = r.int(u8),
+                1 => out.items[at] = touchy[r.uintLessThan(usize, touchy.len)],
+                2 => _ = out.orderedRemove(at),
+                3 => try out.insert(g.arena, at, out.items[at]),
+                4 => out.items.len = at,
+                else => {
+                    const len = @min(out.items.len - at, r.uintLessThan(usize, 80));
+                    try out.insertSlice(g.arena, at, try g.arena.dupe(u8, out.items[at..][0..len]));
+                },
+            }
+        }
+        return out.items;
+    }
+};
+
+test "fromJson and the serializers agree with std.json on generated events" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var prng = std.Random.DefaultPrng.init(0x6576_656e_7473);
+    const g: Generator = .{ .rand = prng.random(), .arena = arena_state.allocator() };
+
+    for (0..4000) |_| {
+        const ev = try g.event();
+        try reference.expectSameSerialization(ev);
+        const wire = try toJson(g.arena, ev);
+        try reference.expectSameAsReference(wire);
+        const spelled = try g.text(ev);
+        try reference.expectSameAsReference(spelled);
+        try reference.expectSameAsReference(try g.mutate(spelled));
+        try reference.expectSameAsReference(try g.mutate(try g.arena.dupe(u8, wire)));
+        _ = arena_state.reset(.retain_capacity);
+    }
+}
+
+test "fromJson agrees with std.json at the edges" {
+    const z32 = "\"" ++ "00" ** 32 ++ "\"";
+    const z64 = "\"" ++ "00" ** 64 ++ "\"";
+    const head = "{\"id\":" ++ z32 ++ ",\"pubkey\":" ++ z32 ++ ",\"sig\":" ++ z64 ++ ",\"tags\":[]";
+    const cases = [_][]const u8{
+        head ++ ",\"created_at\":0,\"kind\":0,\"content\":\"\"}",
+        head ++ ",\"created_at\":-0,\"kind\":-0,\"content\":\"\"}",
+        head ++ ",\"created_at\":9223372036854775807,\"kind\":65535,\"content\":\"\"}",
+        head ++ ",\"created_at\":-9223372036854775808,\"kind\":1,\"content\":\"\"}",
+        head ++ ",\"created_at\":9223372036854775808,\"kind\":1,\"content\":\"\"}",
+        head ++ ",\"created_at\":-9223372036854775809,\"kind\":1,\"content\":\"\"}",
+        head ++ ",\"created_at\":1,\"kind\":65536,\"content\":\"\"}",
+        head ++ ",\"created_at\":1,\"kind\":-1,\"content\":\"\"}",
+        head ++ ",\"created_at\":01,\"kind\":1,\"content\":\"\"}",
+        head ++ ",\"created_at\":1.5,\"kind\":1,\"content\":\"\"}",
+        head ++ ",\"created_at\":1e3,\"kind\":1E0,\"content\":\"\"}",
+        head ++ ",\"created_at\":\"12\",\"kind\":1,\"content\":\"\"}",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":[104,105]}",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":null}",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":\"\\ud83d\\ude00\"}",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":\"\\ud83d\"}",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":\"\\ude00\"}",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":\"\\ud83d\\u0041\"}",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":\"\\x\"}",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":\"\\u12\"}",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":\"\xed\xa0\x80\"}",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":\"\xc0\xaf\"}",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":\"\xf4\x90\x80\x80\"}",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":\"\xc3\"}",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":\"\xc3\\u00a9\"}",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":\"a\tb\"}",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":\"\x7f\"}",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":\"\"} x",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":\"\"}\x00",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":\"\",}",
+        head ++ ",\"created_at\":1,\"kind\":1}",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":\"\",\"kind\":2}",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":\"\",\"x\":1,\"x\":2}",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":\"\",\"x\":[1,]}",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":\"\",\"x\":tru}",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":\"\",\"x\":1.}",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":\"\",\"x\":.5}",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":\"\",\"x\":1e}",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":\"\",\"x\":+1}",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":\"\",\"x\":" ++ "[" ** 100 ++ "]" ** 100 ++ "}",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":\"\",\"\\u0069d\":1}",
+        "{\"\\u0069d\":" ++ z32 ++ ",\"pubkey\":" ++ z32 ++ ",\"sig\":" ++ z64 ++ ",\"tags\":[],\"created_at\":1,\"kind\":1,\"content\":\"\"}",
+        "{\"id\":\"" ++ "0" ** 63 ++ "\",\"pubkey\":" ++ z32 ++ ",\"sig\":" ++ z64 ++ ",\"tags\":[],\"created_at\":1,\"kind\":1,\"content\":\"\"}",
+        "{\"id\":\"" ++ "AB" ** 32 ++ "\",\"pubkey\":" ++ z32 ++ ",\"sig\":" ++ z64 ++ ",\"tags\":[],\"created_at\":1,\"kind\":1,\"content\":\"\"}",
+        "{\"id\":\"" ++ "0g" ** 32 ++ "\",\"pubkey\":" ++ z32 ++ ",\"sig\":" ++ z64 ++ ",\"tags\":[],\"created_at\":1,\"kind\":1,\"content\":\"\"}",
+        "{\"id\":\"\\u0030" ++ "0" ** 63 ++ "\",\"pubkey\":" ++ z32 ++ ",\"sig\":" ++ z64 ++ ",\"tags\":[],\"created_at\":1,\"kind\":1,\"content\":\"\"}",
+        "{\"id\":" ++ z32 ++ ",\"pubkey\":" ++ z32 ++ ",\"sig\":" ++ z64 ++ ",\"tags\":[[]],\"created_at\":1,\"kind\":1,\"content\":\"\"}",
+        "{\"id\":" ++ z32 ++ ",\"pubkey\":" ++ z32 ++ ",\"sig\":" ++ z64 ++ ",\"tags\":[[1]],\"created_at\":1,\"kind\":1,\"content\":\"\"}",
+        "{\"id\":" ++ z32 ++ ",\"pubkey\":" ++ z32 ++ ",\"sig\":" ++ z64 ++ ",\"tags\":[\"e\"],\"created_at\":1,\"kind\":1,\"content\":\"\"}",
+        "{\"id\":" ++ z32 ++ ",\"pubkey\":" ++ z32 ++ ",\"sig\":" ++ z64 ++ ",\"tags\":null,\"created_at\":1,\"kind\":1,\"content\":\"\"}",
+        "{}",
+        "[]",
+        "",
+        " ",
+        "{",
+        "\"x\"",
+    };
+    for (cases) |c| try reference.expectSameAsReference(c);
 }

@@ -64,6 +64,7 @@ const testing = std.testing;
 const bech32 = @import("bech32.zig");
 const bip39 = @import("bip39.zig");
 const event = @import("event.zig");
+const event_reference = @import("event_reference.zig");
 const filter = @import("filter.zig");
 const hex = @import("hex.zig");
 const json = @import("json.zig");
@@ -528,18 +529,19 @@ fn fuzzReplyRoundTrip(_: void, smith: *testing.Smith) anyerror!void {
 
 // -- An event on its own ------------------------------------------------------
 
+/// The event objects every event target starts from.
+const event_corpus: []const []const u8 = &.{
+    one(sample_event),
+    // Reordered, with a key the parser has to skip.
+    one("{\"kind\":7,\"extra\":{\"a\":[1,2]},\"content\":\"\",\"tags\":[],\"created_at\":-5,\"pubkey\":\"" ++ zeros32 ++ "\",\"id\":\"" ++ zeros32 ++ "\",\"sig\":\"" ++ zeros64 ++ "\"}"),
+    // Every control character and a multi-byte sequence in the content.
+    one("{\"id\":\"" ++ zeros32 ++ "\",\"pubkey\":\"" ++ zeros32 ++ "\",\"created_at\":1,\"kind\":1,\"tags\":[[\"\\u0001\",\"\\u00e9\\ud83d\\ude00\"]],\"content\":\"\\u0000\\u001f\\b\\f\\/\",\"sig\":\"" ++ zeros64 ++ "\"}"),
+    // A number past the range of the field it lands in.
+    one("{\"id\":\"" ++ zeros32 ++ "\",\"pubkey\":\"" ++ zeros32 ++ "\",\"created_at\":99999999999999999999,\"kind\":1,\"tags\":[],\"content\":\"\",\"sig\":\"" ++ zeros64 ++ "\"}"),
+};
+
 test "fuzz: an event, and then everything that reads one" {
-    try testing.fuzz({}, fuzzEvent, .{
-        .corpus = &.{
-            one(sample_event),
-            // Reordered, with a key the parser has to skip.
-            one("{\"kind\":7,\"extra\":{\"a\":[1,2]},\"content\":\"\",\"tags\":[],\"created_at\":-5,\"pubkey\":\"" ++ zeros32 ++ "\",\"id\":\"" ++ zeros32 ++ "\",\"sig\":\"" ++ zeros64 ++ "\"}"),
-            // Every control character and a multi-byte sequence in the content.
-            one("{\"id\":\"" ++ zeros32 ++ "\",\"pubkey\":\"" ++ zeros32 ++ "\",\"created_at\":1,\"kind\":1,\"tags\":[[\"\\u0001\",\"\\u00e9\\ud83d\\ude00\"]],\"content\":\"\\u0000\\u001f\\b\\f\\/\",\"sig\":\"" ++ zeros64 ++ "\"}"),
-            // A number past the range of the field it lands in.
-            one("{\"id\":\"" ++ zeros32 ++ "\",\"pubkey\":\"" ++ zeros32 ++ "\",\"created_at\":99999999999999999999,\"kind\":1,\"tags\":[],\"content\":\"\",\"sig\":\"" ++ zeros64 ++ "\"}"),
-        },
-    });
+    try testing.fuzz({}, fuzzEvent, .{ .corpus = event_corpus });
 }
 
 /// Deserialise an event, then put it through the things that walk it afterwards:
@@ -589,6 +591,73 @@ fn expectEventRoundTrips(ev: event.Event) !void {
     const a = try event.computeId(testing.allocator, ev.pubkey, ev.created_at, ev.kind, ev.tags, ev.content);
     const b = try event.computeId(testing.allocator, again.value.pubkey, again.value.created_at, again.value.kind, again.value.tags, again.value.content);
     try testing.expectEqualSlices(u8, &a, &b);
+}
+
+test "fuzz: the event scanner against std.json" {
+    try testing.fuzz({}, fuzzEventScanner, .{ .corpus = event_corpus ++ &[_][]const u8{
+        one("{\"id\":\"" ++ zeros32 ++ "\",\"pubkey\":\"" ++ zeros32 ++ "\",\"created_at\":1e3,\"kind\":-0,\"tags\":[],\"content\":\"\\ud83d\",\"sig\":\"" ++ zeros64 ++ "\"}"),
+        one(" {\"\\u0069d\":\"" ++ zeros32 ++ "\",\"pubkey\":\"" ++ zeros32 ++ "\",\"created_at\":01,\"kind\":1,\"tags\":[[\"\xc3\"]],\"content\":\"\",\"sig\":\"" ++ zeros64 ++ "\"} "),
+    } });
+}
+
+/// `event.fromJson` reads an event with a scanner of its own and hands what it
+/// does not take to `std.json`. Whatever it accepts has to be what `std.json`
+/// gives for the same text, and whatever it refuses has to be refused with the
+/// same error, or the scanner has quietly changed which events exist. Where
+/// both parse, `toJson`, the canonical form and the id are checked against the
+/// serializers they replaced as well.
+fn fuzzEventScanner(_: void, smith: *testing.Smith) anyerror!void {
+    @disableInstrumentation();
+    var buf: [4096]u8 = undefined;
+    const n = smith.slice(&buf);
+    try event_reference.expectSameAsReference(buf[0..n]);
+}
+
+test "fuzz: event strings the scanner has to decode" {
+    try testing.fuzz({}, fuzzEventStrings, .{ .corpus = &.{
+        seed(&.{ .{ .slice = "plain" }, .{ .slice = "e" }, .{ .slice = "1700000000" } }),
+        seed(&.{ .{ .slice = "a\\nb\\\"c\\u00e9\\ud83d\\ude00" }, .{ .slice = "\\/" }, .{ .slice = "-0" } }),
+        seed(&.{ .{ .slice = "\xed\xa0\x80" }, .{ .slice = "\\ud800x" }, .{ .slice = "1.0" } }),
+        seed(&.{ .{ .slice = "\x01\x7f\xf4\x8f\xbf\xbf" }, .{ .slice = "\\u" }, .{ .slice = "99999999999999999999" } }),
+    } });
+}
+
+/// Reaches past the envelope: fuzzed bytes go raw between the quotes of the
+/// content and of a tag, and in place of `created_at`, inside an event that is
+/// otherwise well formed, so the effort lands on escapes, surrogates, UTF-8
+/// and number syntax. The same bytes, unescaped, also go through both
+/// serializers as the content and a tag of an event.
+fn fuzzEventStrings(_: void, smith: *testing.Smith) anyerror!void {
+    @disableInstrumentation();
+    var content: [1024]u8 = undefined;
+    var tag: [256]u8 = undefined;
+    var number: [32]u8 = undefined;
+    const content_len = smith.slice(&content);
+    const tag_len = smith.slice(&tag);
+    const number_len = smith.slice(&number);
+
+    const text = try std.mem.concat(testing.allocator, u8, &.{
+        "{\"id\":\"" ++ zeros32 ++ "\",\"pubkey\":\"" ++ zeros32 ++ "\",\"created_at\":",
+        number[0..number_len],
+        ",\"kind\":1,\"tags\":[[\"e\",\"",
+        tag[0..tag_len],
+        "\"]],\"content\":\"",
+        content[0..content_len],
+        "\",\"sig\":\"" ++ zeros64 ++ "\"}",
+    });
+    defer testing.allocator.free(text);
+    try event_reference.expectSameAsReference(text);
+
+    const tags = [_]event.Tag{&.{ "e", tag[0..tag_len] }};
+    try event_reference.expectSameSerialization(.{
+        .id = @splat(0),
+        .pubkey = @splat(0),
+        .created_at = 1,
+        .kind = 1,
+        .tags = &tags,
+        .content = content[0..content_len],
+        .sig = @splat(0),
+    });
 }
 
 // -- A payload somebody encrypted to you --------------------------------------
