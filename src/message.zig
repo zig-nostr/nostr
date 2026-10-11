@@ -13,6 +13,7 @@ const hex = @import("hex.zig");
 const json = @import("json.zig");
 const event_mod = @import("event.zig");
 const filter_mod = @import("filter.zig");
+const scan = @import("scan.zig");
 const Event = event_mod.Event;
 const Filter = filter_mod.Filter;
 
@@ -319,7 +320,15 @@ pub const ParsedRelayMessage = struct {
 };
 
 /// Parses one relay message. The returned value owns an arena backing its
-/// borrowed fields — call `deinit` to free it.
+/// borrowed fields, so `json_text` may be freed as soon as this returns; call
+/// `deinit` to free it.
+///
+/// The text is copied into the arena and read in one pass by `scanRelayMessage`,
+/// which hands an `EVENT`'s object to the event scanner without building a
+/// JSON tree. Anything it does not take (an extra element, a key an event does
+/// not name, a number spelled `1e3`, malformed JSON) is parsed again through a
+/// `std.json.Value` tree, so what is accepted and every error returned are
+/// exactly what that path alone gives.
 pub fn parseRelayMessage(gpa: std.mem.Allocator, json_text: []const u8) Error!ParsedRelayMessage {
     const arena = try gpa.create(std.heap.ArenaAllocator);
     arena.* = std.heap.ArenaAllocator.init(gpa);
@@ -329,6 +338,154 @@ pub fn parseRelayMessage(gpa: std.mem.Allocator, json_text: []const u8) Error!Pa
     }
     const allocator = arena.allocator();
 
+    const owned_text = try allocator.dupe(u8, json_text);
+    if (scanRelayMessage(allocator, owned_text)) |value| {
+        return .{ .arena = arena, .value = value };
+    } else |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Unsupported => {},
+    }
+    // The scan decoded strings in place, so the copy is no longer the text.
+    _ = arena.reset(.retain_capacity);
+    return .{ .arena = arena, .value = try relayMessageFromTree(allocator, json_text) };
+}
+
+/// Reads a relay message in one pass, decoding its strings in place in `buf`.
+/// Takes only the shapes a relay sends in practice, each with exactly the
+/// elements its type names; anything else is `Unsupported`, never an error of
+/// its own, so `relayMessageFromTree` decides it.
+fn scanRelayMessage(allocator: std.mem.Allocator, buf: []u8) scan.ScanError!RelayMessage {
+    var s: scan.Scanner = .{ .buf = buf };
+    const tag = try openEnvelope(&s);
+    const eql = std.mem.eql;
+    const value: RelayMessage = if (eql(u8, tag, "EVENT")) blk: {
+        const sub = try nextString(&s);
+        try nextElement(&s);
+        const ev = try scan.eventObject(allocator, &s, .refuse);
+        break :blk .{ .event = .{ .subscription_id = sub, .event = ev } };
+    } else if (eql(u8, tag, "EOSE"))
+        .{ .eose = .{ .subscription_id = try nextString(&s) } }
+    else if (eql(u8, tag, "OK")) blk: {
+        try nextElement(&s);
+        const id = try s.hexString(32);
+        try nextElement(&s);
+        const accepted = try scanBool(&s);
+        break :blk .{ .ok = .{ .event_id = id, .accepted = accepted, .message = try nextString(&s) } };
+    } else if (eql(u8, tag, "CLOSED")) blk: {
+        const sub = try nextString(&s);
+        break :blk .{ .closed = .{ .subscription_id = sub, .message = try nextString(&s) } };
+    } else if (eql(u8, tag, "NOTICE"))
+        .{ .notice = .{ .message = try nextString(&s) } }
+    else if (eql(u8, tag, "AUTH"))
+        .{ .auth = .{ .challenge = try nextString(&s) } }
+    else if (eql(u8, tag, "COUNT")) blk: {
+        const sub = try nextString(&s);
+        try nextElement(&s);
+        const c = try scanCountObject(&s);
+        break :blk .{ .count = .{ .subscription_id = sub, .count = c.count, .approximate = c.approximate } };
+    } else if (eql(u8, tag, "NEG-MSG")) blk: {
+        const sub = try nextString(&s);
+        const h = try nextString(&s);
+        if (!isNegHex(h)) return error.Unsupported;
+        break :blk .{ .neg_msg = .{ .sub_id = sub, .hex = h } };
+    } else if (eql(u8, tag, "NEG-ERR")) blk: {
+        const sub = try nextString(&s);
+        break :blk .{ .neg_err = .{ .sub_id = sub, .reason = try nextString(&s) } };
+    } else return error.Unsupported;
+    try closeEnvelope(&s);
+    return value;
+}
+
+/// `[` and the type string, decoded.
+fn openEnvelope(s: *scan.Scanner) error{Unsupported}![]const u8 {
+    s.skipWs();
+    try s.expect('[');
+    s.skipWs();
+    if (s.peek() != '"') return error.Unsupported;
+    return s.string();
+}
+
+/// `]` and nothing after it but whitespace.
+fn closeEnvelope(s: *scan.Scanner) error{Unsupported}!void {
+    s.skipWs();
+    try s.expect(']');
+    s.skipWs();
+    if (s.i != s.buf.len) return error.Unsupported;
+}
+
+/// The `,` before the next element, and the whitespace around it.
+fn nextElement(s: *scan.Scanner) error{Unsupported}!void {
+    s.skipWs();
+    try s.expect(',');
+    s.skipWs();
+}
+
+/// The next element, which has to be a string.
+fn nextString(s: *scan.Scanner) error{Unsupported}![]const u8 {
+    try nextElement(s);
+    if (s.peek() != '"') return error.Unsupported;
+    return s.string();
+}
+
+fn scanBool(s: *scan.Scanner) error{Unsupported}!bool {
+    switch (s.peek()) {
+        't' => {
+            try s.literal("true");
+            return true;
+        },
+        'f' => {
+            try s.literal("false");
+            return false;
+        },
+        else => return error.Unsupported,
+    }
+}
+
+/// `{"count": N, "approximate"?: bool, "hll"?: string}`, each key at most once
+/// and no other, which is everything NIP-45 puts there.
+fn scanCountObject(s: *scan.Scanner) error{Unsupported}!struct { count: u64, approximate: ?bool } {
+    try s.expect('{');
+    s.skipWs();
+    var count: ?u64 = null;
+    var approximate: ?bool = null;
+    var hll = false;
+    while (true) {
+        if (s.peek() != '"') return error.Unsupported;
+        const key = try s.string();
+        s.skipWs();
+        try s.expect(':');
+        s.skipWs();
+        if (std.mem.eql(u8, key, "count")) {
+            if (count != null) return error.Unsupported;
+            count = try s.int(u64);
+        } else if (std.mem.eql(u8, key, "approximate")) {
+            if (approximate != null) return error.Unsupported;
+            approximate = try scanBool(s);
+        } else if (std.mem.eql(u8, key, "hll")) {
+            if (hll or s.peek() != '"') return error.Unsupported;
+            hll = true;
+            _ = try s.string();
+        } else return error.Unsupported;
+        s.skipWs();
+        switch (s.peek()) {
+            ',' => {
+                s.i += 1;
+                s.skipWs();
+            },
+            '}' => {
+                s.i += 1;
+                break;
+            },
+            else => return error.Unsupported,
+        }
+    }
+    return .{ .count = count orelse return error.Unsupported, .approximate = approximate };
+}
+
+/// The relay message, read through a `std.json.Value` tree into `allocator`.
+/// What `parseRelayMessage` falls back to, and the reference it is tested
+/// against.
+fn relayMessageFromTree(allocator: std.mem.Allocator, json_text: []const u8) Error!RelayMessage {
     // Out of memory is not a malformed message, and a caller that skips
     // malformed messages would otherwise drop a good one without a word.
     const root = std.json.parseFromSliceLeaky(std.json.Value, allocator, json_text, .{}) catch |err| return switch (err) {
@@ -403,7 +560,7 @@ pub fn parseRelayMessage(gpa: std.mem.Allocator, json_text: []const u8) Error!Pa
         return Error.InvalidMessage;
     };
 
-    return ParsedRelayMessage{ .arena = arena, .value = value };
+    return value;
 }
 
 // ---------------------------------------------------------------------------
@@ -458,6 +615,11 @@ pub const ParsedClientMessage = struct {
 /// or `COUNT` carries 1 to `max_filters` filters. A `limit` above `u32` is
 /// read as the largest `u32`. Unknown filter keys
 /// are skipped, as NIP-01 asks of a relay.
+///
+/// An `EVENT` or `AUTH` is read in one pass, the way `parseRelayMessage`
+/// reads a relay's `EVENT`; every other message, and anything that pass does
+/// not take, goes through a `std.json.Value` tree, so what is accepted and
+/// every error returned are what that path alone gives.
 pub fn parseClientMessage(gpa: std.mem.Allocator, json_text: []const u8) Error!ParsedClientMessage {
     const arena = try gpa.create(std.heap.ArenaAllocator);
     arena.* = std.heap.ArenaAllocator.init(gpa);
@@ -467,6 +629,33 @@ pub fn parseClientMessage(gpa: std.mem.Allocator, json_text: []const u8) Error!P
     }
     const allocator = arena.allocator();
 
+    const owned_text = try allocator.dupe(u8, json_text);
+    if (scanClientEvent(allocator, owned_text)) |value| {
+        return .{ .arena = arena, .value = value };
+    } else |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Unsupported => {},
+    }
+    _ = arena.reset(.retain_capacity);
+    return .{ .arena = arena, .value = try clientMessageFromTree(allocator, json_text) };
+}
+
+/// `["EVENT", <event>]` or `["AUTH", <event>]` in one pass; everything else is
+/// `Unsupported`.
+fn scanClientEvent(allocator: std.mem.Allocator, buf: []u8) scan.ScanError!ClientMessage {
+    var s: scan.Scanner = .{ .buf = buf };
+    const tag = try openEnvelope(&s);
+    const is_event = std.mem.eql(u8, tag, "EVENT");
+    if (!is_event and !std.mem.eql(u8, tag, "AUTH")) return error.Unsupported;
+    try nextElement(&s);
+    const ev = try scan.eventObject(allocator, &s, .refuse);
+    try closeEnvelope(&s);
+    return if (is_event) .{ .event = ev } else .{ .auth = ev };
+}
+
+/// The client message, read through a `std.json.Value` tree into
+/// `allocator`: the fallback of `parseClientMessage` and its test reference.
+fn clientMessageFromTree(allocator: std.mem.Allocator, json_text: []const u8) Error!ClientMessage {
     const root = std.json.parseFromSliceLeaky(std.json.Value, allocator, json_text, .{}) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => Error.InvalidMessage,
@@ -515,7 +704,7 @@ pub fn parseClientMessage(gpa: std.mem.Allocator, json_text: []const u8) Error!P
         return Error.InvalidMessage;
     };
 
-    return ParsedClientMessage{ .arena = arena, .value = value };
+    return value;
 }
 
 fn eventFromValue(allocator: std.mem.Allocator, v: std.json.Value) Error!Event {
@@ -623,9 +812,13 @@ fn asSubId(v: std.json.Value) ?[]const u8 {
 /// A negentropy payload: an even-length hex string, bounded.
 fn asNegHex(v: std.json.Value) ?[]const u8 {
     const s = asString(v) orelse return null;
-    if (s.len > max_neg_hex_len or s.len % 2 != 0) return null;
-    for (s) |c| if (!std.ascii.isHex(c)) return null;
-    return s;
+    return if (isNegHex(s)) s else null;
+}
+
+fn isNegHex(s: []const u8) bool {
+    if (s.len > max_neg_hex_len or s.len % 2 != 0) return false;
+    for (s) |c| if (!std.ascii.isHex(c)) return false;
+    return true;
 }
 
 fn asString(v: std.json.Value) ?[]const u8 {
@@ -1197,4 +1390,126 @@ test "a REQ or COUNT with no filter is refused, and a limit past u32 is clamped"
     var p = try parseClientMessage(a, "[\"REQ\",\"s\",{\"limit\":5000000000}]");
     defer p.deinit();
     try std.testing.expectEqual(@as(?u32, std.math.maxInt(u32)), p.value.req.filters[0].limit);
+}
+
+// -- The one-pass parsers against the std.json ones they replaced -------------
+
+const reference = @import("message_reference.zig");
+
+test "parseRelayMessage and parseClientMessage agree with std.json on generated messages" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var prng = std.Random.DefaultPrng.init(0x656e_7665_6c6f_7065);
+    const e: reference.Envelopes = .{ .g = .{ .rand = prng.random(), .arena = arena_state.allocator() } };
+
+    for (0..4000) |_| {
+        const relay_text = try e.relay();
+        try reference.expectSameRelayMessage(relay_text);
+        try reference.expectSameRelayMessage(try e.g.mutate(relay_text));
+        const client_text = try e.client();
+        try reference.expectSameClientMessage(client_text);
+        try reference.expectSameClientMessage(try e.g.mutate(client_text));
+        _ = arena_state.reset(.retain_capacity);
+    }
+}
+
+test "parseRelayMessage agrees with std.json at the edges" {
+    const z32 = "\"" ++ "00" ** 32 ++ "\"";
+    const z64 = "\"" ++ "00" ** 64 ++ "\"";
+    const ev = "{\"id\":" ++ z32 ++ ",\"pubkey\":" ++ z32 ++ ",\"created_at\":1,\"kind\":1,\"tags\":[[\"e\",\"x\"]],\"content\":\"hi\",\"sig\":" ++ z64 ++ "}";
+    const cases = [_][]const u8{
+        "[\"EVENT\",\"s\"," ++ ev ++ "]",
+        " [ \"EVENT\" , \"s\" , " ++ ev ++ " ] ",
+        "[\"EVENT\",\"s\"," ++ ev ++ ",1]",
+        "[\"EVENT\",\"s\"," ++ ev ++ ",{\"a\":1,\"a\":2}]",
+        "[\"EVENT\",\"s\"]",
+        "[\"EVENT\",1," ++ ev ++ "]",
+        "[\"EVENT\",\"s\"," ++ ev ++ "] x",
+        "[\"EVENT\",\"s\"," ++ ev ++ "",
+        "[\"\\u0045VENT\",\"\\u00e9\"," ++ ev ++ "]",
+        "[\"EVENT\",\"s\",{\"x\":{\"a\":1,\"a\":2},\"id\":" ++ z32 ++ ",\"pubkey\":" ++ z32 ++ ",\"created_at\":1,\"kind\":1,\"tags\":[],\"content\":\"\",\"sig\":" ++ z64 ++ "}]",
+        "[\"EVENT\",\"s\",{\"x\":1,\"x\":2,\"id\":" ++ z32 ++ ",\"pubkey\":" ++ z32 ++ ",\"created_at\":1,\"kind\":1,\"tags\":[],\"content\":\"\",\"sig\":" ++ z64 ++ "}]",
+        "[\"EVENT\",\"s\",{\"x\":1,\"id\":" ++ z32 ++ ",\"pubkey\":" ++ z32 ++ ",\"created_at\":1,\"kind\":1,\"tags\":[],\"content\":\"\",\"sig\":" ++ z64 ++ "}]",
+        "[\"EVENT\",\"s\",{\"id\":" ++ z32 ++ ",\"id\":" ++ z32 ++ ",\"pubkey\":" ++ z32 ++ ",\"created_at\":1,\"kind\":1,\"tags\":[],\"content\":\"\",\"sig\":" ++ z64 ++ "}]",
+        "[\"OK\"," ++ z32 ++ ",true,\"\"]",
+        "[\"OK\"," ++ z32 ++ ",false,\"blocked: no\"]",
+        "[\"OK\"," ++ z32 ++ ",null,\"\"]",
+        "[\"OK\",\"\\u0030" ++ "0" ** 63 ++ "\",true,\"\"]",
+        "[\"OK\",\"" ++ "AB" ** 32 ++ "\",true,\"\"]",
+        "[\"OK\"," ++ z32 ++ ",true]",
+        "[\"OK\"," ++ z32 ++ ",truex,\"\"]",
+        "[\"EOSE\",\"s\"]",
+        "[\"EOSE\",\"\"]",
+        "[\"EOSE\"]",
+        "[\"CLOSED\",\"s\",\"auth-required: x\"]",
+        "[\"NOTICE\",\"a\\nb\\ud83d\\ude00\"]",
+        "[\"NOTICE\",\"\\ud83d\"]",
+        "[\"NOTICE\",\"\xc3\"]",
+        "[\"AUTH\",\"challenge\"]",
+        "[\"AUTH\"," ++ ev ++ "]",
+        "[\"COUNT\",\"s\",{\"count\":5}]",
+        "[\"COUNT\",\"s\",{\"count\":5,\"approximate\":true,\"hll\":\"00ff\"}]",
+        "[\"COUNT\",\"s\",{\"count\":5,\"approximate\":null}]",
+        "[\"COUNT\",\"s\",{\"count\":5,\"count\":6}]",
+        "[\"COUNT\",\"s\",{\"count\":18446744073709551615}]",
+        "[\"COUNT\",\"s\",{\"count\":18446744073709551616}]",
+        "[\"COUNT\",\"s\",{\"count\":-0}]",
+        "[\"COUNT\",\"s\",{\"count\":1e2}]",
+        "[\"COUNT\",\"s\",{\"count\":5,\"other\":[1]}]",
+        "[\"COUNT\",\"s\",{\"count\":5,\"hll\":{\"a\":1,\"a\":1}}]",
+        "[\"COUNT\",\"s\",{}]",
+        "[\"NEG-MSG\",\"s\",\"61ab\"]",
+        "[\"NEG-MSG\",\"s\",\"61a\"]",
+        "[\"NEG-MSG\",\"s\",\"zz\"]",
+        "[\"NEG-ERR\",\"s\",\"blocked\"]",
+        "[\"UNKNOWN\",\"s\"]",
+        "[]",
+        "[1]",
+        "{}",
+        "",
+        "[",
+    };
+    for (cases) |c| try reference.expectSameRelayMessage(c);
+    for (cases) |c| try reference.expectSameClientMessage(c);
+    const client_cases = [_][]const u8{
+        "[\"EVENT\"," ++ ev ++ "]",
+        "[\"AUTH\"," ++ ev ++ "]",
+        "[\"EVENT\"," ++ ev ++ ",1]",
+        "[\"EVENT\"]",
+        "[\"EVENT\",\"s\"]",
+        "[\"REQ\",\"s\",{\"kinds\":[1]}]",
+        "[\"CLOSE\",\"s\"]",
+    };
+    for (client_cases) |c| try reference.expectSameClientMessage(c);
+}
+
+test "a parsed relay message outlives the text it was parsed from" {
+    const gpa = std.testing.allocator;
+    const ev = sampleEvent();
+    const text = try encodeEventMsg(gpa, "sub \\ \u{e9}", ev);
+    var parsed = try parseRelayMessage(gpa, text);
+    defer parsed.deinit();
+    const fresh = try gpa.dupe(u8, text);
+    defer gpa.free(fresh);
+    @memset(text, 'x');
+    gpa.free(text);
+    try reference.expectSameRelayMessage(fresh);
+    try std.testing.expectEqualStrings("sub \\ \u{e9}", parsed.value.event.subscription_id);
+    try expectSameEvent(ev, parsed.value.event.event);
+}
+
+test "a created_at of 2^63 written as a float is refused, not a crash" {
+    const z32 = "\"" ++ "00" ** 32 ++ "\"";
+    const z64 = "\"" ++ "00" ** 64 ++ "\"";
+    const body = ",\"pubkey\":" ++ z32 ++ ",\"kind\":1,\"tags\":[],\"content\":\"\",\"sig\":" ++ z64 ++ "}";
+    for ([_][]const u8{ "9223372036854775807.0", "9223372036854775808.0", "9.223372036854775807e18" }) |n| {
+        var buf: [512]u8 = undefined;
+        const ev = try std.fmt.bufPrint(&buf, "{{\"id\":{s},\"created_at\":{s}{s}", .{ z32, n, body });
+        var relay_buf: [600]u8 = undefined;
+        const relay_text = try std.fmt.bufPrint(&relay_buf, "[\"EVENT\",\"s\",{s}]", .{ev});
+        try std.testing.expectError(Error.InvalidMessage, parseRelayMessage(std.testing.allocator, relay_text));
+        var client_buf: [600]u8 = undefined;
+        const client_text = try std.fmt.bufPrint(&client_buf, "[\"EVENT\",{s}]", .{ev});
+        try std.testing.expectError(Error.InvalidMessage, parseClientMessage(std.testing.allocator, client_text));
+    }
 }

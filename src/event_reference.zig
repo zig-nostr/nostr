@@ -212,7 +212,7 @@ pub fn expectSameAsReference(text: []const u8) !void {
     try expectSameSerialization(a.value);
 }
 
-fn expectSameEvent(want: Event, got: Event) !void {
+pub fn expectSameEvent(want: Event, got: Event) !void {
     const t = std.testing;
     try t.expectEqualSlices(u8, &want.id, &got.id);
     try t.expectEqualSlices(u8, &want.pubkey, &got.pubkey);
@@ -258,4 +258,248 @@ pub fn expectSameSerialization(ev: Event) !void {
     const want_id = try computeId(gpa, ev.pubkey, ev.created_at, ev.kind, ev.tags, ev.content);
     const got_id = try event_mod.computeId(gpa, ev.pubkey, ev.created_at, ev.kind, ev.tags, ev.content);
     try t.expectEqualSlices(u8, &want_id, &got_id);
+}
+
+// -- Generated input for the differential tests -------------------------------
+
+/// Random events, written out with every spelling JSON allows for them, then
+/// broken in small ways, for the differential test below.
+pub const Generator = struct {
+    rand: std.Random,
+    arena: std.mem.Allocator,
+
+    /// A code point, weighted towards the ones that need care: the escaped
+    /// ASCII bytes, other control bytes, and multi-byte UTF-8 of every length.
+    pub fn codePoint(g: Generator) u21 {
+        const r = g.rand;
+        return switch (r.uintLessThan(u8, 12)) {
+            0, 1, 2, 3 => r.intRangeAtMost(u21, 0x20, 0x7e),
+            4 => "\"\\/\n\r\t\x08\x0c"[r.uintLessThan(usize, 8)],
+            5 => r.uintLessThan(u21, 0x20),
+            6 => 0x7f,
+            7 => r.intRangeAtMost(u21, 0x80, 0x7ff),
+            8 => r.intRangeAtMost(u21, 0x800, 0xd7ff),
+            9 => r.intRangeAtMost(u21, 0xe000, 0xffff),
+            else => r.intRangeAtMost(u21, 0x10000, 0x10ffff),
+        };
+    }
+
+    pub fn string(g: Generator) ![]const u8 {
+        const r = g.rand;
+        const n: usize = switch (r.uintLessThan(u8, 8)) {
+            0 => 0,
+            1, 2, 3 => r.uintLessThan(usize, 8),
+            4, 5 => r.uintLessThan(usize, 40),
+            6 => r.uintLessThan(usize, 300),
+            else => 64,
+        };
+        var out: std.ArrayList(u8) = .empty;
+        const plain = r.boolean();
+        for (0..n) |_| {
+            const cp: u21 = if (plain) r.intRangeAtMost(u21, 'a', 'z') else g.codePoint();
+            var buf: [4]u8 = undefined;
+            const len = std.unicode.utf8Encode(cp, &buf) catch unreachable;
+            try out.appendSlice(g.arena, buf[0..len]);
+        }
+        return out.items;
+    }
+
+    pub fn event(g: Generator) !Event {
+        const r = g.rand;
+        const tag_count: usize = switch (r.uintLessThan(u8, 6)) {
+            0 => 0,
+            1, 2, 3 => r.uintLessThan(usize, 6),
+            4 => r.uintLessThan(usize, 40),
+            else => r.uintLessThan(usize, 400),
+        };
+        const tags = try g.arena.alloc(Tag, tag_count);
+        for (tags) |*tag| {
+            const fields = try g.arena.alloc([]const u8, r.uintLessThan(usize, 6));
+            for (fields) |*f| f.* = try g.string();
+            tag.* = fields;
+        }
+        var ev: Event = .{
+            .id = undefined,
+            .pubkey = undefined,
+            .created_at = switch (r.uintLessThan(u8, 6)) {
+                0 => 0,
+                1 => std.math.maxInt(i64),
+                2 => std.math.minInt(i64),
+                3 => -r.intRangeAtMost(i64, 1, 1000),
+                else => r.int(i64),
+            },
+            .kind = switch (r.uintLessThan(u8, 4)) {
+                0 => 0,
+                1 => std.math.maxInt(u16),
+                else => r.int(u16),
+            },
+            .tags = tags,
+            .content = try g.string(),
+            .sig = undefined,
+        };
+        r.bytes(&ev.id);
+        r.bytes(&ev.pubkey);
+        r.bytes(&ev.sig);
+        return ev;
+    }
+
+    pub fn ws(g: Generator, out: *std.ArrayList(u8)) !void {
+        if (g.rand.uintLessThan(u8, 4) != 0) return;
+        for (0..g.rand.intRangeAtMost(usize, 1, 3)) |_| try out.append(g.arena, " \t\n\r"[g.rand.uintLessThan(usize, 4)]);
+    }
+
+    /// `s` as a JSON string, each code point spelled raw, with its short
+    /// escape, or as `\u` (a surrogate pair above the BMP), at random.
+    pub fn writeString(g: Generator, out: *std.ArrayList(u8), s: []const u8) !void {
+        const r = g.rand;
+        try out.append(g.arena, '"');
+        var it = std.unicode.Utf8View.initUnchecked(s).iterator();
+        while (it.nextCodepointSlice()) |slice| {
+            const cp = std.unicode.utf8Decode(slice) catch unreachable;
+            const must = cp < 0x20 or cp == '"' or cp == '\\';
+            const choice = r.uintLessThan(u8, 4);
+            if (choice == 0 or (must and choice == 1)) {
+                if (cp >= 0x10000) {
+                    const v = cp - 0x10000;
+                    try out.print(g.arena, "\\u{X:0>4}\\u{x:0>4}", .{ 0xD800 + (v >> 10), 0xDC00 + (v & 0x3ff) });
+                } else {
+                    try out.print(g.arena, "\\u{x:0>4}", .{cp});
+                }
+            } else if (must or (cp == '/' and choice == 1)) {
+                var esc: [6]u8 = undefined;
+                try out.appendSlice(g.arena, if (cp == '/') "\\/" else shortEscape(@intCast(cp), &esc));
+            } else {
+                try out.appendSlice(g.arena, slice);
+            }
+        }
+        try out.append(g.arena, '"');
+    }
+
+    pub fn writeHexString(g: Generator, out: *std.ArrayList(u8), bytes: []const u8) !void {
+        const digits = if (g.rand.uintLessThan(u8, 8) == 0) "0123456789ABCDEF" else "0123456789abcdef";
+        try out.append(g.arena, '"');
+        for (bytes) |b| try out.appendSlice(g.arena, &.{ digits[b >> 4], digits[b & 0xf] });
+        try out.append(g.arena, '"');
+    }
+
+    /// An event object with its fields in a random order, random whitespace,
+    /// sometimes an extra key, and numbers sometimes in a form only `std.json`
+    /// takes.
+    pub fn text(g: Generator, ev: Event) ![]u8 {
+        const r = g.rand;
+        var out: std.ArrayList(u8) = .empty;
+        var order = [_]u8{ 0, 1, 2, 3, 4, 5, 6, 7 };
+        r.shuffle(u8, &order);
+        const with_extra = r.uintLessThan(u8, 4) == 0;
+        try g.ws(&out);
+        try out.append(g.arena, '{');
+        var first = true;
+        for (order) |field| {
+            if (field == 7 and !with_extra) continue;
+            if (!first) try out.append(g.arena, ',');
+            first = false;
+            try g.ws(&out);
+            const name = switch (field) {
+                0 => "id",
+                1 => "pubkey",
+                2 => "created_at",
+                3 => "kind",
+                4 => "tags",
+                5 => "content",
+                6 => "sig",
+                else => "extra",
+            };
+            try g.writeString(&out, name);
+            try g.ws(&out);
+            try out.append(g.arena, ':');
+            try g.ws(&out);
+            switch (field) {
+                0 => try g.writeHexString(&out, &ev.id),
+                1 => try g.writeHexString(&out, &ev.pubkey),
+                2 => try g.writeNumber(&out, ev.created_at),
+                3 => try g.writeNumber(&out, ev.kind),
+                4 => {
+                    try out.append(g.arena, '[');
+                    for (ev.tags, 0..) |tag, ti| {
+                        if (ti != 0) try out.append(g.arena, ',');
+                        try g.ws(&out);
+                        try out.append(g.arena, '[');
+                        for (tag, 0..) |f, fi| {
+                            if (fi != 0) try out.append(g.arena, ',');
+                            try g.ws(&out);
+                            try g.writeString(&out, f);
+                            try g.ws(&out);
+                        }
+                        try out.append(g.arena, ']');
+                        try g.ws(&out);
+                    }
+                    try out.append(g.arena, ']');
+                },
+                5 => try g.writeString(&out, ev.content),
+                6 => try g.writeHexString(&out, &ev.sig),
+                else => try out.appendSlice(g.arena, switch (r.uintLessThan(u8, 6)) {
+                    0 => "null",
+                    1 => "[true,false,{\"a\":[1.5e-3,-0,0.25E+2]}]",
+                    2 => "{\"nested\":{\"deeper\":[[[]]]}}",
+                    3 => "\"\\u00e9\\ud83d\\ude00\"",
+                    4 => "-12.5e10",
+                    else => "{}",
+                }),
+            }
+            try g.ws(&out);
+        }
+        try out.append(g.arena, '}');
+        try g.ws(&out);
+        return out.items;
+    }
+
+    pub fn writeNumber(g: Generator, out: *std.ArrayList(u8), v: i64) !void {
+        switch (g.rand.uintLessThan(u8, 16)) {
+            0 => try out.print(g.arena, "{d}.0", .{v}),
+            1 => try out.print(g.arena, "\"{d}\"", .{v}),
+            2 => try out.print(g.arena, "{d}e0", .{v}),
+            3 => if (v == 0) try out.appendSlice(g.arena, "-0") else try out.print(g.arena, "{d}", .{v}),
+            else => try out.print(g.arena, "{d}", .{v}),
+        }
+    }
+
+    /// Breaks `text` the way a bad sender would: a byte changed, dropped,
+    /// duplicated, or a slice of the text repeated or cut off.
+    pub fn mutate(g: Generator, text_in: []u8) ![]u8 {
+        const touchy = "\"\\{}[],:0-9eu \x00\x80\xc3\xed\xf4";
+        const r = g.rand;
+        var out: std.ArrayList(u8) = .empty;
+        try out.appendSlice(g.arena, text_in);
+        for (0..r.intRangeAtMost(usize, 1, 3)) |_| {
+            if (out.items.len == 0) break;
+            const at = r.uintLessThan(usize, out.items.len);
+            switch (r.uintLessThan(u8, 6)) {
+                0 => out.items[at] = r.int(u8),
+                1 => out.items[at] = touchy[r.uintLessThan(usize, touchy.len)],
+                2 => _ = out.orderedRemove(at),
+                3 => try out.insert(g.arena, at, out.items[at]),
+                4 => out.items.len = at,
+                else => {
+                    const len = @min(out.items.len - at, r.uintLessThan(usize, 80));
+                    try out.insertSlice(g.arena, at, try g.arena.dupe(u8, out.items[at..][0..len]));
+                },
+            }
+        }
+        return out.items;
+    }
+};
+
+/// The escape `Generator.writeString` uses for a byte it has to escape: the
+/// short form where JSON has one, `\u00XX` otherwise.
+fn shortEscape(c: u8, buf: *[6]u8) []const u8 {
+    return switch (c) {
+        '"' => "\\\"",
+        '\\' => "\\\\",
+        '\n' => "\\n",
+        '\r' => "\\r",
+        '\t' => "\\t",
+        0x08 => "\\b",
+        0x0C => "\\f",
+        else => std.fmt.bufPrint(buf, "\\u{x:0>4}", .{c}) catch unreachable,
+    };
 }
