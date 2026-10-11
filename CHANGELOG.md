@@ -37,12 +37,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Store.OpenOptions.durability`: `.full` (the default, as before), `.no_meta_sync` or `.no_sync`, mapped to LMDB's `MDB_NOMETASYNC` and `MDB_NOSYNC`. The two lighter settings trade what survives a power loss for commits that do not wait for the disk, for a cache that can be rebuilt or a temporary store.
 - `Store.syncItems`: every matching event as a `(created_at, id)` pair in negentropy order, answered from index keys for filters of authors, kinds and time, with `SyncOptions.max_items` failing early with `error.TooManyItems`.
 - The bunker answers `nip04_encrypt` and `nip04_decrypt` under the same rules as the NIP-44 pair, and `nip46.Method` names them.
-- `zig build bench` reports the cost of `event.fromJson` and the NIP-13 hash rate.
+- `event.writeCanonical`, `event.canonicalLen`, `event.writeJson` and `event.jsonLen`: the canonical form and the wire JSON written to any `std.Io.Writer`, such as `Writer.fixed` over a caller's buffer, with the exact length up front.
+- `zig build bench` reports the cost of `event.fromJson`, parsing plus the id, the canonical form, `computeId`, `toJson` and `verify`, and the NIP-13 hash rate.
 
 ### Changed
 
 - `signer.serve` logs through `std.log` with the scope `.signer` instead of printing to stderr: each answered request at `info`, failures to answer or authenticate at `warn`. A program picks where the lines go with its own `std_options`.
 - `RelayMessage` has three new cases (`count`, `neg_msg`, `neg_err`), `nip46.Method` two (`nip04_encrypt`, `nip04_decrypt`) and `ConnectionError` one (`Broken`), so a program that switches over any of them exhaustively has cases to add.
+- `event.fromJson` reads an event with a single-pass scanner straight into the `Event`, decoding strings in place in its copy of the text, instead of building a `std.json` tree. Any text the scanner does not take is parsed by `std.json` as before, so what is accepted and every error are unchanged. The canonical serialization and `toJson` write through a `std.Io.Writer` into exactly sized memory, and `computeId` streams into SHA-256 without allocating. For a note with four tags (ReleaseFast, Apple M2 Pro): `fromJson` 1884 to 499 ns, parse plus id 3360 to 902 ns, `computeId` 1493 to 409 ns, `toJson` 1655 to 281 ns.
 - `zig build test` prints nothing when every test passes. The NIP-13 hash rate moved from the tests to `zig build bench`.
 
 ### Fixed
