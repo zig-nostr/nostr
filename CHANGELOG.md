@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-10-11
+
+### Breaking
+
+- `RelayMessage` gained `count`, `neg_msg` and `neg_err`, `nip46.Method` gained `nip04_encrypt` and `nip04_decrypt`, and `ConnectionError` gained `Broken`. A switch over any of them that has no `else` needs the new cases.
+- `Store.syncItems` and `nip77.Storage.fromStore` take a `SyncOptions` argument. Pass `.{}` for the previous behavior.
+- `signer.serve` logs through `std.log` with the scope `.signer` instead of printing to stderr. A program that showed those lines has to set `std_options` to see them.
+- `event.fromJson` copies its input, so a parsed event owns its strings and outlives the text it was read from.
+- Blossom `AuthOptions.servers` replaces `server` and takes a list, and a descriptor's `sha256` and `size` are optional because older servers omit them.
+
 ### Added
 
 - `nip04`: NIP-04 encryption and decryption for older direct messages (AES-256-CBC over the raw ECDH x coordinate). It has no MAC, so a successful decrypt proves nothing about who wrote the message.

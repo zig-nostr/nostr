@@ -32,7 +32,8 @@ covered by tests:
   implementation.
 - **Messaging**: NIP-59 gift wrap and NIP-17 private direct messages, and
   NIP-04 for reading and writing older ones. A remote signer answers NIP-04
-  and NIP-44 requests alike.
+  and NIP-44 requests alike, and logs through `std.log` with the scope
+  `.signer`.
 - **Sync**: NIP-77 negentropy, matching the reference implementation message
   for message, with storage built straight from the local store's indexes, and
   NIP-45 `COUNT`. The message codecs read every client frame too, so a
@@ -43,7 +44,7 @@ covered by tests:
 
 The library builds for macOS, Linux and Windows (x86_64 and aarch64 on each). CI builds and runs the tests on Linux, macOS and Windows. On Windows, hostnames resolve through std's resolver and both the wait for bytes before a read's deadline and the wait for room before a pong are a poll request to the AFD driver; the other platforms keep libc `getaddrinfo`, a timed peek and `poll`.
 
-The parsers that read bytes from outside (frames, relay messages, events, NIP-19, NIP-44, NIP-46, connection URIs, key files) have fuzz targets that run over a seed corpus in every `zig build test` and can be fuzzed for real. [`ARCHITECTURE.md`](ARCHITECTURE.md) says how the pieces fit.
+The parsers that read bytes from outside (frames, relay and client messages, negentropy messages, events, NIP-19, NIP-44, NIP-13, NIP-46, connection URIs, key files) have fuzz targets that run over a seed corpus in every `zig build test` and can be fuzzed for real. [`ARCHITECTURE.md`](ARCHITECTURE.md) says how the pieces fit.
 
 APIs may still change. There is no 1.0 date, and tagging one is deliberately not
 on the roadmap while groups, messages, media and payments are still landing.
