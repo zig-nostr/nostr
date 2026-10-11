@@ -32,7 +32,7 @@ const io = threaded.io();
 
 ## Keys, events, NIP-19, NIP-44
 
-Every snippet here was compiled and run against v0.14.9.
+Every snippet here was compiled and run against v0.15.0.
 
 ```zig
 const std = @import("std");
@@ -106,7 +106,9 @@ defer found.deinit(); // found.events is newest first
 // Send: one gift wrap per recipient, plus one to yourself.
 var dm = try nostr.nip59.privateDirectMessage(allocator, io, signer, me, &.{their_pubkey}, "hi", null, null);
 defer dm.deinit();
-for (dm.wraps) |w| { /* publish w to the inbox relays of the pubkey in its p tag */ }
+for (dm.wraps) |w| {
+    _ = w; // publish w to the inbox relays of the pubkey in its p tag
+}
 
 // Receive: a kind 1059 event addressed to you.
 var opened = try nostr.nip59.unwrap(allocator, signer, my_secret_key, wrap_event);
@@ -199,9 +201,15 @@ switch (msg.value) {
         const reply = try nostr.message.encodeOk(allocator, ev.id, ok, "");
         _ = reply;
     },
-    .req => |r| { /* store.query for each r.filters entry, encodeEventMsg per event, then encodeEose */ },
-    .count => |c| { /* encodeCountReply(allocator, c.subscription_id, n, null) */ },
-    .neg_open => |n| { /* Storage.fromStore, Responder.reconcile, encodeNegMsg */ },
+    .req => |r| {
+        _ = r; // store.query for each r.filters entry, encodeEventMsg per event, then encodeEose
+    },
+    .count => |c| {
+        _ = c; // encodeCountReply(allocator, c.subscription_id, n, null)
+    },
+    .neg_open => |n| {
+        _ = n; // Storage.fromStore, Responder.reconcile, encodeNegMsg
+    },
     else => {},
 }
 ```
