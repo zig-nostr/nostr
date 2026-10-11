@@ -41,6 +41,8 @@ pub const Error = error{
     InvalidMac,
     /// The randomness source failed while generating a nonce.
     RandomFailed,
+    /// The caller was cancelled while waiting for randomness.
+    Canceled,
     OutOfMemory,
 };
 
@@ -210,7 +212,10 @@ pub fn encrypt(
 ) Error![]u8 {
     const conversation_key = try conversationKey(signer, secret_key, peer_pubkey);
     var nonce: [32]u8 = undefined;
-    io.randomSecure(&nonce) catch return Error.RandomFailed;
+    io.randomSecure(&nonce) catch |err| switch (err) {
+        error.Canceled => |e| return e,
+        error.EntropyUnavailable => return Error.RandomFailed,
+    };
     return encryptWithConversationKey(gpa, conversation_key, plaintext, nonce);
 }
 
@@ -382,4 +387,26 @@ test "NIP-44 encrypt/decrypt round trip with a random nonce" {
         Error.InvalidMac,
         decrypt(testing.allocator, signer, eve.secret_key, alice.public_key, payload),
     );
+}
+
+fn encryptAfterCancel(io: std.Io, signer: keys.Signer, sk: keys.SecretKey, pk: keys.PublicKey) Error!void {
+    // Waits to be cancelled, then carries the cancel into the call.
+    io.sleep(.fromMilliseconds(60_000), .awake) catch |err| switch (err) {
+        error.Canceled => io.recancel(),
+    };
+    const payload = try encrypt(testing.allocator, io, signer, sk, pk, "hello");
+    testing.allocator.free(payload);
+}
+
+test "NIP-44 encrypt while cancelled reports the cancel" {
+    const io = testing.io;
+    var signer = keys.Signer.init();
+    defer signer.deinit();
+    const alice = try signer.keyPairFromSecretKey([_]u8{1} ** 32);
+    const bob = try signer.keyPairFromSecretKey([_]u8{2} ** 32);
+    var pending = try io.concurrent(encryptAfterCancel, .{ io, signer, alice.secret_key, bob.public_key });
+    // Where a cancel lands depends on the system: on Linux the read of
+    // randomness takes it, elsewhere randomness never blocks and the call
+    // completes. Either is fine. A cancel turned into another error is not.
+    pending.cancel(io) catch |err| try testing.expectEqual(error.Canceled, err);
 }

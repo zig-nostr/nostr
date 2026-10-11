@@ -281,7 +281,10 @@ pub fn Client(comptime Conn: type) type {
             const local = if (options.client_secret_key) |sk|
                 try signer.keyPairFromSecretKey(sk)
             else
-                signer.generateKeyPair(io) catch return Error.EntropyUnavailable;
+                signer.generateKeyPair(io) catch |err| switch (err) {
+                    error.Canceled => return error.Canceled,
+                    else => return Error.EntropyUnavailable,
+                };
 
             const self = try gpa.create(Self);
             self.* = .{
