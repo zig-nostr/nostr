@@ -8,9 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-10-11
+
 ### Breaking
 
-- `keys.Error`, `nip44.Error` and `nip04.Error` gained `Canceled` (and `nip59.Error` with them), and `websocket.generateKey` can now return `error.Canceled`. A switch over any of them that has no `else` needs the new case.
+- The error sets of `keys.Error`, `nip44.Error`, `nip04.Error`, `nip59.Error` and `nip46.Error` gained `Canceled`, and so did every function whose error set includes `keys.Error`: `event.create`, the signing helpers in `nip42`, `nip98` and `nip86`, the signing helpers in `blossom`, and `nip06` key derivation. `websocket.generateKey` now returns `error.Canceled` as well as `error.RandomFailed`. A switch over any of them that has no `else` needs the new case.
+- A cancel that lands while these wait for randomness now returns `error.Canceled` instead of a failure. That covers any dial (`relay.dial`, `relay.dialDiagnosed`, `relay.dialOver` and `relay.dialOverDiagnosed`, over `ws://` or `wss://`), any write on a `Connection` or `Relay` (publish, subscribe, close, count, the NIP-77 frames, and the pong sent inside receive), the TLS dial and the NIP-46 client (`nip46_client`). Code that matched `error.RandomFailed` or `error.EntropyUnavailable` to spot a cancelled call must match `error.Canceled` now.
 
 ### Fixed
 
