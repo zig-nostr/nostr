@@ -251,6 +251,7 @@ pub fn main() !void {
     });
     std.debug.print(
         \\  event.fromJson     : {d:.0} ns per event (best of {d} rounds of {d}; a note with 4 tags)
+        \\  parseRelayMessage  : {d:.0} ns per message (["EVENT", sub, <that note>])
         \\  fromJson + id      : {d:.0} ns per event (parse, then the canonical id)
         \\  canonical form     : {d:.0} ns per event (serializeCanonical, no hash)
         \\  event.computeId    : {d:.0} ns per event (canonical form and sha256)
@@ -261,6 +262,7 @@ pub fn main() !void {
         ev_costs.parse,
         parse_rounds,
         parse_reps,
+        ev_costs.relay_msg,
         ev_costs.parse_id,
         ev_costs.canonical,
         ev_costs.id,
@@ -279,7 +281,7 @@ const parse_reps: usize = 100_000;
 /// the general purpose allocator a client would, not the page allocator the
 /// store shapes above use, which would make every arena a fresh mapping. Each
 /// figure is the best of `parse_rounds` rounds, in nanoseconds per event.
-fn eventCosts(io: std.Io) !struct { parse: f64, parse_id: f64, canonical: f64, id: f64, to_json: f64, verify: f64 } {
+fn eventCosts(io: std.Io) !struct { parse: f64, relay_msg: f64, parse_id: f64, canonical: f64, id: f64, to_json: f64, verify: f64 } {
     const gpa = std.heap.smp_allocator;
     var signer = try nostr.keys.Signer.initRandomized(io);
     defer signer.deinit();
@@ -294,16 +296,24 @@ fn eventCosts(io: std.Io) !struct { parse: f64, parse_id: f64, canonical: f64, i
     const ev = try nostr.event.create(gpa, signer, kp, 1_700_000_000, 1, &tags, content, null);
     const text = try nostr.event.toJson(gpa, ev);
     defer gpa.free(text);
+    const envelope = try nostr.message.encodeEventMsg(gpa, "sub-1", ev);
+    defer gpa.free(envelope);
 
     const Ctx = struct {
         gpa: std.mem.Allocator,
         signer: nostr.keys.Signer,
         ev: Event,
         text: []const u8,
+        envelope: []const u8,
 
         fn parseOnly(c: @This()) !void {
             var parsed = try nostr.event.fromJson(c.gpa, c.text);
             std.mem.doNotOptimizeAway(parsed.value.content.ptr);
+            parsed.deinit();
+        }
+        fn relayMessage(c: @This()) !void {
+            var parsed = try nostr.message.parseRelayMessage(c.gpa, c.envelope);
+            std.mem.doNotOptimizeAway(&parsed.value);
             parsed.deinit();
         }
         fn parseId(c: @This()) !void {
@@ -333,9 +343,10 @@ fn eventCosts(io: std.Io) !struct { parse: f64, parse_id: f64, canonical: f64, i
             if (!try nostr.event.verify(c.gpa, c.signer, c.ev)) return error.Unexpected;
         }
     };
-    const ctx: Ctx = .{ .gpa = gpa, .signer = signer, .ev = ev, .text = text };
+    const ctx: Ctx = .{ .gpa = gpa, .signer = signer, .ev = ev, .text = text, .envelope = envelope };
     return .{
         .parse = try bestPerOp(io, ctx, Ctx.parseOnly, parse_reps),
+        .relay_msg = try bestPerOp(io, ctx, Ctx.relayMessage, parse_reps),
         .parse_id = try bestPerOp(io, ctx, Ctx.parseId, parse_reps),
         .canonical = try bestPerOp(io, ctx, Ctx.serialize, parse_reps),
         .id = try bestPerOp(io, ctx, Ctx.computeId, parse_reps),

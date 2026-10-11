@@ -38,18 +38,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Store.syncItems`: every matching event as a `(created_at, id)` pair in negentropy order, answered from index keys for filters of authors, kinds and time, with `SyncOptions.max_items` failing early with `error.TooManyItems`.
 - The bunker answers `nip04_encrypt` and `nip04_decrypt` under the same rules as the NIP-44 pair, and `nip46.Method` names them.
 - `event.writeCanonical`, `event.canonicalLen`, `event.writeJson` and `event.jsonLen`: the canonical form and the wire JSON written to any `std.Io.Writer`, such as `Writer.fixed` over a caller's buffer, with the exact length up front.
-- `zig build bench` reports the cost of `event.fromJson`, parsing plus the id, the canonical form, `computeId`, `toJson` and `verify`, and the NIP-13 hash rate.
+- `zig build bench` reports the cost of `event.fromJson`, `message.parseRelayMessage` on an `EVENT`, parsing plus the id, the canonical form, `computeId`, `toJson` and `verify`, and the NIP-13 hash rate.
 
 ### Changed
 
 - `signer.serve` logs through `std.log` with the scope `.signer` instead of printing to stderr: each answered request at `info`, failures to answer or authenticate at `warn`. A program picks where the lines go with its own `std_options`.
 - `RelayMessage` has three new cases (`count`, `neg_msg`, `neg_err`), `nip46.Method` two (`nip04_encrypt`, `nip04_decrypt`) and `ConnectionError` one (`Broken`), so a program that switches over any of them exhaustively has cases to add.
 - `event.fromJson` reads an event with a single-pass scanner straight into the `Event`, decoding strings in place in its copy of the text, instead of building a `std.json` tree. Any text the scanner does not take is parsed by `std.json` as before, so what is accepted and every error are unchanged. The canonical serialization and `toJson` write through a `std.Io.Writer` into exactly sized memory, and `computeId` streams into SHA-256 without allocating. For a note with four tags (ReleaseFast, Apple M2 Pro): `fromJson` 1884 to 499 ns, parse plus id 3360 to 902 ns, `computeId` 1493 to 409 ns, `toJson` 1655 to 281 ns.
+- `message.parseRelayMessage` reads every relay message in one pass, and `parseClientMessage` reads an `EVENT` or `AUTH` the same way, handing the event object to the scanner `event.fromJson` uses instead of building a `std.json` tree for the whole message. A message the scan does not take (an extra element, a key an event does not name, a number spelled `1e3`) goes through the tree as before, so what is accepted and every error are unchanged. An `EVENT` carrying a note with four tags (ReleaseFast, Apple M2 Pro): 2573 to 511 ns. Reading 50,000 such events from a local relay with `deed req --paginate`: 1.59 to 1.38 s of client CPU.
 - `zig build test` prints nothing when every test passes. The NIP-13 hash rate moved from the tests to `zig build bench`.
 
 ### Fixed
 
 - `event.fromJson` left every tag and content string without an escape pointing into the caller's text, although its doc said the event owned them, so freeing the text and then verifying or serializing the event read freed memory. The text is now copied into the event's arena once, which costs about 2% of a parse (1806 to 1846 ns for a note with four tags, ReleaseFast) against 13% for copying each string.
+- A relay or client `EVENT` whose `created_at` was 2^63 written as a float (`9223372036854775808.0`) crashed the parser in a safe build: `std.json` checks the float against `maxInt(i64)` converted to a float, which rounds up to 2^63, and then fails the conversion. It is now refused as out of range.
 
 ## [0.14.9] - 2026-10-04
 

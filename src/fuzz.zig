@@ -70,6 +70,7 @@ const hex = @import("hex.zig");
 const json = @import("json.zig");
 const keys = @import("keys.zig");
 const message = @import("message.zig");
+const message_reference = @import("message_reference.zig");
 const nip13 = @import("nip13.zig");
 const nip19 = @import("nip19.zig");
 const nip44 = @import("nip44.zig");
@@ -345,6 +346,48 @@ fn fuzzEnvelope(_: void, smith: *testing.Smith) anyerror!void {
         .event => |e| try expectEventRoundTrips(e.event),
         else => {},
     }
+}
+
+test "fuzz: relay and client messages against std.json" {
+    try testing.fuzz({}, fuzzMessageScanner, .{ .corpus = &.{
+        seed(&.{ .{ .int = 0 }, .{ .slice = "[\"EVENT\",\"sub\"," ++ sample_event ++ "]" } }),
+        seed(&.{ .{ .int = 1 }, .{ .slice = "\"sub\"," ++ sample_event } }),
+        seed(&.{ .{ .int = 1 }, .{ .slice = "\"s\",{\"x\":{\"a\":1,\"a\":2},\"id\":\"" ++ zeros32 ++ "\"}" } }),
+        seed(&.{ .{ .int = 1 }, .{ .slice = "\"s\",{\"id\":\"" ++ zeros32 ++ "\",\"pubkey\":\"" ++ zeros32 ++ "\",\"created_at\":9223372036854775808.0,\"kind\":1,\"tags\":[],\"content\":\"\",\"sig\":\"" ++ zeros64 ++ "\"}" } }),
+        seed(&.{ .{ .int = 2 }, .{ .slice = sample_event } }),
+        seed(&.{ .{ .int = 3 }, .{ .slice = "\"" ++ zeros32 ++ "\",true,\"saved\"" } }),
+        seed(&.{ .{ .int = 4 }, .{ .slice = "\"sub\",{\"count\":3,\"approximate\":false,\"hll\":\"00\"}" } }),
+        seed(&.{ .{ .int = 5 }, .{ .slice = "\"sub\",\"00ff\"" } }),
+        seed(&.{ .{ .int = 6 }, .{ .slice = "\"sub\"" } }),
+    } });
+}
+
+/// `parseRelayMessage` and `parseClientMessage` read an `EVENT` in one pass and
+/// hand what they do not take to a `std.json` tree. Whatever they return has
+/// to be what the tree alone gives (`message_reference.zig` keeps it), down to
+/// the error, or the scan has quietly changed which messages exist. The body
+/// goes raw or inside an envelope, so the effort lands past the brackets.
+fn fuzzMessageScanner(_: void, smith: *testing.Smith) anyerror!void {
+    @disableInstrumentation();
+    const prefix = switch (smith.value(enum(u3) { raw, event, client_event, ok, count, neg_msg, eose, auth })) {
+        .raw => "",
+        .event => "[\"EVENT\",",
+        .client_event => "[\"EVENT\",",
+        .ok => "[\"OK\",",
+        .count => "[\"COUNT\",",
+        .neg_msg => "[\"NEG-MSG\",",
+        .eose => "[\"EOSE\",",
+        .auth => "[\"AUTH\",",
+    };
+    var body: [2048]u8 = undefined;
+    const n = smith.slice(&body);
+    var text: [2100]u8 = undefined;
+    const built = if (prefix.len == 0)
+        body[0..n]
+    else
+        std.fmt.bufPrint(&text, "{s}{s}]", .{ prefix, body[0..n] }) catch return;
+    try message_reference.expectSameRelayMessage(built);
+    try message_reference.expectSameClientMessage(built);
 }
 
 // -- What a client says -------------------------------------------------------
