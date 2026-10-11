@@ -1,16 +1,16 @@
 ---
 name: zig-nostr
-description: Build nostr software in Zig with zig-nostr's `nostr` library. Use when a Zig project needs nostr keys and BIP-340 signatures, NIP-01 events (create, sign, verify, serialize), NIP-19 codes, NIP-44 encryption, NIP-50 search filters, NIP-46 remote signing, relay connections (dial, subscribe, publish, read with a deadline), the NIP-65 outbox model, or a local-first LMDB event store with fast queries. Also use when adding the library to build.zig.zon, or when porting Zig nostr code to Zig 0.16's std.Io.
+description: Build nostr software in Zig with zig-nostr's `nostr` library. Use when a Zig project needs nostr keys and BIP-340 signatures, NIP-01 events (create, sign, verify, serialize), NIP-19 codes, NIP-44 encryption, NIP-50 search filters, NIP-46 remote signing as a signer or as a client, NIP-17 private messages and NIP-59 gift wrap, NIP-04, NIP-13 proof of work, NIP-77 negentropy sync, NIP-45 COUNT, NIP-05/NIP-11/NIP-98/NIP-86/Blossom HTTP codecs, writing a relay, relay connections (dial, subscribe, publish, read with a deadline), the NIP-65 outbox model, or a local-first LMDB event store with fast queries. Also use when adding the library to build.zig.zon, or when porting Zig nostr code to Zig 0.16's std.Io.
 ---
 
 # zig-nostr: the nostr library for Zig
 
-`nostr` is a nostr protocol library for Zig 0.16: keys and BIP-340 Schnorr signatures (libsecp256k1, full official test vectors), NIP-01 events, NIP-19, NIP-44, NIP-46 as client and server, NIP-42, NIP-49, NIP-06, relay transport with deadlines, NIP-65, and a memory-mapped LMDB event store. libsecp256k1 and LMDB are compiled from source, so no system packages are needed. It builds for macOS, Linux and Windows. Pre-1.0: APIs can still change between minor versions.
+`nostr` is a nostr protocol library for Zig 0.16: keys and BIP-340 Schnorr signatures (libsecp256k1, full official test vectors), NIP-01 events, NIP-19, NIP-44, NIP-46 as client and server, NIP-42, NIP-49, NIP-06, NIP-59 and NIP-17 private messages, NIP-04, NIP-13, NIP-77 negentropy, NIP-45, relay transport with deadlines, NIP-65, codecs for NIP-05, NIP-11, NIP-98, NIP-86 and Blossom, and a memory-mapped LMDB event store. libsecp256k1 and LMDB are compiled from source, so no system packages are needed. It builds for macOS, Linux and Windows. Pre-1.0: APIs can still change between minor versions.
 
 ## Add it
 
 ```sh
-zig fetch --save https://github.com/zig-nostr/nostr/archive/refs/tags/v0.14.9.tar.gz
+zig fetch --save https://github.com/zig-nostr/nostr/archive/refs/tags/v0.15.0.tar.gz
 ```
 
 Check https://github.com/zig-nostr/nostr/releases for the latest tag. In `build.zig`:
@@ -32,7 +32,7 @@ const io = threaded.io();
 
 ## Keys, events, NIP-19, NIP-44
 
-Every snippet here was compiled and run against v0.14.9.
+Every snippet here was compiled and run against v0.15.0.
 
 ```zig
 const std = @import("std");
@@ -99,6 +99,122 @@ defer found.deinit(); // found.events is newest first
 ```
 
 `ingest` handles replaceable and parameterized-replaceable events, NIP-09 deletions and ephemeral kinds. For many events at once, `ingestBatch` does the same in one transaction, which matters because every commit syncs to disk. Queries walk indexes newest-first and stop at `limit`, so a 500-note feed query takes about 0.28 ms at 100,000 stored events. `Store.query` applies `Filter.search` as a substring of the content, ignoring ASCII case; no index serves it, so name the kinds you mean. On Windows a store takes its full map size on disk (1 GiB by default) from the first open.
+
+## Private messages (NIP-17, NIP-59)
+
+```zig
+// Send: one gift wrap per recipient, plus one to yourself.
+var dm = try nostr.nip59.privateDirectMessage(allocator, io, signer, me, &.{their_pubkey}, "hi", null, null);
+defer dm.deinit();
+for (dm.wraps) |w| {
+    _ = w; // publish w to the inbox relays of the pubkey in its p tag
+}
+
+// Receive: a kind 1059 event addressed to you.
+var opened = try nostr.nip59.unwrap(allocator, signer, my_secret_key, wrap_event);
+defer opened.deinit();
+// opened.rumor.content, opened.rumor.kind, opened.sender
+```
+
+`unwrap` checks the wrap, the seal and that the rumor's author is the seal's signer, and returns an error otherwise. `nip59.seal` and `nip59.wrap` are the single layers if you build a rumor yourself with `nip59.Rumor.init`. `nostr.nip04.encrypt` and `decrypt` take the same arguments as the `nip44` functions of those names for the legacy kind 4 messages; NIP-04 has no authentication, so a successful decrypt proves nothing about the sender.
+
+## Remote signer client (NIP-46)
+
+```zig
+const Client = nostr.nip46_client.Client(*nostr.relay.Relay);
+const client = try Client.initBunker(allocator, io, signer, "bunker://...", .{});
+defer client.deinit();
+// For each relay in the token: dial it, then client.attach(relay) and
+// run client.run(relay, url) in its own task (io.concurrent): one reader per relay.
+try client.connect();
+const user = try client.getPublicKey();
+var signed = try client.signEvent(.{ .kind = 1, .content = "hello", .created_at = now });
+defer signed.deinit(); // the signature and author are already checked
+```
+
+For a `nostrconnect://` flow use `initNostrConnect(allocator, io, signer, relays, options)`, show the user `client.nostrConnectUri(allocator, .{ .name = "my app" })`, then `client.awaitNostrConnect()`. Every request has a deadline (`Options.timeout_ms`) and ends with `error.Canceled` if its task is cancelled.
+
+## Negentropy sync (NIP-77)
+
+```zig
+var mine = try nostr.nip77.Storage.fromSlice(allocator, items); // items: []const nostr.nip77.Item, each .{ .created_at, .id }
+defer mine.deinit(allocator);
+var neg = try nostr.nip77.Initiator.init(&mine, .{});
+const first = try neg.initiate(allocator);              // bytes
+const hex = try nostr.nip77.toHex(allocator, first);     // the NEG-OPEN payload
+// send NEG-OPEN, read the relay's NEG-MSG hex, nostr.nip77.fromHex it, then:
+var r = try neg.reconcile(allocator, reply_bytes);
+defer r.deinit(allocator);
+// r.have: ids you hold and the relay lacks, r.need: the reverse, r.message: next round or null
+```
+
+`Storage.fromStore` builds the item set straight from a `Store` for a filter. Set `Options.frame_size_limit` on a side that talks to untrusted peers. On a connection, `Relay.negOpen`, `negMsg` and `negClose` send the envelopes, and the relay's replies arrive as `.neg_msg` and `.neg_err` relay messages. `Relay.count(sub_id, filters)` sends a NIP-45 COUNT and the answer arrives as `.count`.
+
+## Proof of work (NIP-13)
+
+```zig
+var mined = try nostr.nip13.mine(allocator, io, .{ .pubkey = me.public_key, .created_at = now, .kind = 1, .content = "hello" }, .{ .target = 20, .threads = 4, .timeout_ms = 30_000 });
+defer mined.deinit();
+mined.event.sig = try signer.signId(mined.event.id, me, null); // mine returns the event unsigned
+```
+
+`nip13.difficulty(id)` counts leading zero bits and `committedTarget(ev)` reads the target an event claims. Check both when you require a difficulty from others, because a nonce tag alone proves nothing.
+
+## HTTP codecs
+
+None of these make a request. You fetch, they parse or build.
+
+```zig
+// NIP-05
+const id = try nostr.nip05.parseIdentifier("bob@example.com");
+const url = try nostr.nip05.wellKnownUrl(allocator, &id);
+var who = try nostr.nip05.parseResponse(allocator, body, id.name()); // who.pubkey, who.relays
+defer who.deinit();
+
+// NIP-11: GET httpUrl(relay_url) with nip11.accept_header_name/value
+var info = try nostr.nip11.parse(allocator, body); // info.name, info.supported_nips, info.limitation
+defer info.deinit();
+
+// NIP-98: sign a request, or check one on a server
+const header = try nostr.nip98.authHeader(allocator, signer, me, now, url, "POST", body, null);
+const author = try nostr.nip98.verifyHeader(allocator, signer, header_value, .{ .url = url, .method = "POST", .body = body, .now = now });
+
+// Blossom: a kind 24242 token, and the descriptor a server answers with
+const token = try nostr.blossom.buildAuthHeader(allocator, signer, me, now, .{ .action = .upload, .expiration = now + 300, .hashes = &.{blob_sha256} }, null);
+var desc = try nostr.blossom.parseDescriptor(allocator, body); // desc.value.url, .sha256, .size
+defer desc.deinit();
+```
+
+`nip86` is the relay management API: `encodeRequest(allocator, .{ .banpubkey = .{ .value = pubkey_hex } })` writes the JSON body, `authHeader(allocator, signer, me, now, url, body, null)` signs it with NIP-98, and `parseResponse(allocator, body)` reads `result` and `err`.
+
+## Writing a relay
+
+The library has no listener, but the pieces a relay is made of are here. Parse what a client sends, verify, store and answer:
+
+```zig
+var msg = try nostr.message.parseClientMessage(allocator, text);
+defer msg.deinit();
+switch (msg.value) {
+    .event => |ev| {
+        const ok = try nostr.event.verify(allocator, signer, ev);
+        // store.ingest(...), then:
+        const reply = try nostr.message.encodeOk(allocator, ev.id, ok, "");
+        _ = reply;
+    },
+    .req => |r| {
+        _ = r; // store.query for each r.filters entry, encodeEventMsg per event, then encodeEose
+    },
+    .count => |c| {
+        _ = c; // encodeCountReply(allocator, c.subscription_id, n, null)
+    },
+    .neg_open => |n| {
+        _ = n; // Storage.fromStore, Responder.reconcile, encodeNegMsg
+    },
+    else => {},
+}
+```
+
+Set a frame size limit on the negentropy `Responder` when serving the public. `Store.remove(gpa, id)` and `removeMatching(gpa, filter)` delete events.
 
 ## Traps
 

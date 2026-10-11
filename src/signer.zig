@@ -15,8 +15,14 @@
 //! scripted fake stream, so the whole request→response cycle is proven
 //! hermetically. Relay dialing, fan-out across relays, and reconnection are the
 //! caller's job; this is the pure protocol loop over one connection.
+//!
+//! Every request answered is logged at `info` through `std.log` with the scope
+//! `.signer` (outcome, method, client), and problems with the relay at `warn`.
+//! A program chooses where those lines go, or silences them, with its own
+//! `std_options`.
 
 const std = @import("std");
+const log = std.log.scoped(.signer);
 
 const keys = @import("keys.zig");
 const nip46 = @import("nip46.zig");
@@ -84,16 +90,16 @@ pub fn serve(
             .event => |e| {
                 if (!worthAnswering(io, seen, e.event)) continue;
                 handleRequest(gpa, io, conn, bunker, remote, e.event) catch |err| {
-                    std.debug.print("signer: dropped a request: {s}\n", .{@errorName(err)});
+                    log.warn("dropped a request: {s}", .{@errorName(err)});
                 };
             },
             .eose => {},
             .auth => |a| {
                 if (authenticate(gpa, io, conn, bunker.signer, remote, relay_url, a.challenge)) |id| {
                     auth_event_id = id;
-                    std.debug.print("signer: [{s}] answering NIP-42 auth challenge\n", .{relay_url});
+                    log.info("[{s}] answering NIP-42 auth challenge", .{relay_url});
                 } else |err| {
-                    std.debug.print("signer: [{s}] NIP-42 auth failed: {s}\n", .{ relay_url, @errorName(err) });
+                    log.warn("[{s}] NIP-42 auth failed: {s}", .{ relay_url, @errorName(err) });
                 }
             },
             .closed => |c| {
@@ -101,9 +107,9 @@ pub fn serve(
                 // subscription behind NIP-42. We re-subscribe once the auth event
                 // is accepted (below), so note it and keep the connection open.
                 if (std.mem.startsWith(u8, c.message, "auth-required")) {
-                    std.debug.print("signer: [{s}] auth required for the subscription\n", .{relay_url});
+                    log.info("[{s}] auth required for the subscription", .{relay_url});
                 } else {
-                    std.debug.print("signer: relay closed the subscription: {s}\n", .{c.message});
+                    log.info("relay closed the subscription: {s}", .{c.message});
                     return;
                 }
             },
@@ -116,16 +122,17 @@ pub fn serve(
                     if (std.mem.eql(u8, &o.event_id, &aid)) {
                         if (o.accepted) {
                             conn.subscribe(subscription_id, &filters) catch |err| {
-                                std.debug.print("signer: [{s}] re-subscribe after auth failed: {s}\n", .{ relay_url, @errorName(err) });
+                                log.warn("[{s}] re-subscribe after auth failed: {s}", .{ relay_url, @errorName(err) });
                             };
                         } else {
-                            std.debug.print("signer: [{s}] relay rejected NIP-42 auth: {s}\n", .{ relay_url, o.message });
+                            log.warn("[{s}] relay rejected NIP-42 auth: {s}", .{ relay_url, o.message });
                         }
                         auth_event_id = null; // one attempt per challenge
                     }
                 }
             },
-            .notice => |n| std.debug.print("signer: relay notice: {s}\n", .{n.message}),
+            .notice => |n| log.info("relay notice: {s}", .{n.message}),
+            .count, .neg_msg, .neg_err => {},
         }
     }
 }
@@ -278,7 +285,7 @@ fn handleRequest(
         m.name()
     else
         "<unsupported>";
-    std.debug.print("signer: {s} '{s}' from {s}…\n", .{ outcome, method_label, client_hex[0..16] });
+    log.info("{s} '{s}' from {s}…", .{ outcome, method_label, client_hex[0..16] });
 
     const response_json = try response.value.toJson(gpa);
     defer gpa.free(response_json);

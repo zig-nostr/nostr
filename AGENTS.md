@@ -25,7 +25,15 @@ src/
   websocket.zig  # RFC 6455 framing, hand-written
   store.zig      # the local-first LMDB event store
   liveness.zig   # when a relay connection has gone quiet
-  ...            # one file per NIP, plus filter/message/json/hex/bech32
+  message.zig    # client and relay messages, both directions (COUNT, NEG-*)
+  nip46_client.zig # the app side of NIP-46 remote signing
+  nip59.zig      # gift wrap and NIP-17 private messages
+  nip77.zig      # negentropy set reconciliation
+  nip13.zig      # proof of work, with a multi-threaded miner
+  nip04.zig      # legacy encrypted direct messages
+  nip05.zig, nip11.zig, nip98.zig, nip86.zig, blossom.zig
+                 # HTTP codecs: build and parse bytes, no HTTP client
+  ...            # one file per NIP, plus filter/json/hex/bech32
 build.zig        # build graph: module + test step
 build.zig.zon    # package manifest, dependencies
 .zigversion      # pinned Zig compiler version
@@ -40,6 +48,7 @@ Only declarations re-exported from `root.zig` are part of the public API.
 ```sh
 zig build         # build the library module
 zig build test    # run the unit test suite
+zig build test -Dtest-filter=nip13  # run only tests whose name contains the text
 zig fmt --check .  # verify formatting (CI enforces this)
 zig build test --fuzz -Doptimize=ReleaseSafe  # fuzz the parsers until stopped
 ```

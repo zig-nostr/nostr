@@ -22,12 +22,15 @@ Keys and encodings
 - `bip39.zig`, `nip06.zig`: mnemonics, and key derivation from one.
 - `nip49.zig`: `ncryptsec` private key encryption (scrypt and XChaCha20-Poly1305).
 - `nip44.zig`: NIP-44 v2 authenticated encryption.
+- `nip04.zig`: the legacy NIP-04 direct message cipher (AES-256-CBC, no MAC). It exists to read and write what older clients send. A successful decrypt does not prove who wrote the message.
+- `nip13.zig`: proof of work. `difficulty` and `committedTarget` read an id and a nonce tag, and `mine` searches for a nonce on several threads, hashing from a SHA-256 midstate of the part of the event that does not change.
+- `nip59.zig`: gift wrap and NIP-17 messages. `seal`, `wrap` and `unwrap` build and open the three layers (rumor, kind 13 seal, kind 1059 wrap), and `privateDirectMessage` builds a chat message with one wrap per recipient and one for the sender.
 
 Events and messages
 
 - `event.zig`: the NIP-01 event, canonical serialization, id, signing, verification, and JSON in and out.
 - `filter.zig`: subscription filters, their JSON, and local matching. `Filter.search` (NIP-50) is sent to the relay and ignored by `matches`, because only a relay knows what its search matches.
-- `message.zig`: the messages a client sends and the ones a relay sends back.
+- `message.zig`: the messages a client sends and the ones a relay sends back, including NIP-45 `COUNT` and the NIP-77 `NEG-OPEN`, `NEG-MSG`, `NEG-CLOSE` and `NEG-ERR` envelopes. It goes both ways: `parseRelayMessage` and the `encode*` client functions are the client's side, `parseClientMessage` and the relay-side encoders (`encodeEventMsg`, `encodeOk`, `encodeEose`, `encodeClosed`, `encodeNotice`, `encodeAuthChallenge`, `encodeCountReply`, `encodeNegErr`) are what a program writing a relay needs.
 - `json.zig`: the string escaper the encoders share.
 - `nip42.zig`: the client's authentication event for a relay that asks.
 
@@ -38,30 +41,48 @@ Transport
 - `liveness.zig`: the policy for when a quiet connection should be pinged or given up on. Pure functions over two measurements.
 - `nip65.zig`: relay lists, and the read and write routing of the outbox model.
 
-Storage
+Storage and sync
 
-- `store.zig`: the LMDB event store: record format, indexes, replaceable and deleted events, and the filter-driven query planner.
+- `store.zig`: the LMDB event store: record format, indexes, replaceable and deleted events, and the filter-driven query planner. `Store.syncItems` lists the `(created_at, id)` pairs a filter matches, oldest first, which is the input negentropy wants. `Store.remove` and `removeMatching` delete events by id or by filter.
+- `nip77.zig`: Negentropy v1 set reconciliation. It works on message bytes and holds no connection. `Storage` is the sorted item set, built with `fromSlice` or read from a `Store` with `fromStore`, and `Initiator` and `Responder` are the two roles. It follows the hoytech reference message for message, and `toHex` and `fromHex` convert to the form carried in `NEG-OPEN` and `NEG-MSG`.
+
+HTTP codecs
+
+These modules build and parse the bytes of an HTTP exchange and do no I/O. The caller owns the request, the response and the clock. The library has no HTTP client, so there is nothing here to configure.
+
+- `nip05.zig`: parses `name@domain`, builds the `.well-known/nostr.json` URL, and reads the response for one name.
+- `nip11.zig`: builds the relay information URL and `Accept` header, and parses the document into `Info`.
+- `nip98.zig`: builds the kind 27235 event and its `Authorization` header for a request, and on the server side `verify` and `verifyHeader` check one against a URL, method, body and the verifier's clock.
+- `nip86.zig`: the relay management API. `encodeRequest` writes a JSON-RPC body, `authHeader` signs it with NIP-98, and `parseResponse` reads the answer.
+- `blossom.zig`: the kind 24242 authorization event and header for a Blossom server, and `parseDescriptor` for the blob descriptor it answers with. It reuses `nip98`'s header encoding.
 
 Remote signing
 
 - `nip46.zig`: requests, responses, the kind 24133 envelope, `bunker://` and `nostrconnect://` URIs, and `Bunker`, which answers requests under an approval `Policy`.
 - `signer.zig`: the loop that serves those requests over a relay connection.
+- `nip46_client.zig`: the other end: a `Client` that asks a remote signer to sign and encrypt. It starts from a `bunker://` token (`initBunker`) or invites a signer with a `nostrconnect://` token (`initNostrConnect`). It is generic over the connection type, like `Connection`.
 - `keystore.zig`: the `ncryptsec` key file at rest.
 - `signer_ipc.zig`: the bodies a key-holding daemon and its clients exchange over a local socket.
 
-Not part of the library: `bench.zig` (store benchmark) and `fuzz.zig` (fuzz targets, test only).
+Not part of the library: `bench.zig` (store benchmark, the per-event costs of parsing, serializing, hashing and verifying, and the NIP-13 hash rate), `event_reference.zig` and `message_reference.zig` (the `std.json` event and message code the scanner replaced, kept frozen for differential tests, test only) and `fuzz.zig` (fuzz targets, test only).
 
 ## How data flows
 
 Outbound, a program makes a `keys.Signer`, loads or generates a key pair, and calls `event.create`, which serializes the fields canonically, hashes them to the id and signs the id. `message.encodeEvent` and `message.encodeReq` turn events and filters into JSON text, `Connection` wraps each text in a masked WebSocket frame, and `IoStream` writes the frame to the socket, through TLS for `wss://`.
 
-Inbound, bytes come off the socket into `Connection`'s receive buffer. `websocket.decodeFrame` takes whole frames from the front, answers pings, drops pongs, and reassembles fragments into one message. `message.parseRelayMessage` parses that text into an `EVENT`, `OK`, `EOSE`, `CLOSED`, `NOTICE` or `AUTH`, using `event.fromValueLeaky` for the event. Text that does not parse is counted in `unreadable` and skipped, so one bad message costs that message only.
+Inbound, bytes come off the socket into `Connection`'s receive buffer. `websocket.decodeFrame` takes whole frames from the front, answers pings, drops pongs, and reassembles fragments into one message. `message.parseRelayMessage` parses that text into an `EVENT`, `OK`, `EOSE`, `CLOSED`, `NOTICE` or `AUTH` in one pass, reading the event with the same scanner as `event.fromJson` (`scan.zig`); a message the scanner does not take goes through a `std.json` tree and `event.fromValueLeaky`, with the same result. Text that does not parse is counted in `unreadable` and skipped, so one bad message costs that message only.
 
 Parsing does not verify. A caller decides where to verify, and `Store.ingest` can do it (`IngestOptions.verify_with`) before an event is stored. Ingest also applies the replaceable and deletion rules. Reads go the other way: `Store.query` takes the same `Filter` that was sent to the relay, picks the most selective index, walks it newest first and stops at `limit`, so a read costs the size of the page and not the size of the store. A `search` on the filter is the one constraint the store applies that `Filter.matches` does not: a substring of the content, ignoring ASCII case, with no index behind it.
 
 Which relays to ask comes from `nip65`: parse a user's kind 10002 event, then `readRoutes` or `writeRoutes` group many users by relay, so one subscription per relay covers everyone routed there.
 
-Remote signing sits beside this path. `signer.serve` subscribes for kind 24133 events addressed to the signer, `nip46.open` decrypts each one with NIP-44, `Bunker.handle` answers it under the policy, and `nip46.seal` encrypts and signs the reply, which goes back out through the same connection.
+A program that writes a relay uses the same pieces from the other side. `message.parseClientMessage` turns what a client sent into a `ClientMessage` (an `EVENT`, `REQ`, `CLOSE`, `AUTH`, `COUNT` or one of the `NEG-` messages) with limits on filter count and subscription id length, `event.verify` checks the signature, `Store.ingest` and `Store.query` do the storing and answering, and the relay-side encoders write the replies. The library has no listener or server loop. Accepting sockets, the server side of the WebSocket handshake and writing unmasked frames stay with the program; `websocket.acceptKey` and `decodeFrame` help with two of those steps.
+
+Negentropy sits on the store. `nip77.Storage.fromStore` reads the items a filter matches through `Store.syncItems`, which for a filter of only `since` and `until` walks the time index and decodes no event. An `Initiator` produces the first message, `message.encodeNegOpen` and `Relay.negOpen` put it on the wire, `NEG-MSG` replies come back as `.neg_msg` relay messages, and `reconcile` returns the ids this side has (`have`) and lacks (`need`). The `Responder` is the relay's half. Fetching the missing events and sending the ones the other side lacks is ordinary `REQ` and `EVENT` traffic. A COUNT goes the same way: `Relay.count` sends it and the answer arrives as a `.count` message.
+
+Remote signing sits beside this path. `signer.serve` subscribes for kind 24133 events addressed to the signer, `nip46.open` decrypts each one with NIP-44, `Bunker.handle` answers it under the policy, and `nip46.seal` encrypts and signs the reply, which goes back out through the same connection. On the client side, `nip46_client.Client` does the reverse: each request is a kind 24133 event published to every attached relay, one reader task per relay runs `run`, and a request waits on its own slot for the first reply with its id. A reply is dropped if its author is not the signer, and a signed event is checked before `signEvent` returns it.
+
+Private messages are a pipeline of the same primitives: `nip59.privateDirectMessage` builds the rumor, then calls `seal` (NIP-44, signed by the author) and `wrap` (NIP-44, signed by a one-time key), and `unwrap` on the receiving end checks the wrap, the seal and that the rumor's author is the seal's signer.
 
 Parsed values that own memory (events from `fromJson`, relay messages, query results, URIs) carry their own arena and a `deinit`. One `deinit` frees everything the value borrows from.
 
@@ -79,6 +100,8 @@ Giving up is `Relay.shutdown`, which half-closes the socket so a blocked `receiv
 
 A reader that wants to come up for air without being torn down uses `receiveTimeout`. The `std.Io.Timeout` is turned into an absolute deadline once, and the wait is a readiness check that reads nothing, so when it returns `error.Timeout` the socket, the buffers and any TLS record state are exactly as they were and the call can be repeated. `Timeout` is a different value from `null`, which means the relay is gone. When a deadline is set, a pong is skipped if another write holds the lock or the socket has no room, so a peer that stopped reading cannot wedge the connection. A reader started with `io.concurrent` can also be cancelled, in the wait or between waits: the read fails with `error.ReadFailed` and the reader should return rather than ask again.
 
+A write can be bounded the same way from the inside. `publishTimeout` runs the write as a task of its own with `io.concurrent`, waits for it until the deadline and cancels it after. Given up while it was still waiting for the lock, it sent nothing. Given up once it had started, the relay may hold part of a frame, so the connection is marked broken and every later write fails with `error.Broken`.
+
 `dial` has no deadline of its own. To bound it, start it with `io.concurrent` and cancel it: a cancelled dial stops where it is and frees what it allocated. The name lookup is the one step a cancel cannot cut short: on POSIX it is a libc call, and on Windows std waits for the OS query to finish before it reports the cancel.
 
 Shared signer state is small and locked. `SeenRequests` (replay defence) and the authorized-clients record are shared across the reader threads of every relay a signer serves, behind short spin locks.
@@ -95,16 +118,18 @@ macOS, Linux and Windows. On POSIX the dialer resolves names with `getaddrinfo` 
 2. `src/event.zig` and `src/keys.zig`, the smallest complete path: make an event, sign it, verify it.
 3. `src/message.zig` and `src/filter.zig`, then `src/relay.zig`: `Connection` first, then `IoStream`, `dial` and `Relay`.
 4. `src/store.zig`: the doc comment at the top, then `ingestBatch` and `query`.
-5. `src/nip46.zig`, then `src/signer.zig`, if you are interested in signing.
+5. `src/nip46.zig`, then `src/signer.zig` and `src/nip46_client.zig`, if you are interested in signing.
+6. `src/nip77.zig`, the top comment first, for set sync. `src/nip59.zig` for private messages.
 
 ## How it is tested
 
-`zig build test` runs everything. Tests sit beside the code in `test` blocks, and `root.zig` pulls every file in.
+`zig build test` runs everything. Tests sit beside the code in `test` blocks, and `root.zig` pulls every file in. `zig build test -Dtest-filter=nip13` runs only the tests whose name contains the text, which is the quick loop while working on one module.
 
 - Official vectors for the cryptography: the BIP-340 suite in `keys.zig`, the NIP-44 v2 vectors in `src/data/nip44_vectors.json`, and the NIP-19, NIP-49 and RFC 6455 worked examples.
 - A scripted server for the transport. `Connection` is generic over its stream, so most relay tests drive it with an in-memory fake that plays a relay: handshake, fragments, pings, closes, auth. A few use a real socket on loopback to check the parts a fake cannot, such as a deadline on a quiet socket and cancelling a dial. A dial against a public relay is not part of the suite.
+- Transcripts from the reference for negentropy. `nip77.zig` replays recordings made with the JavaScript implementation and compares the messages byte for byte.
 - A real LMDB file in a temporary directory for the store. `zig build bench` measures ingest and query latency.
-- Fuzz targets in `src/fuzz.zig` for everything that parses bytes someone else wrote: WebSocket frames and handshake responses, relay messages, events, bech32 and NIP-19, NIP-44 payloads, NIP-46 messages and URIs, relay lists and URLs, mnemonics, `ncryptsec` files, filters. Each asserts that nothing crashes or leaks and, where one exists, an invariant: an event parsed, serialized and parsed again is the same event, a decoded frame lies inside its buffer, a bunker URI survives being rebuilt from its parts. Some build the outer layer themselves (a valid relay envelope, a valid bech32 checksum) so the fuzzed bytes reach the code behind it.
+- Fuzz targets in `src/fuzz.zig` for everything that parses bytes someone else wrote: WebSocket frames and handshake responses, relay and client messages, negentropy messages, events, bech32 and NIP-19, NIP-44 payloads, NIP-13 proof of work tags, NIP-46 messages and URIs, relay lists and URLs, mnemonics, `ncryptsec` files, filters. Each asserts that nothing crashes or leaks and, where one exists, an invariant: an event parsed, serialized and parsed again is the same event, the event and message scanners and `std.json` accept the same texts with the same results and errors, a decoded frame lies inside its buffer, a bunker URI survives being rebuilt from its parts. Some build the outer layer themselves (a valid relay envelope, a valid bech32 checksum) so the fuzzed bytes reach the code behind it.
 
   In a plain `zig build test` each target runs once per entry of its seed corpus and once on empty input. `zig build test --fuzz -Doptimize=ReleaseSafe` fuzzes them until stopped. With Zig 0.16.0 the Debug build of the test runner does not compile in fuzz mode, and ReleaseSafe keeps the integer and bounds checks the fuzzer needs. A corpus entry has to be written in the encoding the fuzzer's `Smith` reads, which the `seed` helper in `fuzz.zig` does. A crash the fuzzer finds gets a regression test next to the code it was in, and the input goes in the corpus.
 - `zig fmt --check .` for formatting. CI runs build, test and the format check on Linux and macOS, and build and test on Windows.

@@ -204,6 +204,10 @@ pub fn main() !void {
     };
     const by_id_best = try bestQuery(gpa, io, &store, by_id);
 
+    const ev_costs = try eventCosts(io);
+    const pow_1 = try powRate(io, 1);
+    const pow_4 = try powRate(io, 4);
+
     std.debug.print(
         \\zig-nostr store benchmark
         \\  events ingested    : {d}
@@ -214,6 +218,7 @@ pub fn main() !void {
         \\  same feed by id    : {d} notes in {d:.1} us (best of {d}; {d} ids named, {d} entries examined)
         \\  warm timeline query: {d} events in {d:.1} us (best of {d}; 1 author, any kind)
         \\  warm profile query : {d} event in {d:.1} us (best of {d}; 1 author, kind 0, {d} entries examined)
+        \\  nip13.mine         : {d} hashes/s on 1 thread, {d} hashes/s on 4
         \\
     , .{
         n,
@@ -241,7 +246,129 @@ pub fn main() !void {
         @as(f64, @floatFromInt(profile_best.ns)) / 1e3,
         query_reps,
         profile_best.examined,
+        pow_1,
+        pow_4,
     });
+    std.debug.print(
+        \\  event.fromJson     : {d:.0} ns per event (best of {d} rounds of {d}; a note with 4 tags)
+        \\  parseRelayMessage  : {d:.0} ns per message (["EVENT", sub, <that note>])
+        \\  fromJson + id      : {d:.0} ns per event (parse, then the canonical id)
+        \\  canonical form     : {d:.0} ns per event (serializeCanonical, no hash)
+        \\  event.computeId    : {d:.0} ns per event (canonical form and sha256)
+        \\  event.toJson       : {d:.0} ns per event
+        \\  event.verify       : {d:.0} ns per event (id and signature)
+        \\
+    , .{
+        ev_costs.parse,
+        parse_rounds,
+        parse_reps,
+        ev_costs.relay_msg,
+        ev_costs.parse_id,
+        ev_costs.canonical,
+        ev_costs.id,
+        ev_costs.to_json,
+        ev_costs.verify,
+    });
+}
+
+const parse_rounds: usize = 5;
+const parse_reps: usize = 100_000;
+
+/// Times the per-event costs on one realistic note: a reply with `e`, `p` and
+/// `t` tags and a paragraph of content carrying an escape. Parsing is the cost
+/// every event pays on its way in from a relay message held by a caller, and
+/// the canonical form is what every id check and every signature hashes. Uses
+/// the general purpose allocator a client would, not the page allocator the
+/// store shapes above use, which would make every arena a fresh mapping. Each
+/// figure is the best of `parse_rounds` rounds, in nanoseconds per event.
+fn eventCosts(io: std.Io) !struct { parse: f64, relay_msg: f64, parse_id: f64, canonical: f64, id: f64, to_json: f64, verify: f64 } {
+    const gpa = std.heap.smp_allocator;
+    var signer = try nostr.keys.Signer.initRandomized(io);
+    defer signer.deinit();
+    const kp = try signer.generateKeyPair(io);
+    const tags = [_]nostr.event.Tag{
+        &[_][]const u8{ "e", "5c83da77af1dec6d7289834998ad7aafbd9e2191396d75ec3cc27f5a77226f36", "wss://relay.example.com", "root" },
+        &[_][]const u8{ "e", "d0a1d13aff1d1725d80305f74a3f8419674d726342773b06ddc6988cc5be3a40", "wss://relay.example.com", "reply" },
+        &[_][]const u8{ "p", "f7234bd4c1394dda46d09f35bd384dd30cc552ad5541990f98844fb06676e9ca" },
+        &[_][]const u8{ "t", "zig" },
+    };
+    const content = "A reply long enough to look like one. It quotes \"something\" and runs on for a sentence or two more, about the length of a typical note on the network today.";
+    const ev = try nostr.event.create(gpa, signer, kp, 1_700_000_000, 1, &tags, content, null);
+    const text = try nostr.event.toJson(gpa, ev);
+    defer gpa.free(text);
+    const envelope = try nostr.message.encodeEventMsg(gpa, "sub-1", ev);
+    defer gpa.free(envelope);
+
+    const Ctx = struct {
+        gpa: std.mem.Allocator,
+        signer: nostr.keys.Signer,
+        ev: Event,
+        text: []const u8,
+        envelope: []const u8,
+
+        fn parseOnly(c: @This()) !void {
+            var parsed = try nostr.event.fromJson(c.gpa, c.text);
+            std.mem.doNotOptimizeAway(parsed.value.content.ptr);
+            parsed.deinit();
+        }
+        fn relayMessage(c: @This()) !void {
+            var parsed = try nostr.message.parseRelayMessage(c.gpa, c.envelope);
+            std.mem.doNotOptimizeAway(&parsed.value);
+            parsed.deinit();
+        }
+        fn parseId(c: @This()) !void {
+            var parsed = try nostr.event.fromJson(c.gpa, c.text);
+            defer parsed.deinit();
+            const v = parsed.value;
+            const id = try nostr.event.computeId(c.gpa, v.pubkey, v.created_at, v.kind, v.tags, v.content);
+            if (!std.mem.eql(u8, &id, &v.id)) return error.Unexpected;
+        }
+        fn serialize(c: @This()) !void {
+            const v = c.ev;
+            const bytes = try nostr.event.serializeCanonical(c.gpa, v.pubkey, v.created_at, v.kind, v.tags, v.content);
+            std.mem.doNotOptimizeAway(bytes.ptr);
+            c.gpa.free(bytes);
+        }
+        fn computeId(c: @This()) !void {
+            const v = c.ev;
+            const out = try nostr.event.computeId(c.gpa, v.pubkey, v.created_at, v.kind, v.tags, v.content);
+            std.mem.doNotOptimizeAway(&out);
+        }
+        fn writeJson(c: @This()) !void {
+            const bytes = try nostr.event.toJson(c.gpa, c.ev);
+            std.mem.doNotOptimizeAway(bytes.ptr);
+            c.gpa.free(bytes);
+        }
+        fn check(c: @This()) !void {
+            if (!try nostr.event.verify(c.gpa, c.signer, c.ev)) return error.Unexpected;
+        }
+    };
+    const ctx: Ctx = .{ .gpa = gpa, .signer = signer, .ev = ev, .text = text, .envelope = envelope };
+    return .{
+        .parse = try bestPerOp(io, ctx, Ctx.parseOnly, parse_reps),
+        .relay_msg = try bestPerOp(io, ctx, Ctx.relayMessage, parse_reps),
+        .parse_id = try bestPerOp(io, ctx, Ctx.parseId, parse_reps),
+        .canonical = try bestPerOp(io, ctx, Ctx.serialize, parse_reps),
+        .id = try bestPerOp(io, ctx, Ctx.computeId, parse_reps),
+        .to_json = try bestPerOp(io, ctx, Ctx.writeJson, parse_reps),
+        .verify = try bestPerOp(io, ctx, Ctx.check, verify_reps),
+    };
+}
+
+/// A signature check is tens of microseconds, so it gets fewer repetitions.
+const verify_reps: usize = 5_000;
+
+/// Runs `f` `reps` times per round, `parse_rounds` rounds, and returns the
+/// best round in nanoseconds per call.
+fn bestPerOp(io: std.Io, ctx: anytype, comptime f: fn (@TypeOf(ctx)) anyerror!void, reps: usize) !f64 {
+    var best: u64 = std.math.maxInt(u64);
+    for (0..parse_rounds) |_| {
+        const start = std.Io.Timestamp.now(io, .awake);
+        for (0..reps) |_| try f(ctx);
+        const dt: u64 = @intCast(std.Io.Timestamp.now(io, .awake).nanoseconds - start.nanoseconds);
+        best = @min(best, dt);
+    }
+    return @as(f64, @floatFromInt(best)) / @as(f64, @floatFromInt(reps));
 }
 
 /// Runs `f` once to warm the mmap/page cache, then `query_reps` times,
@@ -273,4 +400,22 @@ fn bestQuery(
         if (dt < best_ns) best_ns = dt;
     }
     return .{ .ns = best_ns, .notes = notes, .examined = examined };
+}
+
+/// NIP-13 hash rate: mines for half a second at a target nobody reaches and
+/// counts the attempts.
+fn powRate(io: std.Io, threads: u32) !u64 {
+    var count: std.atomic.Value(u64) = .init(0);
+    const t0 = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+    if (nostr.nip13.mine(std.heap.smp_allocator, io, .{
+        .pubkey = @splat(3),
+        .created_at = 1,
+        .kind = 1,
+        .content = "bench",
+    }, .{ .target = 200, .threads = threads, .timeout_ms = 500, .attempts = &count })) |mined| {
+        _ = mined;
+        return error.Unexpected;
+    } else |err| if (err != error.Timeout) return err;
+    const ms: u64 = @intCast(@max(1, std.Io.Timestamp.now(io, .awake).toMilliseconds() - t0));
+    return count.load(.monotonic) * 1000 / ms;
 }

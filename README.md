@@ -16,7 +16,7 @@ it like [Notary](https://github.com/zig-nostr/notary), a remote signer that keep
 your key off every client. Full docs, benchmarks, and the ecosystem overview
 live at [zignostr.com](https://zignostr.com).
 
-> **Status: early (`v0.14.9`).** The library core, transport, local-first store
+> **Status: early (`v0.15.0`).** The library core, transport, local-first store
 > and signer protocol have shipped and are covered by tests. Two native apps run
 > on it today. APIs may still change before 1.0.
 
@@ -40,6 +40,22 @@ live at [zignostr.com](https://zignostr.com).
   so a key can sign for any client without ever entering it.
 - **🔐 Portable keys**: NIP-06 mnemonic derivation and NIP-49 (`ncryptsec`)
   encrypted key storage, NFKC-normalized for cross-app interop.
+- **✉️ Private messages**: NIP-59 gift wrap and NIP-17 direct messages, with
+  NIP-04 for the older clients that still send it. An unwrap refuses a message
+  whose author is not the one who sealed it.
+- **🔁 Set sync**: NIP-77 negentropy, matching the hoytech reference message for
+  message, with a storage that reads its items straight from the local store.
+- **🖧 Writing a relay**: `message.parseClientMessage` and the relay-side
+  encoders (`OK`, `EOSE`, `CLOSED`, `NOTICE`, `AUTH`, NIP-45 `COUNT`, NIP-77
+  `NEG-MSG`), plus the NIP-86 management API and NIP-98 verification, so a relay
+  can be built on the same codecs a client uses.
+- **🔌 Remote signer client**: the app side of NIP-46, for `bunker://` and
+  `nostrconnect://`, with one reader task per relay.
+- **⛏️ Proof of work**: NIP-13 with a multi-threaded miner that hashes from a
+  SHA-256 midstate.
+- **🌐 HTTP codecs**: NIP-05 identifiers, NIP-11 relay information, NIP-98 HTTP
+  auth and Blossom auth tokens. No HTTP happens inside the library: you fetch,
+  these parse and build.
 
 ## How it is built
 
@@ -95,7 +111,7 @@ For work from a shell rather than in Zig, [deed](https://github.com/zig-nostr/de
 Add the library to your `build.zig.zon`:
 
 ```sh
-zig fetch --save https://github.com/zig-nostr/nostr/archive/refs/tags/v0.14.9.tar.gz
+zig fetch --save https://github.com/zig-nostr/nostr/archive/refs/tags/v0.15.0.tar.gz
 ```
 
 Wire the module in `build.zig`:
@@ -147,34 +163,47 @@ pub fn main() !void {
 }
 ```
 
-The `nostr` module re-exports focused namespaces: `keys`, `event`,
-`nip19`/`bech32`, `nip06`/`bip39`, `nip49`, `nip44`, `nip46`, `nip42`,
-`relay`/`websocket`/`message`/`filter`, `nip65`, `liveness`, and `store`. See the
-[getting-started guide](https://zignostr.com/getting-started) for more.
+The `nostr` module re-exports focused namespaces:
+
+- Keys and encodings: `keys`, `hex`, `bech32`, `nip19`, `bip39`, `nip06`, `nip49`.
+- Events and encryption: `event`, `filter`, `nip44`, `nip04`, `nip59`, `nip13`.
+- Wire protocol and transport: `message`, `websocket`, `relay`, `liveness`, `nip42`, `nip65`.
+- Storage and sync: `store`, `nip77`.
+- Remote signing: `nip46`, `nip46_client`, `signer`, `keystore`, `signer_ipc`.
+- HTTP codecs, with no transport: `nip05`, `nip11`, `nip98`, `nip86`, `blossom`.
+
+See the [getting-started guide](https://zignostr.com/getting-started) for more.
 
 ## NIP support
 
-Every "done" NIP is covered by tests; the cryptographic ones are verified
-against their official specification vectors.
+The last column says how much of each NIP is in the library, since several are codecs that leave the network to you. Everything listed is covered by tests; the cryptographic ones are verified against their official specification vectors, and negentropy is checked against transcripts recorded from the reference implementation.
 
-| NIP | Title | Status |
+| NIP | Title | What the library has |
 |----|----|----|
-| [01](https://github.com/nostr-protocol/nips/blob/master/01.md) | Basic protocol: events, signatures, subscriptions | ✅ |
-| [06](https://github.com/nostr-protocol/nips/blob/master/06.md) | Key derivation from mnemonic seed | ✅ |
-| [09](https://github.com/nostr-protocol/nips/blob/master/09.md) | Event deletion (ingestion) | ✅ |
-| [19](https://github.com/nostr-protocol/nips/blob/master/19.md) | bech32-encoded entities | ✅ |
-| [21](https://github.com/nostr-protocol/nips/blob/master/21.md) | `nostr:` URI scheme | ✅ |
-| [42](https://github.com/nostr-protocol/nips/blob/master/42.md) | Client-to-relay authentication | ✅ |
-| [44](https://github.com/nostr-protocol/nips/blob/master/44.md) | Encrypted payloads (v2) | ✅ |
-| [46](https://github.com/nostr-protocol/nips/blob/master/46.md) | Nostr Connect, remote signing | ✅ |
-| [49](https://github.com/nostr-protocol/nips/blob/master/49.md) | Private key encryption (`ncryptsec`) | ✅ |
-| [50](https://github.com/nostr-protocol/nips/blob/master/50.md) | Search: the `search` filter field (relays do the matching) | ✅ |
-| [65](https://github.com/nostr-protocol/nips/blob/master/65.md) | Relay list metadata (outbox) | ✅ |
-| [17](https://github.com/nostr-protocol/nips/blob/master/17.md) | Private direct messages | 🚧 planned |
-| [59](https://github.com/nostr-protocol/nips/blob/master/59.md) | Gift wrap | 🚧 planned |
+| [01](https://github.com/nostr-protocol/nips/blob/master/01.md) | Basic protocol: events, signatures, subscriptions | Events, filters, and every client and relay message |
+| [04](https://github.com/nostr-protocol/nips/blob/master/04.md) | Encrypted direct messages (legacy) | `nip04`: encrypt and decrypt, kept for interoperability with older clients |
+| [05](https://github.com/nostr-protocol/nips/blob/master/05.md) | DNS-based identifiers | `nip05`: identifier parsing, the well-known URL and the response parser. You do the HTTP fetch |
+| [06](https://github.com/nostr-protocol/nips/blob/master/06.md) | Key derivation from mnemonic seed | Derivation from a BIP-39 mnemonic |
+| [09](https://github.com/nostr-protocol/nips/blob/master/09.md) | Event deletion | The store applies deletions on ingest |
+| [11](https://github.com/nostr-protocol/nips/blob/master/11.md) | Relay information document | `nip11`: the URL, the `Accept` header and the parser. You do the HTTP fetch |
+| [13](https://github.com/nostr-protocol/nips/blob/master/13.md) | Proof of work | `nip13`: difficulty, the committed target, and a multi-threaded miner |
+| [17](https://github.com/nostr-protocol/nips/blob/master/17.md) | Private direct messages | `nip59.privateDirectMessage` builds the kind 14 rumor and its wraps; `unwrap` reads them |
+| [19](https://github.com/nostr-protocol/nips/blob/master/19.md) | bech32-encoded entities | Encode and decode every entity |
+| [21](https://github.com/nostr-protocol/nips/blob/master/21.md) | `nostr:` URI scheme | Parse and strip, in `nip19` |
+| [42](https://github.com/nostr-protocol/nips/blob/master/42.md) | Client-to-relay authentication | The client's auth event |
+| [44](https://github.com/nostr-protocol/nips/blob/master/44.md) | Encrypted payloads (v2) | Encrypt and decrypt, against the official vectors |
+| [45](https://github.com/nostr-protocol/nips/blob/master/45.md) | Event counts | `COUNT` request and reply in `message`, both directions; `Relay.count` sends one |
+| [46](https://github.com/nostr-protocol/nips/blob/master/46.md) | Nostr Connect, remote signing | Signer side (`nip46`, `signer`) and client side (`nip46_client`) |
+| [49](https://github.com/nostr-protocol/nips/blob/master/49.md) | Private key encryption (`ncryptsec`) | Encrypt and decrypt, scrypt and XChaCha20-Poly1305 |
+| [50](https://github.com/nostr-protocol/nips/blob/master/50.md) | Search | The `search` filter field. Relays do the matching; the store matches a substring of the content |
+| [59](https://github.com/nostr-protocol/nips/blob/master/59.md) | Gift wrap | `nip59`: rumor, seal, wrap and unwrap |
+| [65](https://github.com/nostr-protocol/nips/blob/master/65.md) | Relay list metadata (outbox) | Parsing and read/write routing |
+| [77](https://github.com/nostr-protocol/nips/blob/master/77.md) | Negentropy syncing | `nip77`: Negentropy v1, both roles, plus the `NEG-*` messages in `message`; `Relay.negOpen`, `negMsg` and `negClose` send them |
+| [86](https://github.com/nostr-protocol/nips/blob/master/86.md) | Relay management API | `nip86`: request encoder, response parser and the NIP-98 header. You do the HTTP |
+| [98](https://github.com/nostr-protocol/nips/blob/master/98.md) | HTTP auth | `nip98`: build and verify. You own the request and the clock |
 | [10](https://github.com/nostr-protocol/nips/blob/master/10.md) | Reply threading | client-side |
 
-NIP-17 and NIP-59 arrive together, in Plaza's private-messages milestone.
+Blossom (BUD-01, BUD-02, BUD-11) is in the library too, in `blossom`: the kind 24242 authorization token and the blob descriptor a server returns. No upload or download code is included.
 
 NIP-10 is marked differently on purpose. There is no `nip10` module here, because
 threading is a decision about how to read `e` tags rather than a format to encode:
@@ -196,7 +225,7 @@ one core:
   fast, local-first client where you read without an account, post in four
   clicks, and the feed renders from disk. Downloadable for the same two.
 
-Private messages, zaps and groups land inside Plaza.
+Zaps and groups land inside Plaza.
 A messenger you have to switch to is one you stop using.
 
 ## Roadmap
@@ -209,17 +238,10 @@ The library foundation has shipped: keys, transport, the local-first store and t
 
 Around those: Notary packaged for Windows, so the library, deed and Notary are each tested on Windows, macOS and Linux; `deed mcp`, which puts deed's verbs behind the Model Context Protocol so an agent can read relays, query the local store and verify events, with signing only through a NIP-46 signer that asks first; and Plaza 1.0.
 
-In spec terms, the library still owes NIP-17 private direct messages, with the
-NIP-59 gift wrap that carries them.
-Most of what remains is app work on protocol the library already exports:
-Blossom uploads so a picture can be posted, NIP-57 zaps that can be sent rather
-than only verified, NIP-51 bookmarks, and NIP-29 groups. Reactions,
-notifications and the NIP-51 mute list are in Plaza already, and a repost can
-be sent, though one written by somebody you follow does not yet reach your
-feed. The [NIP support page](https://zignostr.com/nips) maps each one to the
+Most of what remains is app work on protocol the library already exports: the HTTP transfer for Blossom uploads so a picture can be posted, NIP-57 zaps that can be sent rather than only verified, NIP-51 bookmarks, and NIP-29 groups. Reactions, notifications and the NIP-51 mute list are in Plaza already, and a repost can be sent, though one written by somebody you follow does not yet reach your feed. The [NIP support page](https://zignostr.com/nips) maps each one to the
 milestone that lands it.
 
-The [roadmap](https://zignostr.com/roadmap) has the full list, and it also names what is deliberately not being built (set-reconciliation sync, NIP-77, is on that list).
+The [roadmap](https://zignostr.com/roadmap) has the full list, and it also names what is deliberately not being built.
 
 See [`CURRENT_STATE.md`](CURRENT_STATE.md) for exactly what's in progress, the
 [roadmap](https://zignostr.com/roadmap) for the rest, and the
@@ -230,6 +252,7 @@ See [`CURRENT_STATE.md`](CURRENT_STATE.md) for exactly what's in progress, the
 ```sh
 zig build          # build the library
 zig build test     # run the test suite
+zig build test -Dtest-filter=nip13  # run only tests whose name contains the text
 zig fmt --check .  # verify formatting
 ```
 

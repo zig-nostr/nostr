@@ -8,6 +8,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-10-11
+
+### Breaking
+
+- `RelayMessage` gained `count`, `neg_msg` and `neg_err`, `nip46.Method` gained `nip04_encrypt` and `nip04_decrypt`, and `ConnectionError` gained `Broken`. A switch over any of them that has no `else` needs the new cases.
+- `Store.syncItems` and `nip77.Storage.fromStore` take a `SyncOptions` argument. Pass `.{}` for the previous behavior.
+- `signer.serve` logs through `std.log` with the scope `.signer` instead of printing to stderr. A program that showed those lines has to set `std_options` to see them.
+- `event.fromJson` copies its input, so a parsed event owns its strings and outlives the text it was read from.
+- Blossom `AuthOptions.servers` replaces `server` and takes a list, and a descriptor's `sha256` and `size` are optional because older servers omit them.
+
+### Added
+
+- `nip04`: NIP-04 encryption and decryption for older direct messages (AES-256-CBC over the raw ECDH x coordinate). It has no MAC, so a successful decrypt proves nothing about who wrote the message.
+- `nip05`: NIP-05 identifiers: parsing and normalizing `name@domain`, the `.well-known/nostr.json` URL, and reading the response for a name's pubkey and relays. No HTTP.
+- `nip11`: NIP-11 relay information documents: the HTTP URL for a relay URL and a parser that skips fields of the wrong type instead of losing the document. No HTTP.
+- `nip13`: NIP-13 proof of work: `difficulty`, `committedTarget`, and `mine`, which hashes a SHA-256 midstate of everything before the nonce once and then only the bytes after it, on as many threads as asked, with a deadline and a cancel flag.
+- `nip46_client`: the app side of NIP-46, for `bunker://` and `nostrconnect://`, with one reader per relay, a deadline on every request, `auth_url` reported to a handler while the request waits, and every signed event checked against the user key and the template before it is returned.
+- `nip59`: NIP-59 gift wrap and NIP-17 private direct messages: rumors, seals and wraps, `unwrap` that checks every layer, and `privateDirectMessage` with a wrap per recipient and one to the sender.
+- `nip77`: NIP-77 negentropy, protocol version 1, matching the reference implementation message for message. Both sides default to a frame size limit that keeps every message under what the envelope parser reads, and `Storage.fromStore` builds a set from the store with an optional cap.
+- `nip86`: NIP-86 relay management requests and responses, with the NIP-98 header over the request body. No HTTP.
+- `nip98`: NIP-98 HTTP authentication: the event, the `Authorization` header, decoding one, and checking one on the server side.
+- `blossom`: Blossom authorization tokens (`kind:24242`) and blob descriptors (BUD-01, 02, 06, 11). A token that would authorize more than it names (an upload, delete or media token with no hash, a server that is not a bare lowercase domain, an expiration at or before its creation) is refused before it is signed. The header is standard base64, which is what servers accept, rather than the URL-safe form BUD-11 names.
+- `message`: NIP-45 `COUNT` and the NIP-77 `NEG-OPEN`, `NEG-MSG` and `NEG-CLOSE` frames, `COUNT`, `NEG-MSG` and `NEG-ERR` from relays, and `parseClientMessage` with the relay-side encoders, so a program can play the relay. A client `REQ` or `COUNT` needs at least one filter, and a `limit` above `u32` is read as the largest `u32`.
+- `Connection.publishTimeout` and `Relay.publishTimeout`: a publish that gives up at a deadline when the relay has stopped reading. The write runs as a task of its own and is cancelled at the deadline. If it had started, the connection is marked broken and every later write fails with the new `ConnectionError.Broken`.
+- `count`, `negOpen`, `negMsg` and `negClose` on `Connection` and `Relay`, through the same locked write as `subscribe`.
+- `Store.remove(id)` and `Store.removeMatching(filter)`: take events out of the store with their index entries, in one write transaction. Neither records a tombstone.
+- `Store.OpenOptions.durability`: `.full` (the default, as before), `.no_meta_sync` or `.no_sync`, mapped to LMDB's `MDB_NOMETASYNC` and `MDB_NOSYNC`. The two lighter settings trade what survives a power loss for commits that do not wait for the disk, for a cache that can be rebuilt or a temporary store.
+- `Store.syncItems`: every matching event as a `(created_at, id)` pair in negentropy order, answered from index keys for filters of authors, kinds and time, with `SyncOptions.max_items` failing early with `error.TooManyItems`.
+- The bunker answers `nip04_encrypt` and `nip04_decrypt` under the same rules as the NIP-44 pair, and `nip46.Method` names them.
+- `event.writeCanonical`, `event.canonicalLen`, `event.writeJson` and `event.jsonLen`: the canonical form and the wire JSON written to any `std.Io.Writer`, such as `Writer.fixed` over a caller's buffer, with the exact length up front.
+- `zig build bench` reports the cost of `event.fromJson`, `message.parseRelayMessage` on an `EVENT`, parsing plus the id, the canonical form, `computeId`, `toJson` and `verify`, and the NIP-13 hash rate.
+
+### Changed
+
+- `signer.serve` logs through `std.log` with the scope `.signer` instead of printing to stderr: each answered request at `info`, failures to answer or authenticate at `warn`. A program picks where the lines go with its own `std_options`.
+- `RelayMessage` has three new cases (`count`, `neg_msg`, `neg_err`), `nip46.Method` two (`nip04_encrypt`, `nip04_decrypt`) and `ConnectionError` one (`Broken`), so a program that switches over any of them exhaustively has cases to add.
+- `event.fromJson` reads an event with a single-pass scanner straight into the `Event`, decoding strings in place in its copy of the text, instead of building a `std.json` tree. Any text the scanner does not take is parsed by `std.json` as before, so what is accepted and every error are unchanged. The canonical serialization and `toJson` write through a `std.Io.Writer` into exactly sized memory, and `computeId` streams into SHA-256 without allocating. For a note with four tags (ReleaseFast, Apple M2 Pro): `fromJson` 1884 to 499 ns, parse plus id 3360 to 902 ns, `computeId` 1493 to 409 ns, `toJson` 1655 to 281 ns.
+- `message.parseRelayMessage` reads every relay message in one pass, and `parseClientMessage` reads an `EVENT` or `AUTH` the same way, handing the event object to the scanner `event.fromJson` uses instead of building a `std.json` tree for the whole message. A message the scan does not take (an extra element, a key an event does not name, a number spelled `1e3`) goes through the tree as before, so what is accepted and every error are unchanged. An `EVENT` carrying a note with four tags (ReleaseFast, Apple M2 Pro): 2573 to 511 ns. Reading 50,000 such events from a local relay with `deed req --paginate`: 1.59 to 1.38 s of client CPU.
+- `zig build test` prints nothing when every test passes. The NIP-13 hash rate moved from the tests to `zig build bench`.
+
+### Fixed
+
+- `event.fromJson` left every tag and content string without an escape pointing into the caller's text, although its doc said the event owned them, so freeing the text and then verifying or serializing the event read freed memory. The text is now copied into the event's arena once, which costs about 2% of a parse (1806 to 1846 ns for a note with four tags, ReleaseFast) against 13% for copying each string.
+- A relay or client `EVENT` whose `created_at` was 2^63 written as a float (`9223372036854775808.0`) crashed the parser in a safe build: `std.json` checks the float against `maxInt(i64)` converted to a float, which rounds up to 2^63, and then fails the conversion. It is now refused as out of range.
+
 ## [0.14.9] - 2026-10-04
 
 ### Fixed

@@ -28,7 +28,7 @@ jobs:
         run: zig build
 
       - name: Test
-        run: zig build test
+        run: zig build test --test-timeout 120s --summary all
 
       - name: Check formatting
         run: zig fmt --check .

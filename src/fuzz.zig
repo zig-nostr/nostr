@@ -64,16 +64,20 @@ const testing = std.testing;
 const bech32 = @import("bech32.zig");
 const bip39 = @import("bip39.zig");
 const event = @import("event.zig");
+const event_reference = @import("event_reference.zig");
 const filter = @import("filter.zig");
 const hex = @import("hex.zig");
 const json = @import("json.zig");
 const keys = @import("keys.zig");
 const message = @import("message.zig");
+const message_reference = @import("message_reference.zig");
+const nip13 = @import("nip13.zig");
 const nip19 = @import("nip19.zig");
 const nip44 = @import("nip44.zig");
 const nip46 = @import("nip46.zig");
 const nip49 = @import("nip49.zig");
 const nip65 = @import("nip65.zig");
+const nip77 = @import("nip77.zig");
 const relay = @import("relay.zig");
 const signer_ipc = @import("signer_ipc.zig");
 const websocket = @import("websocket.zig");
@@ -273,6 +277,10 @@ test "fuzz: a relay message" {
         one("[\"CLOSED\",\"sub\",\"auth-required: pay up\"]"),
         one("[\"NOTICE\",\"hello\"]"),
         one("[\"AUTH\",\"challenge\"]"),
+        one("[\"COUNT\",\"sub\",{\"count\":12,\"approximate\":true,\"hll\":\"00\"}]"),
+        one("[\"COUNT\",\"sub\",{\"count\":18446744073709551615}]"),
+        one("[\"NEG-MSG\",\"sub\",\"6100000a\"]"),
+        one("[\"NEG-ERR\",\"sub\",\"blocked: too big\"]"),
         one("[\"EVENT\",\"sub\",{\"kind\":70000}]"),
         one("[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[["),
     } });
@@ -302,6 +310,9 @@ test "fuzz: a relay message with a plausible envelope" {
         seed(&.{ .{ .int = 3 }, .{ .slice = "\"sub\",\"closed\"" } }),
         seed(&.{ .{ .int = 4 }, .{ .slice = "\"hello\"" } }),
         seed(&.{ .{ .int = 5 }, .{ .slice = "\"challenge\"" } }),
+        seed(&.{ .{ .int = 6 }, .{ .slice = "\"sub\",{\"count\":3,\"approximate\":false}" } }),
+        seed(&.{ .{ .int = 7 }, .{ .slice = "\"sub\",\"00ff\"" } }),
+        seed(&.{ .{ .int = 8 }, .{ .slice = "\"sub\",\"closed\"" } }),
     } });
 }
 
@@ -313,13 +324,16 @@ test "fuzz: a relay message with a plausible envelope" {
 /// the generator's effort lands on the fields rather than on the brackets.
 fn fuzzEnvelope(_: void, smith: *testing.Smith) anyerror!void {
     @disableInstrumentation();
-    const verb = switch (smith.value(enum(u3) { event, ok, eose, closed, notice, auth })) {
+    const verb = switch (smith.value(enum(u4) { event, ok, eose, closed, notice, auth, count, neg_msg, neg_err })) {
         .event => "EVENT",
         .ok => "OK",
         .eose => "EOSE",
         .closed => "CLOSED",
         .notice => "NOTICE",
         .auth => "AUTH",
+        .count => "COUNT",
+        .neg_msg => "NEG-MSG",
+        .neg_err => "NEG-ERR",
     };
     var body: [1024]u8 = undefined;
     const n = smith.slice(&body);
@@ -334,20 +348,243 @@ fn fuzzEnvelope(_: void, smith: *testing.Smith) anyerror!void {
     }
 }
 
+test "fuzz: relay and client messages against std.json" {
+    try testing.fuzz({}, fuzzMessageScanner, .{ .corpus = &.{
+        seed(&.{ .{ .int = 0 }, .{ .slice = "[\"EVENT\",\"sub\"," ++ sample_event ++ "]" } }),
+        seed(&.{ .{ .int = 1 }, .{ .slice = "\"sub\"," ++ sample_event } }),
+        seed(&.{ .{ .int = 1 }, .{ .slice = "\"s\",{\"x\":{\"a\":1,\"a\":2},\"id\":\"" ++ zeros32 ++ "\"}" } }),
+        seed(&.{ .{ .int = 1 }, .{ .slice = "\"s\",{\"id\":\"" ++ zeros32 ++ "\",\"pubkey\":\"" ++ zeros32 ++ "\",\"created_at\":9223372036854775808.0,\"kind\":1,\"tags\":[],\"content\":\"\",\"sig\":\"" ++ zeros64 ++ "\"}" } }),
+        seed(&.{ .{ .int = 2 }, .{ .slice = sample_event } }),
+        seed(&.{ .{ .int = 3 }, .{ .slice = "\"" ++ zeros32 ++ "\",true,\"saved\"" } }),
+        seed(&.{ .{ .int = 4 }, .{ .slice = "\"sub\",{\"count\":3,\"approximate\":false,\"hll\":\"00\"}" } }),
+        seed(&.{ .{ .int = 5 }, .{ .slice = "\"sub\",\"00ff\"" } }),
+        seed(&.{ .{ .int = 6 }, .{ .slice = "\"sub\"" } }),
+    } });
+}
+
+/// `parseRelayMessage` and `parseClientMessage` read an `EVENT` in one pass and
+/// hand what they do not take to a `std.json` tree. Whatever they return has
+/// to be what the tree alone gives (`message_reference.zig` keeps it), down to
+/// the error, or the scan has quietly changed which messages exist. The body
+/// goes raw or inside an envelope, so the effort lands past the brackets.
+fn fuzzMessageScanner(_: void, smith: *testing.Smith) anyerror!void {
+    @disableInstrumentation();
+    const prefix = switch (smith.value(enum(u3) { raw, event, client_event, ok, count, neg_msg, eose, auth })) {
+        .raw => "",
+        .event => "[\"EVENT\",",
+        .client_event => "[\"EVENT\",",
+        .ok => "[\"OK\",",
+        .count => "[\"COUNT\",",
+        .neg_msg => "[\"NEG-MSG\",",
+        .eose => "[\"EOSE\",",
+        .auth => "[\"AUTH\",",
+    };
+    var body: [2048]u8 = undefined;
+    const n = smith.slice(&body);
+    var text: [2100]u8 = undefined;
+    const built = if (prefix.len == 0)
+        body[0..n]
+    else
+        std.fmt.bufPrint(&text, "{s}{s}]", .{ prefix, body[0..n] }) catch return;
+    try message_reference.expectSameRelayMessage(built);
+    try message_reference.expectSameClientMessage(built);
+}
+
+// -- What a client says -------------------------------------------------------
+
+test "fuzz: a client message" {
+    try testing.fuzz({}, fuzzClientMessage, .{ .corpus = &.{
+        one("[\"EVENT\"," ++ sample_event ++ "]"),
+        one("[\"AUTH\"," ++ sample_event ++ "]"),
+        one("[\"REQ\",\"sub\",{\"ids\":[\"" ++ zeros32 ++ "\"],\"kinds\":[1,7],\"#e\":[\"x\"],\"since\":1,\"limit\":5,\"search\":\"hi\"},{}]"),
+        one("[\"REQ\",\"sub\"]"),
+        one("[\"COUNT\",\"sub\",{\"authors\":[\"" ++ zeros32 ++ "\"],\"unknown\":[1]}]"),
+        one("[\"CLOSE\",\"sub\"]"),
+        one("[\"NEG-OPEN\",\"sub\",{\"kinds\":[1]},\"6100000a\"]"),
+        one("[\"NEG-MSG\",\"sub\",\"00ff\"]"),
+        one("[\"NEG-CLOSE\",\"sub\"]"),
+        one("[\"REQ\",\"sub\",{\"kinds\":[65536],\"limit\":-1}]"),
+        one("[\"NEG-MSG\",\"sub\",\"abc\"]"),
+        one("[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[["),
+    } });
+}
+
+/// The relay-side front door: every byte a client sends arrives here. Beyond
+/// not crashing, a parsed REQ or COUNT must re-encode to something the parser
+/// reads back as the same filters, so a filter the parser accepts is one the
+/// encoder can write down.
+fn fuzzClientMessage(_: void, smith: *testing.Smith) anyerror!void {
+    @disableInstrumentation();
+    var buf: [4096]u8 = undefined;
+    const n = smith.slice(&buf);
+    var parsed = message.parseClientMessage(testing.allocator, buf[0..n]) catch return;
+    defer parsed.deinit();
+    try expectClientMessageStable(parsed.value);
+}
+
+fn expectClientMessageStable(value: message.ClientMessage) !void {
+    switch (value) {
+        .event, .auth => |ev| try expectEventRoundTrips(ev),
+        .req => |r| {
+            const again = try message.encodeReq(testing.allocator, r.subscription_id, r.filters);
+            defer testing.allocator.free(again);
+            var p2 = try message.parseClientMessage(testing.allocator, again);
+            defer p2.deinit();
+            try expectSameFilters(r.filters, p2.value.req.filters);
+        },
+        .count => |c| {
+            const again = try message.encodeCount(testing.allocator, c.subscription_id, c.filters);
+            defer testing.allocator.free(again);
+            var p2 = try message.parseClientMessage(testing.allocator, again);
+            defer p2.deinit();
+            try expectSameFilters(c.filters, p2.value.count.filters);
+        },
+        .neg_open => |o| {
+            const again = try message.encodeNegOpen(testing.allocator, o.sub_id, o.filter, o.initial_hex);
+            defer testing.allocator.free(again);
+            var p2 = try message.parseClientMessage(testing.allocator, again);
+            defer p2.deinit();
+            try expectSameFilters(&.{o.filter}, &.{p2.value.neg_open.filter});
+            try testing.expectEqualStrings(o.initial_hex, p2.value.neg_open.initial_hex);
+        },
+        .close, .neg_msg, .neg_close => {},
+    }
+}
+
+fn expectSameFilters(a: []const filter.Filter, b: []const filter.Filter) !void {
+    try testing.expectEqual(a.len, b.len);
+    for (a, b) |fa, fb| {
+        var la: std.ArrayList(u8) = .empty;
+        defer la.deinit(testing.allocator);
+        var lb: std.ArrayList(u8) = .empty;
+        defer lb.deinit(testing.allocator);
+        try fa.appendJson(&la, testing.allocator);
+        try fb.appendJson(&lb, testing.allocator);
+        try testing.expectEqualStrings(la.items, lb.items);
+    }
+}
+
+test "fuzz: a client message with a plausible envelope" {
+    try testing.fuzz({}, fuzzClientEnvelope, .{ .corpus = &.{
+        seed(&.{ .{ .int = 0 }, .{ .slice = sample_event } }),
+        seed(&.{ .{ .int = 1 }, .{ .slice = "\"sub\",{\"kinds\":[1],\"#p\":[\"a\"]},{\"limit\":3}" } }),
+        seed(&.{ .{ .int = 2 }, .{ .slice = "\"sub\",{\"since\":-5}" } }),
+        seed(&.{ .{ .int = 3 }, .{ .slice = "\"sub\"" } }),
+        seed(&.{ .{ .int = 4 }, .{ .slice = "\"sub\",{},\"6100\"" } }),
+        seed(&.{ .{ .int = 5 }, .{ .slice = "\"sub\",\"6100\"" } }),
+        seed(&.{ .{ .int = 6 }, .{ .slice = "\"sub\"" } }),
+        seed(&.{ .{ .int = 7 }, .{ .slice = sample_event } }),
+    } });
+}
+
+/// The client-side parser, reached past the first `if`, for the same reason as
+/// `fuzzEnvelope`.
+fn fuzzClientEnvelope(_: void, smith: *testing.Smith) anyerror!void {
+    @disableInstrumentation();
+    const verb = switch (smith.value(enum(u4) { event, req, count, close, neg_open, neg_msg, neg_close, auth })) {
+        .event => "EVENT",
+        .req => "REQ",
+        .count => "COUNT",
+        .close => "CLOSE",
+        .neg_open => "NEG-OPEN",
+        .neg_msg => "NEG-MSG",
+        .neg_close => "NEG-CLOSE",
+        .auth => "AUTH",
+    };
+    var body: [1024]u8 = undefined;
+    const n = smith.slice(&body);
+
+    var text: [1200]u8 = undefined;
+    const built = std.fmt.bufPrint(&text, "[\"{s}\",{s}]", .{ verb, body[0..n] }) catch return;
+    var parsed = message.parseClientMessage(testing.allocator, built) catch return;
+    defer parsed.deinit();
+    try expectClientMessageStable(parsed.value);
+}
+
+test "fuzz: relay replies and negentropy frames read back as written" {
+    try testing.fuzz({}, fuzzReplyRoundTrip, .{ .corpus = &.{
+        seed(&.{ .{ .slice = "sub" }, .{ .slice = "blocked: no" }, .{ .int = 7 } }),
+        seed(&.{ .{ .slice = "a\"b\\c\n" }, .{ .slice = "\x01\x1f" }, .{ .int = 0 } }),
+        seed(&.{ .{ .slice = "\u{e9}" }, .{ .slice = "" }, .{ .int = 255 } }),
+    } });
+}
+
+/// Every reply a local relay writes has to be read back by the client parser
+/// as the strings it was given, whatever those strings hold.
+fn fuzzReplyRoundTrip(_: void, smith: *testing.Smith) anyerror!void {
+    @disableInstrumentation();
+    var a_buf: [256]u8 = undefined;
+    const an = smith.slice(&a_buf);
+    var b_buf: [256]u8 = undefined;
+    const bn = smith.slice(&b_buf);
+    const a = a_buf[0..an];
+    const b = b_buf[0..bn];
+    if (!std.unicode.utf8ValidateSlice(a) or !std.unicode.utf8ValidateSlice(b)) return;
+    const count = smith.value(u64);
+    const approx: ?bool = switch (smith.value(u2)) {
+        0 => null,
+        1 => true,
+        else => false,
+    };
+
+    {
+        const s = try message.encodeClosed(testing.allocator, a, b);
+        defer testing.allocator.free(s);
+        var p = try message.parseRelayMessage(testing.allocator, s);
+        defer p.deinit();
+        try testing.expectEqualStrings(a, p.value.closed.subscription_id);
+        try testing.expectEqualStrings(b, p.value.closed.message);
+    }
+    {
+        const s = try message.encodeNegErr(testing.allocator, a, b);
+        defer testing.allocator.free(s);
+        var p = try message.parseRelayMessage(testing.allocator, s);
+        defer p.deinit();
+        try testing.expectEqualStrings(a, p.value.neg_err.sub_id);
+        try testing.expectEqualStrings(b, p.value.neg_err.reason);
+    }
+    {
+        const s = try message.encodeCountReply(testing.allocator, a, count, approx);
+        defer testing.allocator.free(s);
+        var p = try message.parseRelayMessage(testing.allocator, s);
+        defer p.deinit();
+        try testing.expectEqualStrings(a, p.value.count.subscription_id);
+        try testing.expectEqual(count, p.value.count.count);
+        try testing.expectEqual(approx, p.value.count.approximate);
+    }
+    {
+        // Hex built from the bytes, so it is valid whatever the fuzzer sent.
+        const h = try hex.encode(testing.allocator, b);
+        defer testing.allocator.free(h);
+        const s = try message.encodeNegMsg(testing.allocator, a, h);
+        defer testing.allocator.free(s);
+        var p = try message.parseRelayMessage(testing.allocator, s);
+        defer p.deinit();
+        try testing.expectEqualStrings(h, p.value.neg_msg.hex);
+        if (a.len >= 1 and a.len <= message.max_subscription_id_len) {
+            var c = try message.parseClientMessage(testing.allocator, s);
+            defer c.deinit();
+            try testing.expectEqualStrings(a, c.value.neg_msg.sub_id);
+            try testing.expectEqualStrings(h, c.value.neg_msg.hex);
+        }
+    }
+}
+
 // -- An event on its own ------------------------------------------------------
 
+/// The event objects every event target starts from.
+const event_corpus: []const []const u8 = &.{
+    one(sample_event),
+    // Reordered, with a key the parser has to skip.
+    one("{\"kind\":7,\"extra\":{\"a\":[1,2]},\"content\":\"\",\"tags\":[],\"created_at\":-5,\"pubkey\":\"" ++ zeros32 ++ "\",\"id\":\"" ++ zeros32 ++ "\",\"sig\":\"" ++ zeros64 ++ "\"}"),
+    // Every control character and a multi-byte sequence in the content.
+    one("{\"id\":\"" ++ zeros32 ++ "\",\"pubkey\":\"" ++ zeros32 ++ "\",\"created_at\":1,\"kind\":1,\"tags\":[[\"\\u0001\",\"\\u00e9\\ud83d\\ude00\"]],\"content\":\"\\u0000\\u001f\\b\\f\\/\",\"sig\":\"" ++ zeros64 ++ "\"}"),
+    // A number past the range of the field it lands in.
+    one("{\"id\":\"" ++ zeros32 ++ "\",\"pubkey\":\"" ++ zeros32 ++ "\",\"created_at\":99999999999999999999,\"kind\":1,\"tags\":[],\"content\":\"\",\"sig\":\"" ++ zeros64 ++ "\"}"),
+};
+
 test "fuzz: an event, and then everything that reads one" {
-    try testing.fuzz({}, fuzzEvent, .{
-        .corpus = &.{
-            one(sample_event),
-            // Reordered, with a key the parser has to skip.
-            one("{\"kind\":7,\"extra\":{\"a\":[1,2]},\"content\":\"\",\"tags\":[],\"created_at\":-5,\"pubkey\":\"" ++ zeros32 ++ "\",\"id\":\"" ++ zeros32 ++ "\",\"sig\":\"" ++ zeros64 ++ "\"}"),
-            // Every control character and a multi-byte sequence in the content.
-            one("{\"id\":\"" ++ zeros32 ++ "\",\"pubkey\":\"" ++ zeros32 ++ "\",\"created_at\":1,\"kind\":1,\"tags\":[[\"\\u0001\",\"\\u00e9\\ud83d\\ude00\"]],\"content\":\"\\u0000\\u001f\\b\\f\\/\",\"sig\":\"" ++ zeros64 ++ "\"}"),
-            // A number past the range of the field it lands in.
-            one("{\"id\":\"" ++ zeros32 ++ "\",\"pubkey\":\"" ++ zeros32 ++ "\",\"created_at\":99999999999999999999,\"kind\":1,\"tags\":[],\"content\":\"\",\"sig\":\"" ++ zeros64 ++ "\"}"),
-        },
-    });
+    try testing.fuzz({}, fuzzEvent, .{ .corpus = event_corpus });
 }
 
 /// Deserialise an event, then put it through the things that walk it afterwards:
@@ -397,6 +634,73 @@ fn expectEventRoundTrips(ev: event.Event) !void {
     const a = try event.computeId(testing.allocator, ev.pubkey, ev.created_at, ev.kind, ev.tags, ev.content);
     const b = try event.computeId(testing.allocator, again.value.pubkey, again.value.created_at, again.value.kind, again.value.tags, again.value.content);
     try testing.expectEqualSlices(u8, &a, &b);
+}
+
+test "fuzz: the event scanner against std.json" {
+    try testing.fuzz({}, fuzzEventScanner, .{ .corpus = event_corpus ++ &[_][]const u8{
+        one("{\"id\":\"" ++ zeros32 ++ "\",\"pubkey\":\"" ++ zeros32 ++ "\",\"created_at\":1e3,\"kind\":-0,\"tags\":[],\"content\":\"\\ud83d\",\"sig\":\"" ++ zeros64 ++ "\"}"),
+        one(" {\"\\u0069d\":\"" ++ zeros32 ++ "\",\"pubkey\":\"" ++ zeros32 ++ "\",\"created_at\":01,\"kind\":1,\"tags\":[[\"\xc3\"]],\"content\":\"\",\"sig\":\"" ++ zeros64 ++ "\"} "),
+    } });
+}
+
+/// `event.fromJson` reads an event with a scanner of its own and hands what it
+/// does not take to `std.json`. Whatever it accepts has to be what `std.json`
+/// gives for the same text, and whatever it refuses has to be refused with the
+/// same error, or the scanner has quietly changed which events exist. Where
+/// both parse, `toJson`, the canonical form and the id are checked against the
+/// serializers they replaced as well.
+fn fuzzEventScanner(_: void, smith: *testing.Smith) anyerror!void {
+    @disableInstrumentation();
+    var buf: [4096]u8 = undefined;
+    const n = smith.slice(&buf);
+    try event_reference.expectSameAsReference(buf[0..n]);
+}
+
+test "fuzz: event strings the scanner has to decode" {
+    try testing.fuzz({}, fuzzEventStrings, .{ .corpus = &.{
+        seed(&.{ .{ .slice = "plain" }, .{ .slice = "e" }, .{ .slice = "1700000000" } }),
+        seed(&.{ .{ .slice = "a\\nb\\\"c\\u00e9\\ud83d\\ude00" }, .{ .slice = "\\/" }, .{ .slice = "-0" } }),
+        seed(&.{ .{ .slice = "\xed\xa0\x80" }, .{ .slice = "\\ud800x" }, .{ .slice = "1.0" } }),
+        seed(&.{ .{ .slice = "\x01\x7f\xf4\x8f\xbf\xbf" }, .{ .slice = "\\u" }, .{ .slice = "99999999999999999999" } }),
+    } });
+}
+
+/// Reaches past the envelope: fuzzed bytes go raw between the quotes of the
+/// content and of a tag, and in place of `created_at`, inside an event that is
+/// otherwise well formed, so the effort lands on escapes, surrogates, UTF-8
+/// and number syntax. The same bytes, unescaped, also go through both
+/// serializers as the content and a tag of an event.
+fn fuzzEventStrings(_: void, smith: *testing.Smith) anyerror!void {
+    @disableInstrumentation();
+    var content: [1024]u8 = undefined;
+    var tag: [256]u8 = undefined;
+    var number: [32]u8 = undefined;
+    const content_len = smith.slice(&content);
+    const tag_len = smith.slice(&tag);
+    const number_len = smith.slice(&number);
+
+    const text = try std.mem.concat(testing.allocator, u8, &.{
+        "{\"id\":\"" ++ zeros32 ++ "\",\"pubkey\":\"" ++ zeros32 ++ "\",\"created_at\":",
+        number[0..number_len],
+        ",\"kind\":1,\"tags\":[[\"e\",\"",
+        tag[0..tag_len],
+        "\"]],\"content\":\"",
+        content[0..content_len],
+        "\",\"sig\":\"" ++ zeros64 ++ "\"}",
+    });
+    defer testing.allocator.free(text);
+    try event_reference.expectSameAsReference(text);
+
+    const tags = [_]event.Tag{&.{ "e", tag[0..tag_len] }};
+    try event_reference.expectSameSerialization(.{
+        .id = @splat(0),
+        .pubkey = @splat(0),
+        .created_at = 1,
+        .kind = 1,
+        .tags = &tags,
+        .content = content[0..content_len],
+        .sig = @splat(0),
+    });
 }
 
 // -- A payload somebody encrypted to you --------------------------------------
@@ -1068,4 +1372,116 @@ fn fuzzJsonString(_: void, smith: *testing.Smith) anyerror!void {
     const parsed = try std.json.parseFromSlice([]const u8, testing.allocator, list.items, .{});
     defer parsed.deinit();
     try testing.expectEqualStrings(buf[0..n], parsed.value);
+}
+
+// -- Negentropy messages and proof of work -------------------------------------
+
+/// A small fixed set to reconcile against, so the fuzzer's effort goes into the
+/// message and not into building storage.
+fn negStorage() !nip77.Storage {
+    var items: [40]nip77.Item = undefined;
+    for (&items, 0..) |*it, i| {
+        it.* = .{ .created_at = 1000 + i / 3, .id = [_]u8{@intCast(i)} ** 32 };
+    }
+    return nip77.Storage.fromSlice(testing.allocator, &items);
+}
+
+/// The frame size limit a target runs under: none, the smallest allowed, or
+/// the default.
+fn negLimit(smith: *testing.Smith) u64 {
+    return switch (smith.value(enum(u2) { none, smallest, default, other })) {
+        .none => 0,
+        .smallest => nip77.min_frame_size_limit,
+        .default, .other => nip77.default_frame_size_limit,
+    };
+}
+
+test "fuzz: a negentropy message a relay answers" {
+    try testing.fuzz({}, fuzzNegResponder, .{ .corpus = &.{
+        seed(&.{ .{ .int = 0 }, .{ .slice = "\x61" } }),
+        seed(&.{ .{ .int = 1 }, .{ .slice = "\x61\x00\x00" } }),
+        seed(&.{ .{ .int = 2 }, .{ .slice = "\x61\x00\x02\x00" } }),
+        seed(&.{ .{ .int = 0 }, .{ .slice = "\x61\x00\x01" ++ "\x00" ** 16 } }),
+        seed(&.{ .{ .int = 1 }, .{ .slice = "\x62" } }),
+        seed(&.{ .{ .int = 2 }, .{ .slice = "\x61\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x01" } }),
+    } });
+}
+
+/// What a relay does with a NEG-OPEN or NEG-MSG from anybody. It either
+/// answers or refuses, and an answer under a frame size limit fits it.
+fn fuzzNegResponder(_: void, smith: *testing.Smith) anyerror!void {
+    @disableInstrumentation();
+    const limit = negLimit(smith);
+    var buf: [4096]u8 = undefined;
+    const n = smith.slice(&buf);
+
+    var storage = try negStorage();
+    defer storage.deinit(testing.allocator);
+    var responder = try nip77.Responder.init(&storage, .{ .frame_size_limit = limit });
+    const out = responder.reconcile(testing.allocator, buf[0..n]) catch return;
+    defer testing.allocator.free(out);
+    if (limit != 0) try testing.expect(out.len <= limit);
+}
+
+test "fuzz: a negentropy reply a client reads" {
+    try testing.fuzz({}, fuzzNegInitiator, .{ .corpus = &.{
+        seed(&.{ .{ .int = 0 }, .{ .slice = "\x61" } }),
+        seed(&.{ .{ .int = 1 }, .{ .slice = "\x61\x00\x02\x01" ++ "\x07" ** 32 } }),
+        seed(&.{ .{ .int = 2 }, .{ .slice = "\x61\x00\x01" ++ "\x00" ** 16 } }),
+        seed(&.{ .{ .int = 0 }, .{ .slice = "\x60" } }),
+    } });
+}
+
+/// What a client does with a relay's answer after its first message. The ids
+/// it reports came out of that answer or out of its own set, and a next
+/// message under a frame size limit fits it.
+fn fuzzNegInitiator(_: void, smith: *testing.Smith) anyerror!void {
+    @disableInstrumentation();
+    const limit = negLimit(smith);
+    var buf: [4096]u8 = undefined;
+    const n = smith.slice(&buf);
+
+    var storage = try negStorage();
+    defer storage.deinit(testing.allocator);
+    var initiator = try nip77.Initiator.init(&storage, .{ .frame_size_limit = limit });
+    const first = try initiator.initiate(testing.allocator);
+    testing.allocator.free(first);
+    var r = initiator.reconcile(testing.allocator, buf[0..n]) catch return;
+    defer r.deinit(testing.allocator);
+    if (limit != 0) if (r.message) |m| try testing.expect(m.len <= limit);
+    try testing.expect(r.need.len <= n / 32 + 1);
+}
+
+test "fuzz: a NIP-13 committed target" {
+    try testing.fuzz({}, fuzzCommittedTarget, .{ .corpus = &.{
+        one("20"),
+        one("0"),
+        one("4294967295"),
+        one("4294967296"),
+        one("+16"),
+        one("1_6"),
+        one(""),
+    } });
+}
+
+/// A target is a number only when it is nothing but ASCII digits, and then it
+/// is that number.
+fn fuzzCommittedTarget(_: void, smith: *testing.Smith) anyerror!void {
+    @disableInstrumentation();
+    var buf: [64]u8 = undefined;
+    const n = smith.slice(&buf);
+    const tag: event.Tag = &.{ "nonce", "1", buf[0..n] };
+    const ev: event.Event = .{
+        .id = @splat(0),
+        .pubkey = @splat(0),
+        .created_at = 0,
+        .kind = 1,
+        .tags = &.{tag},
+        .content = "",
+        .sig = @splat(0),
+    };
+    const got = nip13.committedTarget(ev) orelse return;
+    try testing.expect(n > 0);
+    for (buf[0..n]) |ch| try testing.expect(std.ascii.isDigit(ch));
+    try testing.expectEqual(try std.fmt.parseInt(u32, buf[0..n], 10), got);
 }

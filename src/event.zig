@@ -4,6 +4,7 @@
 const std = @import("std");
 const hex = @import("hex.zig");
 const keys = @import("keys.zig");
+const scan = @import("scan.zig");
 
 pub const Error = error{
     InvalidJson,
@@ -24,8 +25,57 @@ pub const Event = struct {
     sig: [64]u8,
 };
 
-/// Escapes a string for the id serialization and for the wire JSON, which
-/// want the same bytes.
+// -- Serialization ------------------------------------------------------------
+//
+// Every serializer below writes through a `std.Io.Writer`, so the same code
+// fills a caller's buffer (`Writer.fixed`), an exactly sized allocation, or a
+// SHA-256 state with a small stack buffer in front of it, which is how
+// `computeId` hashes an event without allocating. The `...Len` functions
+// return the exact byte count the matching writer produces, so a caller can
+// size a buffer before writing into it.
+
+const Writer = std.Io.Writer;
+
+const nextSpecial = scan.nextSpecial;
+
+/// The escape for a byte `nextSpecial` stopped at. A six-byte buffer holds
+/// the longest, `\u00XX`.
+fn escapeFor(c: u8, buf: *[6]u8) []const u8 {
+    const short: u8 = switch (c) {
+        '\n' => 'n',
+        '"' => '"',
+        '\\' => '\\',
+        '\r' => 'r',
+        '\t' => 't',
+        0x08 => 'b',
+        0x0C => 'f',
+        else => 0,
+    };
+    buf[0] = '\\';
+    if (short != 0) {
+        buf[1] = short;
+        return buf[0..2];
+    }
+    buf[1..4].* = "u00".*;
+    buf[4] = hex_digits[c >> 4];
+    buf[5] = hex_digits[c & 0xf];
+    return buf[0..6];
+}
+
+fn escapedLen(s: []const u8) usize {
+    var n: usize = s.len + 2;
+    var i = nextSpecial(s, 0);
+    while (i < s.len) : (i = nextSpecial(s, i + 1)) {
+        n += switch (s[i]) {
+            '\n', '"', '\\', '\r', '\t', 0x08, 0x0C => 1,
+            else => 5,
+        };
+    }
+    return n;
+}
+
+/// Writes `s` as a quoted JSON string, escaped the way the id serialization
+/// needs.
 ///
 /// NIP-01 names seven escapes (`\n \" \\ \r \t \b \f`) and says all other
 /// characters must be included verbatim. Read literally that leaves a byte
@@ -43,48 +93,110 @@ pub const Event = struct {
 /// So the remaining control bytes are escaped as `\u00XX`. Everything from
 /// 0x20 up, raw UTF-8 included, is still copied verbatim, which is where the
 /// warning against a general-purpose encoder still holds: escaping non-ASCII
-/// would change the id.
-fn appendJsonString(list: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) std.mem.Allocator.Error!void {
-    try list.append(allocator, '"');
-    for (s) |c| {
-        switch (c) {
-            '\n' => try list.appendSlice(allocator, "\\n"),
-            '"' => try list.appendSlice(allocator, "\\\""),
-            '\\' => try list.appendSlice(allocator, "\\\\"),
-            '\r' => try list.appendSlice(allocator, "\\r"),
-            '\t' => try list.appendSlice(allocator, "\\t"),
-            0x08 => try list.appendSlice(allocator, "\\b"),
-            0x0C => try list.appendSlice(allocator, "\\f"),
-            else => |b| {
-                if (b < 0x20) {
-                    try list.print(allocator, "\\u{x:0>4}", .{b});
-                } else {
-                    try list.append(allocator, b);
-                }
-            },
-        }
+/// would change the id. The wire JSON wants the same bytes.
+fn writeJsonString(w: *Writer, s: []const u8) Writer.Error!void {
+    try w.writeByte('"');
+    var start: usize = 0;
+    var i = nextSpecial(s, 0);
+    var esc: [6]u8 = undefined;
+    while (i < s.len) : (i = nextSpecial(s, start)) {
+        try w.writeAll(s[start..i]);
+        try w.writeAll(escapeFor(s[i], &esc));
+        start = i + 1;
     }
-    try list.append(allocator, '"');
+    try w.writeAll(s[start..]);
+    try w.writeByte('"');
 }
 
-fn appendInt(list: *std.ArrayList(u8), allocator: std.mem.Allocator, v: anytype) std.mem.Allocator.Error!void {
-    var buf: [32]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, "{d}", .{v}) catch unreachable;
-    try list.appendSlice(allocator, s);
+const hex_digits = "0123456789abcdef";
+
+fn writeHex(w: *Writer, comptime n: usize, bytes: *const [n]u8) Writer.Error!void {
+    var out: [n * 2]u8 = undefined;
+    for (bytes, 0..) |b, i| {
+        out[2 * i] = hex_digits[b >> 4];
+        out[2 * i + 1] = hex_digits[b & 0xf];
+    }
+    try w.writeAll(&out);
 }
 
-fn appendTags(list: *std.ArrayList(u8), allocator: std.mem.Allocator, tags: []const Tag) std.mem.Allocator.Error!void {
-    try list.append(allocator, '[');
+/// Decimal digits of `v`, written from the back of `buf`.
+fn intDigits(v: i64, buf: *[20]u8) []const u8 {
+    var mag: u64 = @abs(v);
+    var i: usize = buf.len;
+    while (true) {
+        i -= 1;
+        buf[i] = '0' + @as(u8, @intCast(mag % 10));
+        mag /= 10;
+        if (mag == 0) break;
+    }
+    if (v < 0) {
+        i -= 1;
+        buf[i] = '-';
+    }
+    return buf[i..];
+}
+
+fn intLen(v: i64) usize {
+    var buf: [20]u8 = undefined;
+    return intDigits(v, &buf).len;
+}
+
+fn writeInt(w: *Writer, v: i64) Writer.Error!void {
+    var buf: [20]u8 = undefined;
+    try w.writeAll(intDigits(v, &buf));
+}
+
+fn tagsLen(tags: []const Tag) usize {
+    var n: usize = 2;
     for (tags, 0..) |tag, ti| {
-        if (ti != 0) try list.append(allocator, ',');
-        try list.append(allocator, '[');
-        for (tag, 0..) |field, fi| {
-            if (fi != 0) try list.append(allocator, ',');
-            try appendJsonString(list, allocator, field);
-        }
-        try list.append(allocator, ']');
+        n += @as(usize, @intFromBool(ti != 0)) + 2;
+        for (tag, 0..) |field, fi| n += @as(usize, @intFromBool(fi != 0)) + escapedLen(field);
     }
-    try list.append(allocator, ']');
+    return n;
+}
+
+fn writeTags(w: *Writer, tags: []const Tag) Writer.Error!void {
+    try w.writeByte('[');
+    for (tags, 0..) |tag, ti| {
+        if (ti != 0) try w.writeByte(',');
+        try w.writeByte('[');
+        for (tag, 0..) |field, fi| {
+            if (fi != 0) try w.writeByte(',');
+            try writeJsonString(w, field);
+        }
+        try w.writeByte(']');
+    }
+    try w.writeByte(']');
+}
+
+/// The exact length of the canonical serialization `writeCanonical` writes.
+pub fn canonicalLen(created_at: i64, kind: u16, tags: []const Tag, content: []const u8) usize {
+    // `[0,"` + 64 hex + `",` + created_at + `,` + kind + `,` + tags + `,` + content + `]`
+    return 4 + 64 + 2 + intLen(created_at) + 1 + intLen(kind) + 1 + tagsLen(tags) + 1 + escapedLen(content) + 1;
+}
+
+/// Writes the canonical `[0,pubkey,created_at,kind,tags,content]`
+/// serialization (used only for id hashing, per NIP-01) to `w`. With
+/// `Writer.fixed` over a buffer of `canonicalLen` bytes it allocates nothing.
+pub fn writeCanonical(
+    w: *Writer,
+    pubkey: [32]u8,
+    created_at: i64,
+    kind: u16,
+    tags: []const Tag,
+    content: []const u8,
+) Writer.Error!void {
+    try w.writeAll("[0,\"");
+    try writeHex(w, 32, &pubkey);
+    try w.writeAll("\",");
+    try writeInt(w, created_at);
+    try w.writeByte(',');
+    try writeInt(w, kind);
+    try w.writeByte(',');
+    try writeTags(w, tags);
+    try w.writeByte(',');
+    try writeJsonString(w, content);
+    try w.writeByte(']');
 }
 
 /// Appends the canonical `[0,pubkey,created_at,kind,tags,content]`
@@ -98,17 +210,11 @@ pub fn appendCanonical(
     tags: []const Tag,
     content: []const u8,
 ) std.mem.Allocator.Error!void {
-    try list.appendSlice(allocator, "[0,\"");
-    try hex.appendHex(list, allocator, &pubkey);
-    try list.appendSlice(allocator, "\",");
-    try appendInt(list, allocator, created_at);
-    try list.append(allocator, ',');
-    try appendInt(list, allocator, kind);
-    try list.append(allocator, ',');
-    try appendTags(list, allocator, tags);
-    try list.append(allocator, ',');
-    try appendJsonString(list, allocator, content);
-    try list.append(allocator, ']');
+    const len = canonicalLen(created_at, kind, tags, content);
+    try list.ensureUnusedCapacity(allocator, len);
+    var w: Writer = .fixed(list.unusedCapacitySlice()[0..len]);
+    writeCanonical(&w, pubkey, created_at, kind, tags, content) catch unreachable;
+    list.items.len += len;
 }
 
 /// Returns the owned canonical serialization bytes (for inspection/testing).
@@ -120,13 +226,17 @@ pub fn serializeCanonical(
     tags: []const Tag,
     content: []const u8,
 ) std.mem.Allocator.Error![]u8 {
-    var list: std.ArrayList(u8) = .empty;
-    errdefer list.deinit(allocator);
-    try appendCanonical(&list, allocator, pubkey, created_at, kind, tags, content);
-    return list.toOwnedSlice(allocator);
+    const out = try allocator.alloc(u8, canonicalLen(created_at, kind, tags, content));
+    var w: Writer = .fixed(out);
+    writeCanonical(&w, pubkey, created_at, kind, tags, content) catch unreachable;
+    return out;
 }
 
 /// Computes the NIP-01 event id: sha256 of the canonical serialization.
+///
+/// The serialization streams through a stack buffer into the hash, so this
+/// allocates nothing; `allocator` is kept for the signature callers already
+/// use, and the error set with it.
 pub fn computeId(
     allocator: std.mem.Allocator,
     pubkey: [32]u8,
@@ -135,11 +245,18 @@ pub fn computeId(
     tags: []const Tag,
     content: []const u8,
 ) std.mem.Allocator.Error![32]u8 {
-    var list: std.ArrayList(u8) = .empty;
-    defer list.deinit(allocator);
-    try appendCanonical(&list, allocator, pubkey, created_at, kind, tags, content);
+    _ = allocator;
+    return idOf(pubkey, created_at, kind, tags, content);
+}
+
+fn idOf(pubkey: [32]u8, created_at: i64, kind: u16, tags: []const Tag, content: []const u8) [32]u8 {
+    var buf: [1024]u8 = undefined;
+    var hashing: Writer.Hashing(std.crypto.hash.sha2.Sha256) = .init(&buf);
+    // The hashing writer's drain cannot fail.
+    writeCanonical(&hashing.writer, pubkey, created_at, kind, tags, content) catch unreachable;
+    hashing.writer.flush() catch unreachable;
     var id: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(list.items, &id, .{});
+    hashing.hasher.final(&id);
     return id;
 }
 
@@ -179,28 +296,49 @@ pub fn verify(allocator: std.mem.Allocator, signer: keys.Signer, ev: Event) std.
     return signer.verifyId(ev.sig, ev.id, ev.pubkey);
 }
 
-/// Serializes a full `Event` to wire-format JSON (`{"id":...,...}`).
+const json_id = "{\"id\":\"";
+const json_pubkey = "\",\"pubkey\":\"";
+const json_created_at = "\",\"created_at\":";
+const json_kind = ",\"kind\":";
+const json_tags = ",\"tags\":";
+const json_content = ",\"content\":";
+const json_sig = ",\"sig\":\"";
+const json_end = "\"}";
+
+/// The exact length of the wire JSON `writeJson` writes.
+pub fn jsonLen(event: Event) usize {
+    return json_id.len + 64 + json_pubkey.len + 64 + json_created_at.len + intLen(event.created_at) +
+        json_kind.len + intLen(event.kind) + json_tags.len + tagsLen(event.tags) +
+        json_content.len + escapedLen(event.content) + json_sig.len + 128 + json_end.len;
+}
+
+/// Writes a full `Event` as wire-format JSON (`{"id":...,...}`) to `w`. With
+/// `Writer.fixed` over a buffer of `jsonLen` bytes it allocates nothing.
+pub fn writeJson(w: *Writer, event: Event) Writer.Error!void {
+    try w.writeAll(json_id);
+    try writeHex(w, 32, &event.id);
+    try w.writeAll(json_pubkey);
+    try writeHex(w, 32, &event.pubkey);
+    try w.writeAll(json_created_at);
+    try writeInt(w, event.created_at);
+    try w.writeAll(json_kind);
+    try writeInt(w, event.kind);
+    try w.writeAll(json_tags);
+    try writeTags(w, event.tags);
+    try w.writeAll(json_content);
+    try writeJsonString(w, event.content);
+    try w.writeAll(json_sig);
+    try writeHex(w, 64, &event.sig);
+    try w.writeAll(json_end);
+}
+
+/// Serializes a full `Event` to wire-format JSON (`{"id":...,...}`), in one
+/// allocation of exactly the right size.
 pub fn toJson(allocator: std.mem.Allocator, event: Event) std.mem.Allocator.Error![]u8 {
-    var list: std.ArrayList(u8) = .empty;
-    errdefer list.deinit(allocator);
-
-    try list.appendSlice(allocator, "{\"id\":\"");
-    try hex.appendHex(&list, allocator, &event.id);
-    try list.appendSlice(allocator, "\",\"pubkey\":\"");
-    try hex.appendHex(&list, allocator, &event.pubkey);
-    try list.appendSlice(allocator, "\",\"created_at\":");
-    try appendInt(&list, allocator, event.created_at);
-    try list.appendSlice(allocator, ",\"kind\":");
-    try appendInt(&list, allocator, event.kind);
-    try list.appendSlice(allocator, ",\"tags\":");
-    try appendTags(&list, allocator, event.tags);
-    try list.appendSlice(allocator, ",\"content\":");
-    try appendJsonString(&list, allocator, event.content);
-    try list.appendSlice(allocator, ",\"sig\":\"");
-    try hex.appendHex(&list, allocator, &event.sig);
-    try list.appendSlice(allocator, "\"}");
-
-    return list.toOwnedSlice(allocator);
+    const out = try allocator.alloc(u8, jsonLen(event));
+    var w: Writer = .fixed(out);
+    writeJson(&w, event) catch unreachable;
+    return out;
 }
 
 /// The seven fields NIP-01 names. An event object may carry other keys beside
@@ -231,8 +369,17 @@ pub const Parsed = struct {
     }
 };
 
-/// Parses wire-format event JSON. The returned `Parsed` owns an arena
-/// backing `value.tags`/`value.content` — call `deinit` to free it.
+/// Parses wire-format event JSON. The returned `Parsed` owns every byte the
+/// Parses wire-format event JSON. The returned `Parsed` owns every byte the
+/// event points at, in one arena, so `json_text` may be freed or reused as soon
+/// as this returns. Call `deinit` to free it.
+///
+/// The text is copied into the arena once and read by `scan.event`, which
+/// decodes each string in place in that copy and builds the event without a
+/// JSON tree. Anything it does not take on the first pass (a missing or
+/// repeated field, a number written as `1e3`, bad hex, malformed JSON) is
+/// parsed again by `std.json`, so what is accepted and every error returned
+/// are exactly what the `std.json` path alone gives.
 pub fn fromJson(gpa: std.mem.Allocator, json_text: []const u8) !Parsed {
     const arena = try gpa.create(std.heap.ArenaAllocator);
     arena.* = std.heap.ArenaAllocator.init(gpa);
@@ -242,12 +389,19 @@ pub fn fromJson(gpa: std.mem.Allocator, json_text: []const u8) !Parsed {
     }
     const allocator = arena.allocator();
 
-    const wire = try std.json.parseFromSliceLeaky(WireEvent, allocator, json_text, wire_options);
+    const owned_text = try allocator.dupe(u8, json_text);
+    if (scan.event(allocator, owned_text)) |ev| {
+        return .{ .arena = arena, .value = ev };
+    } else |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Unsupported => {},
+    }
 
-    return Parsed{
-        .arena = arena,
-        .value = try fromWire(wire),
-    };
+    // The scan decoded strings in place, so the copy is no longer the text.
+    _ = arena.reset(.retain_capacity);
+    const fresh = try allocator.dupe(u8, json_text);
+    const wire = try std.json.parseFromSliceLeaky(WireEvent, allocator, fresh, wire_options);
+    return .{ .arena = arena, .value = try fromWire(wire) };
 }
 
 /// Builds an `Event` from an already-parsed `std.json.Value` (which must be a
@@ -259,6 +413,14 @@ pub fn fromJson(gpa: std.mem.Allocator, json_text: []const u8) !Parsed {
 /// whole message shares one arena, so re-serializing just to call `fromJson`
 /// would be wasteful.
 pub fn fromValueLeaky(allocator: std.mem.Allocator, value: std.json.Value) !Event {
+    // `std.json` bounds a float against `maxInt(i64)` converted to a float,
+    // which rounds up to 2^63, so a `created_at` of exactly 2^63 written as a
+    // float (`9223372036854775808.0`, `9.223372036854775807e18`) passes the
+    // check and then fails the conversion: a panic in a safe build. It is out
+    // of range, so say so first.
+    if (value == .object) if (value.object.get("created_at")) |v| {
+        if (v == .float and v.float >= 0x1p63) return error.Overflow;
+    };
     const wire = try std.json.parseFromValueLeaky(WireEvent, allocator, value, wire_options);
     return fromWire(wire);
 }
@@ -431,6 +593,43 @@ test "an event carrying a field NIP-01 does not name still parses and verifies" 
     try std.testing.expectEqualStrings(wire, again);
 }
 
+test "a parsed event outlives the text it was parsed from" {
+    const allocator = std.testing.allocator;
+    var signer = try keys.Signer.initRandomized(std.testing.io);
+    defer signer.deinit();
+    const kp = try signer.generateKeyPair(std.testing.io);
+
+    // Unescaped strings are the ones a parser can hand back as slices of its
+    // input, and the escaped content is the one it cannot, so both kinds are
+    // here.
+    const tags = [_]Tag{
+        &[_][]const u8{ "e", "5c83da77af1dec6d7289834998ad7aafbd9e2191396d75ec3cc27f5a77226f36", "wss://relay.example" },
+        &[_][]const u8{ "t", "zig" },
+    };
+    const ev = try create(allocator, signer, kp, 1700000000, 1, &tags, "plain words", null);
+    const wire = try toJson(allocator, ev);
+    defer allocator.free(wire);
+
+    const text = try allocator.dupe(u8, wire);
+    var parsed = parsed: {
+        // Overwrite the text before freeing it as well, so the test does not
+        // depend on what the allocator does with freed memory.
+        defer {
+            @memset(text, 'x');
+            allocator.free(text);
+        }
+        break :parsed try fromJson(allocator, text);
+    };
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("plain words", parsed.value.content);
+    try std.testing.expectEqualStrings("zig", parsed.value.tags[1][1]);
+    try std.testing.expect(try verify(allocator, signer, parsed.value));
+    const again = try toJson(allocator, parsed.value);
+    defer allocator.free(again);
+    try std.testing.expectEqualStrings(wire, again);
+}
+
 test "an event naming the same field twice is still refused" {
     const allocator = std.testing.allocator;
     // Two contents make it ambiguous which one the signature covers.
@@ -476,4 +675,92 @@ test "verify rejects a signature from the wrong key" {
     var ev = try create(allocator, signer, kp_a, 1700000000, 1, &[_]Tag{}, "hello", null);
     ev.sig = try signer.signId(ev.id, kp_b, null); // sign the same id, wrong key
     try std.testing.expect(!(try verify(allocator, signer, ev)));
+}
+
+// -- The scanner and the serializers against the code they replaced ----------
+
+const reference = @import("event_reference.zig");
+
+test "fromJson and the serializers agree with std.json on generated events" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var prng = std.Random.DefaultPrng.init(0x6576_656e_7473);
+    const g: reference.Generator = .{ .rand = prng.random(), .arena = arena_state.allocator() };
+
+    for (0..4000) |_| {
+        const ev = try g.event();
+        try reference.expectSameSerialization(ev);
+        const wire = try toJson(g.arena, ev);
+        try reference.expectSameAsReference(wire);
+        const spelled = try g.text(ev);
+        try reference.expectSameAsReference(spelled);
+        try reference.expectSameAsReference(try g.mutate(spelled));
+        try reference.expectSameAsReference(try g.mutate(try g.arena.dupe(u8, wire)));
+        _ = arena_state.reset(.retain_capacity);
+    }
+}
+
+test "fromJson agrees with std.json at the edges" {
+    const z32 = "\"" ++ "00" ** 32 ++ "\"";
+    const z64 = "\"" ++ "00" ** 64 ++ "\"";
+    const head = "{\"id\":" ++ z32 ++ ",\"pubkey\":" ++ z32 ++ ",\"sig\":" ++ z64 ++ ",\"tags\":[]";
+    const cases = [_][]const u8{
+        head ++ ",\"created_at\":0,\"kind\":0,\"content\":\"\"}",
+        head ++ ",\"created_at\":-0,\"kind\":-0,\"content\":\"\"}",
+        head ++ ",\"created_at\":9223372036854775807,\"kind\":65535,\"content\":\"\"}",
+        head ++ ",\"created_at\":-9223372036854775808,\"kind\":1,\"content\":\"\"}",
+        head ++ ",\"created_at\":9223372036854775808,\"kind\":1,\"content\":\"\"}",
+        head ++ ",\"created_at\":-9223372036854775809,\"kind\":1,\"content\":\"\"}",
+        head ++ ",\"created_at\":1,\"kind\":65536,\"content\":\"\"}",
+        head ++ ",\"created_at\":1,\"kind\":-1,\"content\":\"\"}",
+        head ++ ",\"created_at\":01,\"kind\":1,\"content\":\"\"}",
+        head ++ ",\"created_at\":1.5,\"kind\":1,\"content\":\"\"}",
+        head ++ ",\"created_at\":1e3,\"kind\":1E0,\"content\":\"\"}",
+        head ++ ",\"created_at\":\"12\",\"kind\":1,\"content\":\"\"}",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":[104,105]}",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":null}",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":\"\\ud83d\\ude00\"}",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":\"\\ud83d\"}",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":\"\\ude00\"}",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":\"\\ud83d\\u0041\"}",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":\"\\x\"}",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":\"\\u12\"}",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":\"\xed\xa0\x80\"}",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":\"\xc0\xaf\"}",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":\"\xf4\x90\x80\x80\"}",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":\"\xc3\"}",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":\"\xc3\\u00a9\"}",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":\"a\tb\"}",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":\"\x7f\"}",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":\"\"} x",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":\"\"}\x00",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":\"\",}",
+        head ++ ",\"created_at\":1,\"kind\":1}",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":\"\",\"kind\":2}",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":\"\",\"x\":1,\"x\":2}",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":\"\",\"x\":[1,]}",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":\"\",\"x\":tru}",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":\"\",\"x\":1.}",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":\"\",\"x\":.5}",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":\"\",\"x\":1e}",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":\"\",\"x\":+1}",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":\"\",\"x\":" ++ "[" ** 100 ++ "]" ** 100 ++ "}",
+        head ++ ",\"created_at\":1,\"kind\":1,\"content\":\"\",\"\\u0069d\":1}",
+        "{\"\\u0069d\":" ++ z32 ++ ",\"pubkey\":" ++ z32 ++ ",\"sig\":" ++ z64 ++ ",\"tags\":[],\"created_at\":1,\"kind\":1,\"content\":\"\"}",
+        "{\"id\":\"" ++ "0" ** 63 ++ "\",\"pubkey\":" ++ z32 ++ ",\"sig\":" ++ z64 ++ ",\"tags\":[],\"created_at\":1,\"kind\":1,\"content\":\"\"}",
+        "{\"id\":\"" ++ "AB" ** 32 ++ "\",\"pubkey\":" ++ z32 ++ ",\"sig\":" ++ z64 ++ ",\"tags\":[],\"created_at\":1,\"kind\":1,\"content\":\"\"}",
+        "{\"id\":\"" ++ "0g" ** 32 ++ "\",\"pubkey\":" ++ z32 ++ ",\"sig\":" ++ z64 ++ ",\"tags\":[],\"created_at\":1,\"kind\":1,\"content\":\"\"}",
+        "{\"id\":\"\\u0030" ++ "0" ** 63 ++ "\",\"pubkey\":" ++ z32 ++ ",\"sig\":" ++ z64 ++ ",\"tags\":[],\"created_at\":1,\"kind\":1,\"content\":\"\"}",
+        "{\"id\":" ++ z32 ++ ",\"pubkey\":" ++ z32 ++ ",\"sig\":" ++ z64 ++ ",\"tags\":[[]],\"created_at\":1,\"kind\":1,\"content\":\"\"}",
+        "{\"id\":" ++ z32 ++ ",\"pubkey\":" ++ z32 ++ ",\"sig\":" ++ z64 ++ ",\"tags\":[[1]],\"created_at\":1,\"kind\":1,\"content\":\"\"}",
+        "{\"id\":" ++ z32 ++ ",\"pubkey\":" ++ z32 ++ ",\"sig\":" ++ z64 ++ ",\"tags\":[\"e\"],\"created_at\":1,\"kind\":1,\"content\":\"\"}",
+        "{\"id\":" ++ z32 ++ ",\"pubkey\":" ++ z32 ++ ",\"sig\":" ++ z64 ++ ",\"tags\":null,\"created_at\":1,\"kind\":1,\"content\":\"\"}",
+        "{}",
+        "[]",
+        "",
+        " ",
+        "{",
+        "\"x\"",
+    };
+    for (cases) |c| try reference.expectSameAsReference(c);
 }

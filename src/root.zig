@@ -4,7 +4,7 @@ const std = @import("std");
 
 /// Kept in step with `build.zig.zon` by hand, and it had drifted three
 /// releases behind, so anything reading it was told the wrong number.
-pub const version = "0.14.9";
+pub const version = "0.15.0";
 
 pub const bech32 = @import("bech32.zig");
 pub const nip19 = @import("nip19.zig");
@@ -38,6 +38,18 @@ pub const signer = @import("signer.zig");
 // local HTTP, so every product speaks the identical protocol without sharing
 // a server. Transport, ports, and authentication stay product concerns.
 pub const signer_ipc = @import("signer_ipc.zig");
+// Legacy encryption, gift wrap, proof of work, negentropy, the remote signer
+// client, and the HTTP-side codecs (NIP-05, NIP-11, NIP-86, NIP-98, Blossom).
+pub const nip04 = @import("nip04.zig");
+pub const nip05 = @import("nip05.zig");
+pub const nip11 = @import("nip11.zig");
+pub const nip13 = @import("nip13.zig");
+pub const nip46_client = @import("nip46_client.zig");
+pub const nip59 = @import("nip59.zig");
+pub const nip77 = @import("nip77.zig");
+pub const nip86 = @import("nip86.zig");
+pub const nip98 = @import("nip98.zig");
+pub const blossom = @import("blossom.zig");
 
 test "module compiles and version is set" {
     try std.testing.expect(version.len > 0);

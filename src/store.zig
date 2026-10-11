@@ -42,6 +42,8 @@ pub const Error = error{
     Lmdb,
     /// A stored event record was truncated or malformed.
     CorruptRecord,
+    /// More events match than `SyncOptions.max_items` allows.
+    TooManyItems,
     OutOfMemory,
 };
 
@@ -92,6 +94,38 @@ pub const Store = struct {
         map_size: usize = 1 << 30,
         /// Maximum number of named sub-databases. Defaults to 16.
         max_dbs: u32 = 16,
+        /// How much a commit waits for the disk. See `Durability`.
+        durability: Durability = .full,
+    };
+
+    /// What survives a crash, traded against what a commit costs. LMDB syncs
+    /// to disk on every commit by default, and a client ingesting events one
+    /// write at a time spends most of its time there.
+    ///
+    /// None of these can corrupt the database through a crash of the program
+    /// alone: the operating system still writes what it was handed. They
+    /// differ when the machine itself goes down before the disk caught up.
+    pub const Durability = enum {
+        /// Sync data and metadata on every commit. A committed write
+        /// survives a power loss.
+        full,
+        /// Sync data but not the meta page (`MDB_NOMETASYNC`). After a power
+        /// loss the last commit may be rolled back, and the database stays
+        /// consistent.
+        no_meta_sync,
+        /// Never sync (`MDB_NOSYNC`); the operating system writes when it
+        /// chooses. After a power loss any recent commits may be lost, and on
+        /// a filesystem that reorders writes the file can be left corrupt.
+        /// For a cache that can be rebuilt from relays, or a temporary store.
+        no_sync,
+
+        fn envFlags(self: Durability) c_uint {
+            return switch (self) {
+                .full => 0,
+                .no_meta_sync => @intCast(c.MDB_NOMETASYNC),
+                .no_sync => @intCast(c.MDB_NOSYNC),
+            };
+        }
     };
 
     /// Opens (creating if necessary) the LMDB environment at `path`. The path
@@ -104,7 +138,7 @@ pub const Store = struct {
         errdefer c.mdb_env_close(env);
         try check(c.mdb_env_set_mapsize(env, options.map_size));
         try check(c.mdb_env_set_maxdbs(env, @intCast(options.max_dbs)));
-        try check(c.mdb_env_open(env, path, @intCast(c.MDB_NOSUBDIR), 0o644));
+        try check(c.mdb_env_open(env, path, @as(c_uint, @intCast(c.MDB_NOSUBDIR)) | options.durability.envFlags(), 0o644));
 
         // Create/open the named sub-databases in a single write transaction.
         // The dbi handles remain valid for the life of the environment.
@@ -719,6 +753,90 @@ pub const Store = struct {
         return f;
     }
 
+    /// Every stored event matching `filter` as a `(created_at, id)` pair,
+    /// sorted by `created_at` ascending and then by id: the order NIP-77
+    /// negentropy reconciles over. The caller owns the returned slice.
+    ///
+    /// `limit` is honoured the way `query` honours it (the newest `limit`
+    /// matches). Events with a negative `created_at` are left out, since a
+    /// negentropy timestamp is unsigned.
+    ///
+    /// A filter that constrains nothing but `authors`, `kinds`, `since` and
+    /// `until` is answered from index keys alone, which already hold the
+    /// timestamp and the id, so no event is read or decoded. Any other filter
+    /// goes through `query` and is sorted.
+    ///
+    /// With `options.max_items` set, a filter matching more than that fails
+    /// with `error.TooManyItems` as soon as the walk passes it, so a relay
+    /// can refuse a reconciliation over too large a set (NIP-77's
+    /// `NEG-ERR "blocked: too many records"`) without first collecting it.
+    pub fn syncItems(self: *Store, gpa: std.mem.Allocator, filter: Filter, options: SyncOptions) Error![]SyncItem {
+        var out: std.ArrayList(SyncItem) = .empty;
+        errdefer out.deinit(gpa);
+        const max = options.max_items orelse std.math.maxInt(usize);
+
+        const from_index = filter.ids == null and filter.tags == null and
+            filter.search == null and filter.limit == null;
+        if (!from_index) {
+            var f = filter;
+            // One past the cap is enough to know the cap was passed.
+            if (options.max_items) |m| {
+                const over: u32 = std.math.cast(u32, m +| 1) orelse std.math.maxInt(u32);
+                f.limit = if (filter.limit) |l| @min(l, over) else over;
+            }
+            var r = try self.query(gpa, f);
+            defer r.deinit();
+            if (r.events.len > max) return error.TooManyItems;
+            try out.ensureTotalCapacity(gpa, r.events.len);
+            for (r.events) |ev| {
+                if (ev.created_at < 0) continue;
+                out.appendAssumeCapacity(.{ .created_at = @intCast(ev.created_at), .id = ev.id });
+            }
+            std.mem.sort(SyncItem, out.items, {}, SyncItem.lessThan);
+            return out.toOwnedSlice(gpa);
+        }
+
+        const since = @max(filter.since orelse 0, 0);
+        const until = filter.until orelse std.math.maxInt(i64);
+        if (until < since) return out.toOwnedSlice(gpa);
+        const range: SyncRange = .{ .since_key = orderKey(since), .until_key = orderKey(until), .max = max };
+
+        var txn: ?*c.MDB_txn = null;
+        try check(c.mdb_txn_begin(self.env, null, @intCast(c.MDB_RDONLY), &txn));
+        defer c.mdb_txn_abort(txn);
+
+        // The same author or kind named twice would list its events twice.
+        const authors = try sortedUnique([32]u8, gpa, filter.authors orelse &.{});
+        defer gpa.free(authors);
+        const kinds = try sortedUnique(u16, gpa, filter.kinds orelse &.{});
+        defer gpa.free(kinds);
+
+        if (filter.authors == null and filter.kinds == null) {
+            // Keys are time-key ++ id, so a forward walk is already in
+            // (created_at, id) order.
+            try walkSyncRange(gpa, txn, self.idx_created_dbi, &.{}, range, &out);
+            return out.toOwnedSlice(gpa);
+        }
+        var prefix: [34]u8 = undefined;
+        if (filter.authors != null and filter.kinds != null) {
+            for (authors) |pk| for (kinds) |kind| {
+                prefix[0..32].* = pk;
+                std.mem.writeInt(u16, prefix[32..34], kind, .big);
+                try walkSyncRange(gpa, txn, self.idx_author_kind_dbi, &prefix, range, &out);
+            };
+        } else if (filter.authors != null) {
+            for (authors) |pk| try walkSyncRange(gpa, txn, self.idx_author_dbi, &pk, range, &out);
+        } else {
+            for (kinds) |kind| {
+                std.mem.writeInt(u16, prefix[0..2], kind, .big);
+                try walkSyncRange(gpa, txn, self.idx_kind_dbi, prefix[0..2], range, &out);
+            }
+        }
+        // One walk is in order already; several have to be merged.
+        std.mem.sort(SyncItem, out.items, {}, SyncItem.lessThan);
+        return out.toOwnedSlice(gpa);
+    }
+
     // -- Cache policy -------------------------------------------------------
 
     /// The number of events currently stored (O(1), from LMDB's statistics).
@@ -780,6 +898,59 @@ pub const Store = struct {
 
         try check(c.mdb_txn_commit(txn));
         return evicted;
+    }
+
+    /// Removes the event `id` and every index entry that points at it, in one
+    /// write transaction. Returns whether it was stored.
+    ///
+    /// This is a local removal, not a NIP-09 deletion: no tombstone is
+    /// recorded, so the same event can be ingested again later. If it was the
+    /// current event of a replaceable coordinate, the coordinate is cleared,
+    /// so an older version that arrives afterwards is taken as the current one.
+    pub fn remove(self: *Store, gpa: std.mem.Allocator, id: [32]u8) Error!bool {
+        var txn: ?*c.MDB_txn = null;
+        try check(c.mdb_txn_begin(self.env, null, 0, &txn));
+        errdefer c.mdb_txn_abort(txn);
+        var scratch = std.heap.ArenaAllocator.init(gpa);
+        defer scratch.deinit();
+        const removed = try self.removeIn(gpa, txn, scratch.allocator(), id);
+        try check(c.mdb_txn_commit(txn));
+        return removed;
+    }
+
+    /// Removes every event `query(filter)` returns, in one write transaction,
+    /// and returns how many. A `limit` on the filter bounds it the way it
+    /// bounds the query. Like `remove`, records no tombstones.
+    pub fn removeMatching(self: *Store, gpa: std.mem.Allocator, filter: Filter) Error!usize {
+        var found = try self.query(gpa, filter);
+        defer found.deinit();
+
+        var txn: ?*c.MDB_txn = null;
+        try check(c.mdb_txn_begin(self.env, null, 0, &txn));
+        errdefer c.mdb_txn_abort(txn);
+        var scratch = std.heap.ArenaAllocator.init(gpa);
+        defer scratch.deinit();
+        var removed: usize = 0;
+        for (found.events) |ev| {
+            _ = scratch.reset(.retain_capacity);
+            if (try self.removeIn(gpa, txn, scratch.allocator(), ev.id)) removed += 1;
+        }
+        try check(c.mdb_txn_commit(txn));
+        return removed;
+    }
+
+    /// Removes `id` within `txn`, decoding the stored record into `scratch`
+    /// so the index keys it wrote can be rebuilt and deleted.
+    fn removeIn(self: *Store, gpa: std.mem.Allocator, txn: ?*c.MDB_txn, scratch: std.mem.Allocator, id: [32]u8) Error!bool {
+        var k = val(&id);
+        var v: c.MDB_val = undefined;
+        const rc = c.mdb_get(txn, self.events_dbi, &k, &v);
+        if (rc == c.MDB_NOTFOUND) return false;
+        try check(rc);
+        const stored = try decodeEvent(scratch, valBytes(v));
+        try self.removeEvent(gpa, txn, stored);
+        try self.clearReplCoordinate(gpa, txn, stored);
+        return true;
     }
 
     // -- Ingestion ----------------------------------------------------------
@@ -1002,6 +1173,77 @@ pub const Store = struct {
         var v = val(&ev.id);
         try check(c.mdb_put(txn, self.repl_dbi, &ck, &v, 0));
         return result;
+    }
+};
+
+/// A stored event reduced to what NIP-77 negentropy reconciles: its
+/// `created_at` and its id. See `Store.syncItems`.
+pub const SyncOptions = struct {
+    /// Fail with `error.TooManyItems` once more than this many events match.
+    /// Null is no cap.
+    max_items: ?usize = null,
+};
+
+/// The time bounds and the cap of one `syncItems` walk.
+const SyncRange = struct {
+    since_key: [8]u8,
+    until_key: [8]u8,
+    max: usize,
+};
+
+/// Appends the `(created_at, id)` of every key in `dbi` that is `prefix`
+/// followed by a time key inside `range` and an id, reading only the keys.
+fn walkSyncRange(gpa: std.mem.Allocator, txn: ?*c.MDB_txn, dbi: c.MDB_dbi, prefix: []const u8, range: SyncRange, out: *std.ArrayList(SyncItem)) Error!void {
+    var cursor: ?*c.MDB_cursor = null;
+    try check(c.mdb_cursor_open(txn, dbi, &cursor));
+    defer c.mdb_cursor_close(cursor);
+
+    var start_buf: [34 + 8]u8 = undefined;
+    @memcpy(start_buf[0..prefix.len], prefix);
+    start_buf[prefix.len..][0..8].* = range.since_key;
+    var k = val(start_buf[0 .. prefix.len + 8]);
+    var v: c.MDB_val = undefined;
+    var rc = c.mdb_cursor_get(cursor, &k, &v, c.MDB_SET_RANGE);
+    while (rc == c.MDB_SUCCESS) : (rc = c.mdb_cursor_get(cursor, &k, &v, c.MDB_NEXT)) {
+        const key = valBytes(k);
+        if (!std.mem.startsWith(u8, key, prefix)) break;
+        const rest = key[prefix.len..];
+        if (rest.len != 40) continue;
+        if (std.mem.order(u8, rest[0..8], &range.until_key) == .gt) break;
+        if (out.items.len >= range.max) return error.TooManyItems;
+        const t: i64 = @bitCast(std.mem.readInt(u64, rest[0..8], .big) ^ (@as(u64, 1) << 63));
+        try out.append(gpa, .{ .created_at = @intCast(t), .id = rest[8..40].* });
+    }
+    if (rc != c.MDB_SUCCESS and rc != c.MDB_NOTFOUND) return error.Lmdb;
+}
+
+/// A sorted copy of `items` with duplicates removed. The caller frees it.
+fn sortedUnique(comptime T: type, gpa: std.mem.Allocator, items: []const T) Error![]T {
+    const copy = try gpa.dupe(T, items);
+    const less = struct {
+        fn f(_: void, a: T, b: T) bool {
+            return if (T == u16) a < b else std.mem.order(u8, &a, &b) == .lt;
+        }
+    }.f;
+    std.mem.sort(T, copy, {}, less);
+    var n: usize = 0;
+    for (copy) |item| {
+        if (n > 0 and std.meta.eql(copy[n - 1], item)) continue;
+        copy[n] = item;
+        n += 1;
+    }
+    if (n == copy.len) return copy;
+    return gpa.realloc(copy, n) catch copy[0..n];
+}
+
+pub const SyncItem = struct {
+    created_at: u64,
+    id: [32]u8,
+
+    /// Orders by `created_at`, then by id bytes.
+    pub fn lessThan(_: void, a: SyncItem, b: SyncItem) bool {
+        if (a.created_at != b.created_at) return a.created_at < b.created_at;
+        return std.mem.order(u8, &a.id, &b.id) == .lt;
     }
 };
 
@@ -2494,6 +2736,91 @@ test "store: evictToCap removes the oldest events and their indexes" {
     try std.testing.expectEqual(@as(usize, 0), try store.evictToCap(gpa, 10));
 }
 
+test "store: remove takes one event and every index entry that points at it" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var store = try openTempStore(&tmp, "remove.mdb", &buf);
+    defer store.deinit();
+
+    const a = [_]u8{0xA1} ** 32;
+    const t_tag = [_]Tag{&[_][]const u8{ "t", "zig" }};
+    for (1..4) |i| {
+        const seed: u8 = @intCast(i);
+        _ = try store.putEvent(gpa, qEvent(seed, a, 1, @as(i64, @intCast(i)) * 100, &t_tag));
+    }
+
+    try std.testing.expect(try store.remove(gpa, [_]u8{2} ** 32));
+    try std.testing.expect(!try store.remove(gpa, [_]u8{2} ** 32));
+    try std.testing.expect(!try store.hasEvent([_]u8{2} ** 32));
+    try std.testing.expectEqual(@as(usize, 2), try store.eventCount());
+
+    // Every index that could have produced it no longer does.
+    const t_values = [_][]const u8{"zig"};
+    const t_filter = [_]filter_mod.TagFilter{.{ .letter = 't', .values = &t_values }};
+    const filters = [_]Filter{
+        .{ .authors = &[_][32]u8{a} },
+        .{ .authors = &[_][32]u8{a}, .kinds = &[_]u16{1} },
+        .{ .kinds = &[_]u16{1} },
+        .{ .tags = &t_filter },
+        .{},
+    };
+    for (filters) |f| {
+        var r = try store.query(gpa, f);
+        defer r.deinit();
+        try std.testing.expectEqual(@as(usize, 2), r.events.len);
+        try std.testing.expectEqual(@as(u8, 3), r.events[0].id[0]);
+        try std.testing.expectEqual(@as(u8, 1), r.events[1].id[0]);
+    }
+
+    // Not a deletion: the same event can come back.
+    try std.testing.expectEqual(IngestResult.added, try store.ingest(gpa, qEvent(2, a, 1, 200, &t_tag), .{}));
+}
+
+test "store: removing the current replaceable event lets an older one take its place" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var store = try openTempStore(&tmp, "remove-repl.mdb", &buf);
+    defer store.deinit();
+
+    const a = [_]u8{0xA2} ** 32;
+    try std.testing.expectEqual(IngestResult.added, try store.ingest(gpa, qEvent(9, a, 0, 900, &[_]Tag{}), .{}));
+    try std.testing.expect(try store.remove(gpa, [_]u8{9} ** 32));
+    try std.testing.expectEqual(IngestResult.added, try store.ingest(gpa, qEvent(8, a, 0, 800, &[_]Tag{}), .{}));
+    var r = try store.query(gpa, .{ .authors = &[_][32]u8{a}, .kinds = &[_]u16{0} });
+    defer r.deinit();
+    try std.testing.expectEqual(@as(usize, 1), r.events.len);
+    try std.testing.expectEqual(@as(u8, 8), r.events[0].id[0]);
+}
+
+test "store: removeMatching removes what the filter selects and nothing else" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var store = try openTempStore(&tmp, "remove-matching.mdb", &buf);
+    defer store.deinit();
+
+    const a = [_]u8{0xA3} ** 32;
+    const b = [_]u8{0xB3} ** 32;
+    for (1..5) |i| {
+        const seed: u8 = @intCast(i);
+        _ = try store.putEvent(gpa, qEvent(seed, if (i % 2 == 0) a else b, 1, @as(i64, @intCast(i)) * 100, &[_]Tag{}));
+    }
+    try std.testing.expectEqual(@as(usize, 2), try store.removeMatching(gpa, .{ .authors = &[_][32]u8{a} }));
+    try std.testing.expectEqual(@as(usize, 2), try store.eventCount());
+    try std.testing.expect(try store.hasEvent([_]u8{1} ** 32));
+    try std.testing.expect(try store.hasEvent([_]u8{3} ** 32));
+
+    // A limit bounds it like a query: the newest one only.
+    try std.testing.expectEqual(@as(usize, 1), try store.removeMatching(gpa, .{ .authors = &[_][32]u8{b}, .limit = 1 }));
+    try std.testing.expect(!try store.hasEvent([_]u8{3} ** 32));
+    try std.testing.expect(try store.hasEvent([_]u8{1} ** 32));
+}
+
 test "store: a profile is found without reading the notes written since" {
     // The shape every Nostr client asks for constantly: one account's kind:0,
     // which they set once and have posted over ever since. Answered from the
@@ -2971,5 +3298,144 @@ test "store: the heap merge picks in the same order as the linear scan" {
             fast[g] = if (fast_pos[g] < lists[g].len) lists[g][fast_pos[g]] else .{};
             heap.settleTop(fast);
         }
+    }
+}
+
+test "store: syncItems lists (created_at, id) ascending for nip77" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var store = try openTempStore(&tmp, "sync.mdb", &buf);
+    defer store.deinit();
+
+    const gpa = std.testing.allocator;
+    // seed, author, kind, created_at
+    _ = try store.putEvent(gpa, qEvent(9, author_a, 1, 200, &.{}));
+    _ = try store.putEvent(gpa, qEvent(3, author_b, 7, 200, &.{}));
+    _ = try store.putEvent(gpa, qEvent(5, author_a, 1, 100, &.{}));
+    _ = try store.putEvent(gpa, qEvent(7, author_b, 1, 300, &.{}));
+    _ = try store.putEvent(gpa, qEvent(1, author_a, 1, -5, &.{}));
+
+    const Case = struct { filter: Filter, want: []const SyncItem };
+    const s = struct {
+        fn item(t: u64, seed: u8) SyncItem {
+            return .{ .created_at = t, .id = [_]u8{seed} ** 32 };
+        }
+    };
+    const cases = [_]Case{
+        // Everything, from the time index alone; the negative timestamp is dropped.
+        .{ .filter = .{}, .want = &.{ s.item(100, 5), s.item(200, 3), s.item(200, 9), s.item(300, 7) } },
+        // since/until are inclusive.
+        .{ .filter = .{ .since = 200, .until = 200 }, .want = &.{ s.item(200, 3), s.item(200, 9) } },
+        .{ .filter = .{ .since = 301 }, .want = &.{} },
+        .{ .filter = .{ .since = 300, .until = 100 }, .want = &.{} },
+        // A filter with other constraints goes through query and is sorted.
+        .{ .filter = .{ .kinds = &.{1} }, .want = &.{ s.item(100, 5), s.item(200, 9), s.item(300, 7) } },
+        .{ .filter = .{ .authors = &.{author_b} }, .want = &.{ s.item(200, 3), s.item(300, 7) } },
+        // Several authors and kinds, named twice, are merged without repeats.
+        .{ .filter = .{ .authors = &.{ author_a, author_b, author_a } }, .want = &.{ s.item(100, 5), s.item(200, 3), s.item(200, 9), s.item(300, 7) } },
+        .{ .filter = .{ .authors = &.{ author_a, author_b }, .kinds = &.{ 1, 1 }, .since = 150 }, .want = &.{ s.item(200, 9), s.item(300, 7) } },
+        .{ .filter = .{ .kinds = &.{ 7, 1 }, .until = 200 }, .want = &.{ s.item(100, 5), s.item(200, 3), s.item(200, 9) } },
+        // limit keeps the newest matches, still returned ascending.
+        .{ .filter = .{ .limit = 2 }, .want = &.{ s.item(200, 9), s.item(300, 7) } },
+    };
+    for (cases) |case| {
+        const got = try store.syncItems(gpa, case.filter, .{});
+        defer gpa.free(got);
+        try std.testing.expectEqual(case.want.len, got.len);
+        for (case.want, got) |w, g| {
+            try std.testing.expectEqual(w.created_at, g.created_at);
+            try std.testing.expectEqualSlices(u8, &w.id, &g.id);
+        }
+    }
+}
+
+test "store: syncItems stops at max_items instead of collecting everything" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var store = try openTempStore(&tmp, "sync-cap.mdb", &buf);
+    defer store.deinit();
+    const gpa = std.testing.allocator;
+    for (1..6) |i| {
+        const seed: u8 = @intCast(i);
+        _ = try store.putEvent(gpa, qEvent(seed, if (i % 2 == 0) author_a else author_b, 1, @as(i64, @intCast(i)) * 100, &.{}));
+    }
+    const filters = [_]Filter{
+        .{},
+        .{ .kinds = &.{1} },
+        .{ .authors = &.{ author_a, author_b } },
+        .{ .authors = &.{ author_a, author_b }, .kinds = &.{1} },
+        .{ .ids = &.{ [_]u8{1} ** 32, [_]u8{2} ** 32, [_]u8{3} ** 32, [_]u8{4} ** 32 } },
+    };
+    for (filters) |f| {
+        try std.testing.expectError(error.TooManyItems, store.syncItems(gpa, f, .{ .max_items = 3 }));
+        const all = try store.syncItems(gpa, f, .{ .max_items = 5 });
+        gpa.free(all);
+    }
+    // A limit under the cap keeps the set under it.
+    const capped = try store.syncItems(gpa, .{ .ids = &.{ [_]u8{1} ** 32, [_]u8{2} ** 32, [_]u8{3} ** 32, [_]u8{4} ** 32 }, .limit = 3 }, .{ .max_items = 3 });
+    defer gpa.free(capped);
+    try std.testing.expectEqual(@as(usize, 3), capped.len);
+}
+
+test "store: syncItems by author or kind reads index keys, not events" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var store = try openTempStore(&tmp, "sync-keys.mdb", &buf);
+    defer store.deinit();
+    const gpa = std.testing.allocator;
+    _ = try store.putEvent(gpa, qEvent(4, author_a, 1, 400, &.{}));
+
+    // Overwrite the record behind the indexes with bytes no decoder accepts.
+    // Anything that decodes it fails; a walk over the index keys does not.
+    {
+        var txn: ?*c.MDB_txn = null;
+        try check(c.mdb_txn_begin(store.env, null, 0, &txn));
+        errdefer c.mdb_txn_abort(txn);
+        const id = [_]u8{4} ** 32;
+        var k = val(&id);
+        var v = val("junk");
+        try check(c.mdb_put(txn, store.events_dbi, &k, &v, 0));
+        try check(c.mdb_txn_commit(txn));
+    }
+    const filters = [_]Filter{ .{ .kinds = &.{1} }, .{ .authors = &.{author_a} }, .{ .authors = &.{author_a}, .kinds = &.{1} } };
+    for (filters) |f| {
+        const got = try store.syncItems(gpa, f, .{});
+        defer gpa.free(got);
+        try std.testing.expectEqual(@as(usize, 1), got.len);
+        try std.testing.expectEqual(@as(u64, 400), got[0].created_at);
+    }
+}
+
+test "store: every durability opens, keeps what it commits, and sets its flag" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const gpa = std.testing.allocator;
+    const cases = [_]struct { d: Store.Durability, flag: c_uint }{
+        .{ .d = .full, .flag = 0 },
+        .{ .d = .no_meta_sync, .flag = @intCast(c.MDB_NOMETASYNC) },
+        .{ .d = .no_sync, .flag = @intCast(c.MDB_NOSYNC) },
+    };
+    for (cases, 0..) |case, i| {
+        var name_buf: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "durability-{d}.mdb", .{i});
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = testStorePath(&tmp, name, &buf);
+        {
+            var store = try Store.open(path.ptr, .{ .durability = case.d });
+            defer store.deinit();
+            var flags: c_uint = 0;
+            try check(c.mdb_env_get_flags(store.env, &flags));
+            const sync_bits: c_uint = @intCast(c.MDB_NOSYNC | c.MDB_NOMETASYNC);
+            try std.testing.expectEqual(case.flag, flags & sync_bits);
+            _ = try store.putEvent(gpa, qEvent(1, author_a, 1, 100, &.{}));
+        }
+        // Committed is committed as far as the next open is concerned; the
+        // setting only decides when the disk hears of it.
+        var again = try Store.open(path.ptr, .{});
+        defer again.deinit();
+        try std.testing.expect(try again.hasEvent([_]u8{1} ** 32));
     }
 }
