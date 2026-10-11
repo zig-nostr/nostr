@@ -2541,6 +2541,12 @@ const DeafPeer = struct {
         self.client = try bound.connect(io, .{ .mode = .stream });
         errdefer self.client.close(io);
         self.served = try self.server.accept(io);
+        // Loopback buffers are tuned by the system and can grow past any size
+        // a test can afford to write (Linux and Windows CI runners did). Small
+        // buffers on both ends make the writer block after a few kilobytes,
+        // whatever the platform.
+        shrinkSocketBuffers(self.client.socket.handle);
+        shrinkSocketBuffers(self.served.socket.handle);
         self.reader = self.client.reader(io, &self.read_buf);
         self.writer = self.client.writer(io, &self.write_buf);
     }
@@ -2560,6 +2566,22 @@ const DeafPeer = struct {
         self.server.deinit(io);
     }
 };
+
+fn shrinkSocketBuffers(handle: std.Io.net.Socket.Handle) void {
+    const size: i32 = 4096;
+    const bytes = std.mem.asBytes(&size);
+    if (builtin.os.tag == .windows) {
+        const ws2 = std.os.windows.ws2_32;
+        const set = struct {
+            extern "ws2_32" fn setsockopt(s: std.Io.net.Socket.Handle, level: i32, optname: i32, optval: [*]const u8, optlen: i32) callconv(.winapi) i32;
+        }.setsockopt;
+        _ = set(handle, ws2.SOL.SOCKET, ws2.SO.SNDBUF, bytes.ptr, bytes.len);
+        _ = set(handle, ws2.SOL.SOCKET, ws2.SO.RCVBUF, bytes.ptr, bytes.len);
+    } else {
+        std.posix.setsockopt(handle, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, bytes) catch {};
+        std.posix.setsockopt(handle, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, bytes) catch {};
+    }
+}
 
 /// An event far larger than a loopback socket's buffers, so writing it to a
 /// peer that does not read can never finish.
